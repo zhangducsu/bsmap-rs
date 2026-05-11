@@ -1,0 +1,23 @@
+[package]
+name = "bsmap"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Bisulfite Sequence MAPping - ultra-fast BS-seq aligner in Rust"
+
+[[bin]]
+name = "bsmap"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+rayon = { workspace = true }
+crossbeam-channel = { workspace = true }
+flate2 = { workspace = true }
+needletail = { workspace = true }
+noodles = { workspace = true, features = ["bam", "sam", "core", "csi", "tabix"] }
+log = { workspace = true }
+env_logger = { workspace = true }
+indicatif = { workspace = true }
