@@ -254,9 +254,14 @@ pub fn make_seed(words: &[u64], bit_pos: u32, seed_bits_lz: u32) -> u32 {
     let word_idx = (bit_pos / (SEGLEN as u32 * 2)) as usize;
     let bit_offset = (bit_pos % 64) as u32;
 
-    // Straddle two words if the seed crosses the 64-bit boundary
-    let straddle: u64 = (words[word_idx] << bit_offset)
-        | ((words[word_idx + 1] >> 1) >> (63 - bit_offset));
+    // 跨越两个 word 提取种子（如果种子跨越 64 位边界）
+    // 当 bit_offset=0 时，不需要从下一个 word 取数据
+    let straddle: u64 = if bit_offset == 0 {
+        words[word_idx]
+    } else {
+        (words[word_idx] << bit_offset)
+            | (words[word_idx + 1] >> (64 - bit_offset))
+    };
 
     xt3((straddle >> seed_bits_lz) as u32)
 }
@@ -276,11 +281,20 @@ pub fn make_seed_with_mask(
     let word_idx = (bit_pos / (SEGLEN as u32 * 2)) as usize;
     let bit_offset = (bit_pos % 64) as u32;
 
-    let straddle: u64 = (words[word_idx] << bit_offset)
-        | ((words[word_idx + 1] >> 1) >> (63 - bit_offset));
+    // 当 bit_offset=0 时，不需要从下一个 word 取数据
+    let straddle: u64 = if bit_offset == 0 {
+        words[word_idx]
+    } else {
+        (words[word_idx] << bit_offset)
+            | (words[word_idx + 1] >> (64 - bit_offset))
+    };
 
-    let mask_straddle: u64 = (mask_words[word_idx] << bit_offset)
-        | ((mask_words[word_idx + 1] >> 1) >> (63 - bit_offset));
+    let mask_straddle: u64 = if bit_offset == 0 {
+        mask_words[word_idx]
+    } else {
+        (mask_words[word_idx] << bit_offset)
+            | (mask_words[word_idx + 1] >> (64 - bit_offset))
+    };
 
     let seed = xt3((straddle >> seed_bits_lz) as u32);
     let mask = (!mask_straddle >> seed_bits_lz) as u64 & seed_bits;
@@ -479,5 +493,99 @@ mod tests {
         let expected: u64 = 0b00_01_10_11_00_01_10_11;
         // After left-align and pad (32-8=24 bases of padding = 48 bits)
         assert_eq!(words[0], expected << 48);
+    }
+
+    #[test]
+    fn test_make_seed_bit_offset_zero() {
+        // 测试 bit_offset=0 时的行为
+        // 构造两个 word：word[0] 包含种子，word[1] 包含不同的数据
+        // seed_size=8, seed_bits_lz = (32-8)*2 = 48
+        let seed_bits_lz = 48u32;
+
+        // word[0]: ACGTACGTACGTACGTACGTACGTACGTACGT (32 个碱基，全 A)
+        // 所有 A = 0b00...00，所以任何位置的种子哈希都应该是 0
+        let word0: u64 = 0; // 全 A
+        let word1: u64 = 0xFFFF_FFFF_FFFF_FFFF; // 全 T (0b11)
+
+        let words = vec![word0, word1];
+
+        // bit_pos=0 → word_idx=0, bit_offset=0
+        // 修复后应该只使用 word[0]，不受 word[1] 影响
+        let hash = make_seed(&words, 0, seed_bits_lz);
+        assert_eq!(
+            hash, 0,
+            "bit_offset=0 时不应从下一个 word 取数据，全 A 的种子哈希应为 0"
+        );
+
+        // 对比：如果错误地 OR 了 word[1]，结果会不同
+        // word[1] 全 T，哈希不为 0
+        let hash_t = xt3(0xFFFF_FFFF_u32);
+        assert_ne!(
+            hash, hash_t,
+            "验证全 T 的哈希确实不为 0，确保测试有效"
+        );
+    }
+
+    #[test]
+    fn test_make_seed_bit_offset_nonzero() {
+        // 测试 bit_offset!=0 时跨 word 边界的正确行为
+        // seed_size=8, seed_bits_lz = (32-8)*2 = 48
+        let seed_bits_lz = 48u32;
+
+        // word[0] 低 32 位为全 T (0b11...11)，高 32 位为 0
+        // word[1] 高 32 位为全 A (0)，低 32 位为全 T
+        let word0: u64 = 0x0000_0000_FFFF_FFFF; // 高 32 位为 0，低 32 位全 T
+        let word1: u64 = 0xFFFF_FFFF_0000_0000; // 高 32 位全 T，低 32 位为 0
+
+        let words = vec![word0, word1];
+
+        // bit_pos=32 → word_idx=0, bit_offset=32
+        // straddle = (word0 << 32) | (word1 >> 32)
+        //          = (0xFFFF_FFFF_0000_0000) | (0x0000_0000_FFFF_FFFF)
+        //          = 0xFFFF_FFFF_FFFF_FFFF（全 T）
+        // seed_bits_lz=48，取高 16 位 = 0xFFFF（8 个碱基全 T）
+        let hash = make_seed(&words, 32, seed_bits_lz);
+        let expected_hash = xt3(0xFFFF_u32); // 8 个碱基全 T 的哈希
+        assert_eq!(
+            hash, expected_hash,
+            "bit_offset=32 时应正确跨 word 边界提取种子"
+        );
+    }
+
+    #[test]
+    fn test_make_seed_with_mask_bit_offset_zero() {
+        // 测试 make_seed_with_mask 在 bit_offset=0 时的行为
+        let seed_bits_lz = 48u32;
+        let seed_bits: u64 = (1u64 << 16) - 1; // 8 个碱基
+
+        let words = vec![0u64; 2]; // 全 A
+        let mask_words = vec![0xFFFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF]; // 全有效
+
+        let (hash, has_reg) = make_seed_with_mask(&words, &mask_words, 0, seed_bits_lz, seed_bits);
+        assert_eq!(hash, 0, "全 A 的种子哈希应为 0");
+        assert!(has_reg, "所有碱基都是有效核苷酸");
+    }
+
+    /// 测试 xt3 和 xt3_64 对相同种子的哈希差异
+    ///
+    /// xt3 处理 32 位（最多 16 个碱基），xt3_64 处理 64 位（最多 32 个碱基）。
+    /// 由于权重计算方式不同，它们对相同输入产生不同的哈希值。
+    /// 因此索引构建和读段提取必须统一使用同一个函数（xt3）。
+    #[test]
+    fn test_xt3_xt3_64_differ() {
+        let seed_24bit: u64 = 0b00011011_00011011_00011011;
+        let seed_bits_lz = 40u32;
+        let seed_aligned_64 = seed_24bit << seed_bits_lz;
+        let hash_xt3 = xt3((seed_aligned_64 >> seed_bits_lz) as u32);
+        let hash_xt3_64 = xt3_64(seed_24bit) as u32;
+
+        // 验证它们确实不同（这是预期行为）
+        assert_ne!(
+            hash_xt3, hash_xt3_64,
+            "xt3 和 xt3_64 对相同输入产生不同哈希（这是预期行为）"
+        );
+
+        // 验证 xt3 的结果是我们选择的统一哈希函数
+        assert_eq!(hash_xt3, 106288);
     }
 }

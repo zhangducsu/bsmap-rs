@@ -138,9 +138,47 @@ impl BinSeqCollection {
 
     /// Map a (chr, loc) hit to a flattened integer offset.
     /// Matches C++ `RefSeq::hit2int()`.
+    ///
+    /// `chr` is the block.id (chr_idx * 2 + chain), where even = forward, odd = RC.
+    /// The flat offset encodes both the strand (via refcat vs crefcat) and position.
     #[inline]
     pub fn hit2int(&self, chr: u32, loc: u32) -> u32 {
-        self.ref_anchor[chr as usize / 2] + loc
+        let chr_idx = chr as usize / 2;
+        let _chain = chr as usize % 2;
+        // ref_anchor is indexed by chromosome (not by strand).
+        // Forward chains (chain=0) use refcat offsets, RC chains (chain=1) use crefcat offsets.
+        // Since refcat and crefcat are laid out identically (same anchor offsets),
+        // we can use the same anchor but the caller must select refcat vs crefcat.
+        self.ref_anchor[chr_idx] + loc
+    }
+
+    /// Reverse map: flattened integer offset to (chr, loc).
+    /// Matches C++ `RefSeq::int2hit()`.
+    ///
+    /// Returns (chr, loc) where chr is the chromosome index (not block.id).
+    /// The caller is responsible for determining the strand.
+    #[inline]
+    pub fn int2hit(&self, pos: u32) -> (u32, u32) {
+        // 找到对应的染色体
+        if self.ref_anchor.is_empty() {
+            return (0, pos);
+        }
+        // Handle pos < ref_anchor[0] (shouldn't happen with valid positions)
+        if pos < self.ref_anchor[0] {
+            return (0, pos);
+        }
+        for (i, &anchor) in self.ref_anchor.iter().enumerate().skip(1) {
+            if pos < anchor {
+                let chr = (i - 1) as u32;
+                let loc = pos - self.ref_anchor[i - 1];
+                return (chr, loc);
+            }
+        }
+        // 如果超出范围，返回最后一个染色体
+        let last_idx = self.ref_anchor.len().saturating_sub(2);
+        let chr = last_idx as u32;
+        let loc = pos - self.ref_anchor[last_idx];
+        (chr, loc)
     }
 }
 
@@ -311,10 +349,11 @@ mod tests {
 
     #[test]
     fn test_encode_revcomp_simple() {
-        let seq = b"ACGT"; // rev: TGCA → rev_alphabet: A(3) C(2) G(1) T(0) → 11 01 10 00
+        let seq = b"ACGT";
+        // 反向互补: ACGT → 反向 TGCA → REV_ALPHABET: T(0) G(1) C(2) A(3)
+        // 编码: 00 01 10 11, left-aligned to 64 bits
         let bs = encode_revcomp(seq);
-        // TGCA = 11 01 10 00, left-aligned
-        let expected: u64 = 0b11011000u64 << 56;
+        let expected: u64 = 0b00011011u64 << 56;
         assert_eq!(bs.words[0], expected);
     }
 

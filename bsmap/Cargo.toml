@@ -17,7 +17,13 @@ rayon = { workspace = true }
 crossbeam-channel = { workspace = true }
 flate2 = { workspace = true }
 needletail = { workspace = true }
-noodles = { workspace = true, features = ["bam", "sam", "core", "csi", "tabix"] }
+noodles = { workspace = true, features = ["bam", "sam", "core", "csi", "tabix", "bgzf"] }
 log = { workspace = true }
 env_logger = { workspace = true }
 indicatif = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+memmap2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
