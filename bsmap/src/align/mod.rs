@@ -99,7 +99,6 @@ impl Chain {
     }
 
     /// 判断是否为正义链读段。
-    #[inline]
     pub fn is_read_forward(self) -> bool {
         self.read_chain() == 0
     }

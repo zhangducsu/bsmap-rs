@@ -249,18 +249,35 @@ pub fn xm64(tt: u64) -> u32 {
 /// bases, converts via XT3 (C/T merged), and returns the hash index.
 ///
 /// Equivalent to C++ `RefSeq::s_MakeSeed_1(bit64_t *_m, int _a)`.
+/// C++: ((_m[0]<<(_a*2))|((_m[1]>>1)>>(63-_a*2)))
+/// where _a is the base position within the word (0-31), so _a*2 is bit_offset (0-62)
 #[inline]
 pub fn make_seed(words: &[u64], bit_pos: u32, seed_bits_lz: u32) -> u32 {
-    let word_idx = (bit_pos / (SEGLEN as u32 * 2)) as usize;
+    let word_idx = (bit_pos / 64) as usize;
     let bit_offset = (bit_pos % 64) as u32;
 
+    // 检查边界
+    if word_idx >= words.len() {
+        return 0;
+    }
+
     // 跨越两个 word 提取种子（如果种子跨越 64 位边界）
-    // 当 bit_offset=0 时，不需要从下一个 word 取数据
+    // C++: ((_m[0]<<(_a*2))|((_m[1]>>1)>>(63-_a*2)))
+    // 简化: ((_m[0]<<bit_offset)|(_m[1]>>(64-bit_offset)))
+    // 当 bit_offset=0: _m[0] | 0 = _m[0]
+    // 当 bit_offset=32: (_m[0]<<32) | (_m[1]>>32)
+    //
+    // 注意：当没有下一个 word 时，我们模拟 _m[1] = 0
+    // 这样 straddle = (_m[0] << bit_offset) | 0 = _m[0] << bit_offset
+    // 然后右移 seed_bits_lz 取所需的位
     let straddle: u64 = if bit_offset == 0 {
         words[word_idx]
-    } else {
+    } else if word_idx + 1 < words.len() {
         (words[word_idx] << bit_offset)
             | (words[word_idx + 1] >> (64 - bit_offset))
+    } else {
+        // 边界情况：没有下一个 word，模拟填充 0
+        words[word_idx] << bit_offset
     };
 
     xt3((straddle >> seed_bits_lz) as u32)
@@ -278,22 +295,28 @@ pub fn make_seed_with_mask(
     seed_bits_lz: u32,
     seed_bits: u64,
 ) -> (u32, bool) {
-    let word_idx = (bit_pos / (SEGLEN as u32 * 2)) as usize;
+    let word_idx = (bit_pos / 64) as usize;
     let bit_offset = (bit_pos % 64) as u32;
 
     // 当 bit_offset=0 时，不需要从下一个 word 取数据
+    // C++: ((_m[0]<<(_a*2))|((_m[1]>>1)>>(63-_a*2)))
+    // 简化: ((_m[0]<<bit_offset)|(_m[1]>>(64-bit_offset)))
     let straddle: u64 = if bit_offset == 0 {
         words[word_idx]
-    } else {
+    } else if word_idx + 1 < words.len() {
         (words[word_idx] << bit_offset)
             | (words[word_idx + 1] >> (64 - bit_offset))
+    } else {
+        words[word_idx] << bit_offset
     };
 
     let mask_straddle: u64 = if bit_offset == 0 {
         mask_words[word_idx]
-    } else {
+    } else if word_idx + 1 < mask_words.len() {
         (mask_words[word_idx] << bit_offset)
             | (mask_words[word_idx + 1] >> (64 - bit_offset))
+    } else {
+        mask_words[word_idx] << bit_offset
     };
 
     let seed = xt3((straddle >> seed_bits_lz) as u32);

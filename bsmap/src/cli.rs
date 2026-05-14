@@ -209,7 +209,11 @@ pub enum Commands {
         #[arg(short = 'x', value_name = "INT", default_value = "1000")]
         max_insert: u32,
 
-        /// Mapping strand: 0=forward only, 1=all 4 strands.
+        /// Set mapping strand information.
+        /// -n 0: only map to 2 forward strands, i.e. BSW(++) and BSC(-+) (Lister protocol, default).
+        ///       For PE sequencing, map read#1 to ++ and -+, read#2 to +- and --.
+        /// -n 1: map SE or PE reads to all 4 strands, i.e. ++, +-, -+, -- (Cokus protocol).
+        /// Default: 0. Most bisulfite sequencing data is generated only from forward strands.
         #[arg(short = 'n', value_name = "INT", default_value = "0")]
         chains: u8,
 

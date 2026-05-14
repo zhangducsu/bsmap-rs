@@ -177,48 +177,71 @@ impl PairAlign {
     /// 对应 C++ `GetPairs()`。
     /// 使用双指针法按染色体分组比较，避免 O(n²) 全交叉比较。
     ///
-    /// # 配对逻辑
+    /// # 配对逻辑（与 C++ BSMAP 一致）
     ///
-    /// - chain=0 (a+ vs b-): read_a 正向 vs read_b 反向
-    /// - chain=1 (a- vs b+): read_a 反向 vs read_b 正向
+    /// C++ BSMAP 中 `hits` = read_chain=0 的命中（++, -+），`chits` = read_chain=1 的命中（+-, --）。
     ///
-    /// # 双指针优化
+    /// - chain=0 (a+ vs b-): read_a 正向读段(hits_a) vs read_b 反向读段(chits_b)
+    ///   - hits_a 包含 ++ (strand=0) 和 -+ (strand=2)
+    ///   - chits_b 包含 +- (strand=1) 和 -- (strand=3)
+    ///   - 实际配对: ++ (a) vs -- (b), 即 a正向读段+正向参考 vs b反向读段+反向参考
     ///
-    /// 1. 按染色体对命中分组
-    /// 2. 对每个染色体，只比较该染色体上的命中
-    /// 3. 避免全交叉比较，复杂度从 O(n²) 降到 O(n log n)
+    /// - chain=1 (a- vs b+): read_a 反向读段(chits_a) vs read_b 正向读段(hits_b)
+    ///   - chits_a 包含 +- (strand=1) 和 -- (strand=3)
+    ///   - hits_b 包含 ++ (strand=0) 和 -+ (strand=2)
+    ///   - 实际配对: -+ (a) vs +- (b), 即 a正向读段+反向参考 vs b反向读段+正向参考
+    ///
+    /// # Insert size 计算
+    ///
+    /// 与 C++ BSMAP 一致，根据每个 hit 自身的 ref_chain（`hit.strand >> 1`）决定方向：
+    /// - chain=0, ref_chain_a=0: seg_start=hit_a.loc, seg_end=hit_b.loc+read_len_b
+    /// - chain=0, ref_chain_a=1: seg_start=hit_b.loc, seg_end=hit_a.loc+read_len_a
+    /// - chain=1, ref_chain_a=0: seg_start=hit_b.loc, seg_end=hit_a.loc+read_len_a
+    /// - chain=1, ref_chain_a=1: seg_start=hit_a.loc, seg_end=hit_b.loc+read_len_b
     pub fn get_pairs(
         &mut self,
-        hits_a: &[GHit],      // read_a 在 snp_level=na 的命中
-        hits_b: &[GHit],      // read_b 在 snp_level=nb 的命中（正向）
-        chits_a: &[GHit],     // read_a 的反向命中
-        chits_b: &[GHit],     // read_b 的反向命中
+        hits_a: &[GHit],      // read_a 的正向读段命中 (read_chain=0: ++, -+)
+        hits_b: &[GHit],      // read_b 的正向读段命中 (read_chain=0: ++, -+)
+        chits_a: &[GHit],     // read_a 的反向读段命中 (read_chain=1: +-, --)
+        chits_b: &[GHit],     // read_b 的反向读段命中 (read_chain=1: +-, --)
         na: u8,
         nb: u8,
         config: &AlignConfig,
         read_len_a: u32,
         read_len_b: u32,
+        coll: &BinSeqCollection,
     ) -> usize {
         let mut found_pairs = 0usize;
 
-        // Chain 0: a+ vs b-
-        // read_a 正向 (hits_a) vs read_b 反向 (chits_b)
+        // Chain 0: a正向读段(hits_a) vs b反向读段(chits_b)
+        // 对应 C++: _sa.hits[na] vs _sb.chits[nb]
         found_pairs += self.find_pairs_chain0(
-            hits_a, chits_b, na, nb, config, read_len_a, read_len_b,
+            hits_a, chits_b, na, nb, config, read_len_a, read_len_b, coll,
         );
 
-        // Chain 1: a- vs b+
-        // read_a 反向 (chits_a) vs read_b 正向 (hits_b)
+        // Chain 1: a反向读段(chits_a) vs b正向读段(hits_b)
+        // 对应 C++: _sa.chits[na] vs _sb.hits[nb]
         found_pairs += self.find_pairs_chain1(
-            chits_a, hits_b, na, nb, config, read_len_a, read_len_b,
+            chits_a, hits_b, na, nb, config, read_len_a, read_len_b, coll,
         );
 
         found_pairs
     }
 
-    /// Chain 0: a+ vs b- 配对。
+    /// Chain 0: a正向读段 vs b反向读段 配对。
     ///
-    /// read_a 正向命中 vs read_b 反向命中。
+    /// 对应 C++ GetPairs 中 chain=0 的逻辑：
+    /// ```cpp
+    /// if(chra&1) {
+    ///     seg_start=_sb.chits[nb][j].loc;
+    ///     seg_end=_sa.hits[na][i].loc+_sa._pread->seq.size();
+    /// } else {
+    ///     seg_start=_sa.hits[na][i].loc;
+    ///     seg_end=_sb.chits[nb][j].loc+_sb._pread->seq.size();
+    /// }
+    /// ```
+    /// 其中 chra = hit_a.chr，chra&1 = ref_chain。
+    /// 在 Rust 中，ref_chain 从 hit.strand >> 1 获取。
     fn find_pairs_chain0(
         &mut self,
         hits_a: &[GHit],
@@ -228,22 +251,35 @@ impl PairAlign {
         config: &AlignConfig,
         read_len_a: u32,
         read_len_b: u32,
+        coll: &BinSeqCollection,
     ) -> usize {
         let mut found = 0usize;
 
-        // 按染色体分组 read_b 的反向命中
+        // 按染色体分组 read_b 的反向读段命中
         let grouped_b = group_hits_by_chr(chits_b);
 
-        // 遍历 read_a 的正向命中
+        // 遍历 read_a 的正向读段命中
         for hit_a in hits_a {
             let chr_a = hit_a.chr;
+            let ref_chain_a = hit_a.strand >> 1; // 对应 C++ 的 chra&1
 
-            // 找到该染色体在 read_b 反向命中中的范围
+            // 获取 hit_a 的转换后坐标（C++ int2hit 已转换）
+            let converted_loc_a = convert_loc(hit_a, read_len_a, coll);
+
+            // 找到该染色体在 read_b 反向读段命中中的范围
             if let Some((_, hits_b_chr)) = grouped_b.iter().find(|(chr, _)| *chr == chr_a as u16) {
                 for hit_b in hits_b_chr {
-                    // 计算 insert size
-                    // a+ vs b-: insert = hit_b.loc + read_len_b - hit_a.loc
-                    let insert = calculate_insert(hit_a, hit_b, read_len_a, read_len_b, 0);
+                    // 获取 hit_b 的转换后坐标
+                    let converted_loc_b = convert_loc(*hit_b, read_len_b, coll);
+
+                    // 计算 insert size（与 C++ BSMAP 一致，使用转换后坐标）
+                    let insert = if ref_chain_a == 1 {
+                        // ref_chain=1 (反向参考): seg_start=hit_b.loc, seg_end=hit_a.loc+read_len_a
+                        (converted_loc_a + read_len_a).saturating_sub(converted_loc_b)
+                    } else {
+                        // ref_chain=0 (正向参考): seg_start=hit_a.loc, seg_end=hit_b.loc+read_len_b
+                        (converted_loc_b + read_len_b).saturating_sub(converted_loc_a)
+                    };
 
                     // 检查 insert size 范围
                     if insert >= config.min_insert && insert <= config.max_insert {
@@ -269,9 +305,19 @@ impl PairAlign {
         found
     }
 
-    /// Chain 1: a- vs b+ 配对。
+    /// Chain 1: a反向读段 vs b正向读段 配对。
     ///
-    /// read_a 反向命中 vs read_b 正向命中。
+    /// 对应 C++ GetPairs 中 chain=1 的逻辑：
+    /// ```cpp
+    /// if((chra&1)==0) {
+    ///     seg_start=_sb.hits[nb][j].loc;
+    ///     seg_end=_sa.chits[na][i].loc+_sa._pread->seq.size();
+    /// } else {
+    ///     seg_start=_sa.chits[na][i].loc;
+    ///     seg_end=_sb.hits[nb][j].loc+_sb._pread->seq.size();
+    /// }
+    /// ```
+    /// 其中 chra = hit_a.chr（来自 chits_a），chra&1 = ref_chain。
     fn find_pairs_chain1(
         &mut self,
         chits_a: &[GHit],
@@ -281,22 +327,35 @@ impl PairAlign {
         config: &AlignConfig,
         read_len_a: u32,
         read_len_b: u32,
+        coll: &BinSeqCollection,
     ) -> usize {
         let mut found = 0usize;
 
-        // 按染色体分组 read_b 的正向命中
+        // 按染色体分组 read_b 的正向读段命中
         let grouped_b = group_hits_by_chr(hits_b);
 
-        // 遍历 read_a 的反向命中
+        // 遍历 read_a 的反向读段命中
         for hit_a in chits_a {
             let chr_a = hit_a.chr;
+            let ref_chain_a = hit_a.strand >> 1; // 对应 C++ 的 chra&1
 
-            // 找到该染色体在 read_b 正向命中中的范围
+            // 获取 hit_a 的转换后坐标
+            let converted_loc_a = convert_loc(hit_a, read_len_a, coll);
+
+            // 找到该染色体在 read_b 正向读段命中中的范围
             if let Some((_, hits_b_chr)) = grouped_b.iter().find(|(chr, _)| *chr == chr_a as u16) {
                 for hit_b in hits_b_chr {
-                    // 计算 insert size
-                    // a- vs b+: insert = hit_a.loc + read_len_a - hit_b.loc
-                    let insert = calculate_insert(hit_a, hit_b, read_len_a, read_len_b, 1);
+                    // 获取 hit_b 的转换后坐标
+                    let converted_loc_b = convert_loc(*hit_b, read_len_b, coll);
+
+                    // 计算 insert size（与 C++ BSMAP 一致，使用转换后坐标）
+                    let insert = if ref_chain_a == 0 {
+                        // ref_chain=0 (正向参考): seg_start=hit_b.loc, seg_end=hit_a.loc+read_len_a
+                        (converted_loc_a + read_len_a).saturating_sub(converted_loc_b)
+                    } else {
+                        // ref_chain=1 (反向参考): seg_start=hit_a.loc, seg_end=hit_b.loc+read_len_b
+                        (converted_loc_b + read_len_b).saturating_sub(converted_loc_a)
+                    };
 
                     // 检查 insert size 范围
                     if insert >= config.min_insert && insert <= config.max_insert {
@@ -376,21 +435,23 @@ impl PairAlign {
                     continue;
                 }
 
-                // 分离正向和反向命中
-                let (hits_a_fwd, hits_a_rev) = split_hits_by_strand(&self.align_a.hits[na]);
-                let (hits_b_fwd, hits_b_rev) = split_hits_by_strand(&self.align_b.hits[nb]);
+                // 按 read_chain 分离命中（对应 C++ 的 hits/chits）
+                // hits = read_chain=0 (++, -+), chits = read_chain=1 (+-, --)
+                let (hits_a, chits_a) = split_hits_by_read_chain(&self.align_a.hits[na]);
+                let (hits_b, chits_b) = split_hits_by_read_chain(&self.align_b.hits[nb]);
 
                 // 查找配对
                 let _found = self.get_pairs(
-                    &hits_a_fwd,
-                    &hits_b_fwd,
-                    &hits_a_rev,
-                    &hits_b_rev,
+                    &hits_a,
+                    &hits_b,
+                    &chits_a,
+                    &chits_b,
                     na as u8,
                     nb as u8,
                     config,
                     read_len_a,
                     read_len_b,
+                    coll,
                 );
 
                 // 提前终止策略：如果找到配对且 nt3 模式，立即返回
@@ -641,6 +702,35 @@ impl PairBatchResult {
     }
 }
 
+/// 将 hit 的 loc 转换为与 C++ int2hit 一致的坐标。
+///
+/// C++ int2hit 对反向参考链做了坐标转换：
+/// `gh.loc = rc_offset - map_readlen - gh.loc`
+/// 其中 rc_offset = chr_len + 2*REF_MARGIN（包含 padding）。
+///
+/// 对于正向参考链（ref_chain=0），loc 不变。
+/// 对于反向参考链（ref_chain=1），loc 转换为从染色体末端算起的位置。
+///
+/// 注意：这里使用 chr_len（不含 padding）而非 rc_offset（含 padding），
+/// 因为 insert size 计算中 padding 会抵消。
+fn convert_loc(hit: &GHit, read_len: u32, coll: &BinSeqCollection) -> u32 {
+    let ref_chain = hit.strand >> 1;
+    if ref_chain == 0 {
+        hit.loc
+    } else {
+        // C++ int2hit: gh.loc = rc_offset - map_readlen - loc
+        // rc_offset = total_len = ((seq_len + SEGLEN-1)/SEGLEN + BINSEQPAD) * SEGLEN
+        let rc_offset = coll.total_len_for_chr(hit.chr as usize);
+        rc_offset - read_len - hit.loc
+    }
+}
+
+/// 获取染色体长度（不含 BINSEQPAD padding）。
+fn get_chr_length(chr: u32, coll: &BinSeqCollection) -> u32 {
+    use crate::align::output::get_chromosome_length;
+    get_chromosome_length(chr, coll)
+}
+
 /// 按染色体分组的命中列表（用于双指针优化）。
 ///
 /// 返回按染色体排序的 (chr, hits) 列表。
@@ -658,38 +748,30 @@ fn group_hits_by_chr(hits: &[GHit]) -> Vec<(u16, Vec<&GHit>)> {
     result
 }
 
-/// 分离正向和反向命中。
+/// 分离正向读段和反向读段的命中。
 ///
-/// 根据 strand 字段分离命中：
-/// - strand & 1 == 0: 正向（读段正义链）
-/// - strand & 1 == 1: 反向（读段反义链）
-fn split_hits_by_strand(hits: &[GHit]) -> (Vec<GHit>, Vec<GHit>) {
-    let mut fwd = Vec::new();
-    let mut rev = Vec::new();
+/// 对应 C++ BSMAP 中 `SingleAlign` 的 `hits`（read_chain=0）和 `chits`（read_chain=1）分离。
+///
+/// 根据 strand 字段的低位（read_chain）分离命中：
+/// - strand & 1 == 0: 正向读段（++ 和 -+）
+/// - strand & 1 == 1: 反向读段（+- 和 --）
+fn split_hits_by_read_chain(hits: &[GHit]) -> (Vec<GHit>, Vec<GHit>) {
+    let mut fwd_read = Vec::new();  // read_chain=0: hits (++, -+)
+    let mut rev_read = Vec::new();  // read_chain=1: chits (+-, --)
 
     for hit in hits {
-        // strand 的最低位表示读段链：0=正向，1=反向
         if hit.strand & 1 == 0 {
-            fwd.push(*hit);
+            fwd_read.push(*hit);
         } else {
-            rev.push(*hit);
+            rev_read.push(*hit);
         }
     }
 
-    (fwd, rev)
+    (fwd_read, rev_read)
 }
 
-/// 计算 insert size。
-///
-/// # 参数
-/// - `hit_a`: read_a 的命中
-/// - `hit_b`: read_b 的命中
-/// - `read_len_a`: read_a 的长度
-/// - `read_len_b`: read_b 的长度
-/// - `chain`: 链组合（0=a+ vs b-, 1=a- vs b+）
-///
-/// # 返回值
-/// Insert size
+/// 计算 insert size（已废弃，逻辑已内联到 find_pairs_chain0/chain1）。
+#[allow(dead_code)]
 fn calculate_insert(
     hit_a: &GHit,
     hit_b: &GHit,
@@ -878,22 +960,22 @@ mod tests {
     }
 
     #[test]
-    fn test_split_hits_by_strand() {
+    fn test_split_hits_by_read_chain() {
         let hits = vec![
-            GHit { loc: 100, chr: 0, strand: 0, gap_size: 0, gap_pos: 0, snps: 0 }, // 正向
-            GHit { loc: 200, chr: 0, strand: 1, gap_size: 0, gap_pos: 0, snps: 0 }, // 反向
-            GHit { loc: 300, chr: 0, strand: 2, gap_size: 0, gap_pos: 0, snps: 0 }, // 正向 (strand & 1 == 0)
-            GHit { loc: 400, chr: 0, strand: 3, gap_size: 0, gap_pos: 0, snps: 0 }, // 反向 (strand & 1 == 1)
+            GHit { loc: 100, chr: 0, strand: 0, gap_size: 0, gap_pos: 0, snps: 0 }, // ++: read_chain=0
+            GHit { loc: 200, chr: 0, strand: 1, gap_size: 0, gap_pos: 0, snps: 0 }, // +-: read_chain=1
+            GHit { loc: 300, chr: 0, strand: 2, gap_size: 0, gap_pos: 0, snps: 0 }, // -+: read_chain=0
+            GHit { loc: 400, chr: 0, strand: 3, gap_size: 0, gap_pos: 0, snps: 0 }, // --: read_chain=1
         ];
 
-        let (fwd, rev) = split_hits_by_strand(&hits);
+        let (fwd_read, rev_read) = split_hits_by_read_chain(&hits);
 
-        assert_eq!(fwd.len(), 2);
-        assert_eq!(rev.len(), 2);
-        assert_eq!(fwd[0].loc, 100);
-        assert_eq!(fwd[1].loc, 300);
-        assert_eq!(rev[0].loc, 200);
-        assert_eq!(rev[1].loc, 400);
+        assert_eq!(fwd_read.len(), 2);  // ++ and -+
+        assert_eq!(rev_read.len(), 2);  // +- and --
+        assert_eq!(fwd_read[0].loc, 100);
+        assert_eq!(fwd_read[1].loc, 300);
+        assert_eq!(rev_read[0].loc, 200);
+        assert_eq!(rev_read[1].loc, 400);
     }
 
     #[test]

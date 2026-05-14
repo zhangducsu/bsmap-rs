@@ -65,7 +65,7 @@ pub fn count_mismatch(
     let word_offset = (offset / 64) as usize;
     let bit_offset = (offset % 64) as u32;
 
-    let mut total_mismatches: u32 = 0;
+    let mut total_mismatches: u32 = n_count;
 
     // 处理跨 word 边界的情况
     if bit_offset == 0 {
@@ -78,13 +78,12 @@ pub fn count_mismatch(
             // 计算差异
             let mut diff = q_word ^ ref_word;
 
-            // 应用 C→T 容忍掩码（如果不是 nt3 模式）
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            // 应用 C→T 容忍掩码
+            // WGBS 中 C↔T 不算 mismatch（亚硫酸氢盐转换）
+            diff &= xc64(ref_word);
 
-            // 应用有效碱基掩码：N 位置设为 0（匹配）
-            diff |= !m_word;
+            // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
+            diff &= m_word;
 
             // 统计 mismatch
             total_mismatches += xm64(diff);
@@ -96,14 +95,15 @@ pub fn count_mismatch(
         }
     } else {
         // 复杂情况：需要处理跨 word 边界
+        // 提取以 bit_offset 开始的 64-bit 窗口（与 make_seed 一致）
         let shift_left = bit_offset;
         let shift_right = 64 - bit_offset;
 
         for i in 0..query.len() {
-            // 从参考序列提取对齐的 word
-            let ref_low = ref_seq[word_offset + i] >> shift_left;
+            // 从参考序列提取对齐的 word（与 make_seed 一致的移位方向）
+            let ref_low = ref_seq[word_offset + i] << shift_left;
             let ref_high = if word_offset + i + 1 < ref_seq.len() {
-                ref_seq[word_offset + i + 1] << shift_right
+                ref_seq[word_offset + i + 1] >> shift_right
             } else {
                 0
             };
@@ -116,12 +116,10 @@ pub fn count_mismatch(
             let mut diff = q_word ^ ref_word;
 
             // 应用 C→T 容忍掩码
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            diff &= xc64(ref_word);
 
-            // 应用有效碱基掩码
-            diff |= !m_word;
+            // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
+            diff &= m_word;
 
             // 统计 mismatch
             total_mismatches += xm64(diff);
@@ -133,8 +131,7 @@ pub fn count_mismatch(
         }
     }
 
-    // 减去 N 碱基数（N 被算作 mismatch，但不应计入）
-    total_mismatches.saturating_sub(n_count)
+    total_mismatches
 }
 
 /// 记录所有 mismatch 位置（无 gap）。
@@ -186,9 +183,7 @@ pub fn mismatch_pattern_0(
             let mut diff = q_word ^ ref_word;
 
             // 应用 C→T 容忍掩码
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            diff &= xc64(ref_word);
 
             // 提取有效碱基对应的位（每 2-bit 一个碱基）
             // 将 diff 转换为每个碱基的 mismatch 指示
@@ -206,6 +201,7 @@ pub fn mismatch_pattern_0(
             bases_processed += bases_in_word as u32;
         }
     } else {
+        // 提取以 bit_offset 开始的 64-bit 窗口（与 make_seed 一致）
         let shift_left = bit_offset;
         let shift_right = 64 - bit_offset;
 
@@ -214,10 +210,10 @@ pub fn mismatch_pattern_0(
                 break;
             }
 
-            // 从参考序列提取对齐的 word
-            let ref_low = ref_seq[word_offset + i] >> shift_left;
+            // 从参考序列提取对齐的 word（与 make_seed 相同的移位方向）
+            let ref_low = ref_seq[word_offset + i] << shift_left;
             let ref_high = if word_offset + i + 1 < ref_seq.len() {
-                ref_seq[word_offset + i + 1] << shift_right
+                ref_seq[word_offset + i + 1] >> shift_right
             } else {
                 0
             };
@@ -229,9 +225,7 @@ pub fn mismatch_pattern_0(
             let mut diff = q_word ^ ref_word;
 
             // 应用 C→T 容忍掩码
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            diff &= xc64(ref_word);
 
             let bases_in_word = ((map_readlen - bases_processed).min(SEGLEN as u32)) as usize;
 
@@ -290,9 +284,7 @@ pub fn mismatch_pattern_1(
             let mut diff = q_word ^ ref_word;
 
             // 应用 C→T 容忍掩码
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            diff &= xc64(ref_word);
 
             // 计算这个 word 中的碱基范围
             let word_start_base = i * SEGLEN;
@@ -308,14 +300,15 @@ pub fn mismatch_pattern_1(
             }
         }
     } else {
+        // 提取以 bit_offset 开始的 64-bit 窗口（与 make_seed 一致）
         let shift_left = bit_offset;
         let shift_right = 64 - bit_offset;
 
         for i in (0..num_words).rev() {
-            // 从参考序列提取对齐的 word
-            let ref_low = ref_seq[word_offset + i] >> shift_left;
+            // 从参考序列提取对齐的 word（与 make_seed 相同的移位方向）
+            let ref_low = ref_seq[word_offset + i] << shift_left;
             let ref_high = if word_offset + i + 1 < ref_seq.len() {
-                ref_seq[word_offset + i + 1] << shift_right
+                ref_seq[word_offset + i + 1] >> shift_right
             } else {
                 0
             };
@@ -327,9 +320,7 @@ pub fn mismatch_pattern_1(
             let mut diff = q_word ^ ref_word;
 
             // 应用 C→T 容忍掩码
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            diff &= xc64(ref_word);
 
             let word_start_base = i * SEGLEN;
             let bases_in_word = ((map_readlen as usize).saturating_sub(word_start_base)).min(SEGLEN);
@@ -395,7 +386,7 @@ unsafe fn count_mismatch_avx2(
     let word_offset = (offset / 64) as usize;
     let bit_offset = (offset % 64) as u32;
 
-    let mut total_mismatches: u32 = 0;
+    let mut total_mismatches: u32 = n_count;
 
     // AVX2 每次处理 4 个 u64（256 bits）
     let simd_len = query.len() / 4 * 4;
@@ -411,9 +402,8 @@ unsafe fn count_mismatch_avx2(
             // XOR 计算差异
             let diff_vec = _mm256_xor_si256(q_vec, r_vec);
 
-            // 应用掩码：diff | !mask
-            let not_mask = _mm256_xor_si256(m_vec, _mm256_set1_epi64x(-1));
-            let masked_diff = _mm256_or_si256(diff_vec, not_mask);
+            // 应用掩码：diff & mask（mask=0 的位置清零不计入）
+            let masked_diff = _mm256_and_si256(diff_vec, m_vec);
 
             // 提取到数组进行 popcount（AVX2 没有原生 popcount）
             let mut diffs = [0u64; 4];
@@ -423,10 +413,8 @@ unsafe fn count_mismatch_avx2(
                 let mut diff = diffs[j];
 
                 // 应用 C→T 容忍掩码
-                if !nt3 {
-                    let ref_word = ref_seq[word_offset + i + j];
-                    diff &= xc64(ref_word);
-                }
+                let ref_word = ref_seq[word_offset + i + j];
+                diff &= xc64(ref_word);
 
                 total_mismatches += xm64(diff);
 
@@ -444,11 +432,9 @@ unsafe fn count_mismatch_avx2(
 
             let mut diff = q_word ^ ref_word;
 
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            diff &= xc64(ref_word);
 
-            diff |= !m_word;
+            diff &= m_word;
             total_mismatches += xm64(diff);
 
             if total_mismatches > snp_thres {
@@ -460,7 +446,7 @@ unsafe fn count_mismatch_avx2(
         return count_mismatch(query, offset, ref_seq, mask, snp_thres, n_count, nt3);
     }
 
-    total_mismatches.saturating_sub(n_count)
+    total_mismatches
 }
 
 /// 非 x86_64 平台的 SIMD 存根。

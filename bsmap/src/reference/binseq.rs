@@ -57,6 +57,8 @@ pub struct BinSeqCollection {
     pub blocks: Vec<Block>,
     /// Per-chromosome BinarySeq (for other consumers, not used in alignment).
     pub seqs: Vec<BinarySeq>,
+    /// Chromosome names (from FASTA headers).
+    pub chr_names: Vec<String>,
 }
 
 impl BinSeqCollection {
@@ -95,16 +97,20 @@ impl BinSeqCollection {
         blocks.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.begin.cmp(&b.begin)));
 
         // Compute anchor positions and concatenate
-        let mut ref_anchor = Vec::with_capacity(total_num as usize + 1);
+        // C++ ref_anchor only accumulates forward-strand blocks (even indices),
+        // not reverse-complement blocks. Each chromosome has 2 blocks:
+        //   block[2*chr] = forward, block[2*chr+1] = reverse-complement
+        let num_chromosomes = refs.len();
+        let mut ref_anchor = Vec::with_capacity(num_chromosomes + 1);
         ref_anchor.push((REF_MARGIN * SEGLEN as usize) as u32);
 
-        let mut total_words: usize = 0;
-        for i in 0..total_num as usize {
-            total_words += seqs[i].n as usize;
-            ref_anchor.push(((total_words + REF_MARGIN) * SEGLEN as usize) as u32);
+        let mut total_fwd_words: usize = 0;
+        for i in 0..num_chromosomes {
+            total_fwd_words += seqs[i * 2].n as usize;
+            ref_anchor.push(((total_fwd_words + REF_MARGIN) * SEGLEN as usize) as u32);
         }
 
-        let refcat_len = total_words + REF_MARGIN * 2;
+        let refcat_len = total_fwd_words + REF_MARGIN * 2;
         let mut refcat = vec![0u64; refcat_len];
         let mut crefcat = vec![0u64; refcat_len];
 
@@ -125,6 +131,9 @@ impl BinSeqCollection {
 
         let sum_length: u64 = refs.iter().map(|r| r.len as u64).sum();
 
+        // Collect chromosome names
+        let chr_names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
+
         Self {
             total_num,
             sum_length,
@@ -133,6 +142,7 @@ impl BinSeqCollection {
             ref_anchor,
             blocks,
             seqs,
+            chr_names,
         }
     }
 
@@ -179,6 +189,22 @@ impl BinSeqCollection {
         let chr = last_idx as u32;
         let loc = pos - self.ref_anchor[last_idx];
         (chr, loc)
+    }
+
+    /// 获取指定染色体的反向链总长度（以碱基为单位）。
+    ///
+    /// 对应 C++ 的 `ref.title[chr].rc_offset`。
+    /// 用于反向链位置翻转：`flipped_loc = rc_offset - read_len - loc`
+    pub fn total_len_for_chr(&self, chr_idx: usize) -> u32 {
+        // C++: rc_offset = ((length + SEGLEN - 1) / SEGLEN + BINSEQPAD) * SEGLEN
+        // ref_anchor[chr_idx+1] - ref_anchor[chr_idx] 包含了 margin，
+        // 所以需要减去 margin
+        if chr_idx + 1 < self.ref_anchor.len() {
+            self.ref_anchor[chr_idx + 1] - self.ref_anchor[chr_idx]
+        } else {
+            // 最后一个染色体
+            self.ref_anchor[chr_idx] // fallback
+        }
     }
 }
 

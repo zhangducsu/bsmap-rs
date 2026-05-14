@@ -151,8 +151,10 @@ fn build_record(
         hit.gap_pos as u8,
     );
 
-    // 选择输出序列（根据读段链）
-    let (seq, qual) = select_output_seq(read, chain.is_read_forward());
+    // 选择输出序列（根据参考链）
+    // 当参考链为反向时（-+ 和 --），输出反向互补序列
+    let rev_seq = !chain.is_ref_forward();
+    let (seq, qual) = select_output_seq(read, rev_seq);
 
     // 构建 ZS 标签
     let zs = make_zs_tag(
@@ -160,12 +162,23 @@ fn build_record(
         if chain.is_read_forward() { 0 } else { 1 },
     );
 
+    // 计算输出位置
+    // 对于反向参考链，需要将 crefcat 坐标转换为正向参考坐标
+    let pos = if chain.is_ref_forward() {
+        hit.loc + 1 // 正向链：直接转换为 1-based
+    } else {
+        // 反向链：hit.loc 是 crefcat 上的相对位置（不包括 REF_MARGIN）
+        // 转换为正向参考坐标：chr_len - hit.loc - read_len + 1
+        let chr_len = get_chromosome_length(hit.chr, coll);
+        chr_len - hit.loc - read.seq.len() as u32 + 1
+    };
+
     AlignmentRecord {
         read_name: read.name.clone(),
         seq,
         qual,
         ref_name,
-        pos: hit.loc + 1, // 转换为 1-based
+        pos,
         flag,
         mapq,
         cigar,
@@ -309,7 +322,8 @@ fn calculate_flag(chain: Chain, is_unique: bool, total_hits: usize) -> u16 {
 
     // 0x4: 读段未比对（这里假设已比对）
     // 0x10: 序列反向互补
-    if !chain.is_read_forward() {
+    // 对于反向参考链（-+ 和 --），序列需要反向互补
+    if !chain.is_ref_forward() {
         flag |= 0x10;
     }
 
@@ -335,33 +349,54 @@ fn calculate_flag(chain: Chain, is_unique: bool, total_hits: usize) -> u16 {
 ///
 /// # 返回值
 /// MAPQ 分数（0-255）
-fn calculate_mapq(snps: u32, is_unique: bool, total_hits: usize) -> u8 {
-    if !is_unique {
-        // 多重比对，MAPQ 较低
-        return 0;
-    }
-
-    // 基于 mismatch 数计算 MAPQ
-    // 公式：MAPQ = -10 * log10(P_error)
-    // 简化：MAPQ = 40 - 3 * snps
-    let mapq = 40u32.saturating_sub(snps * 3);
-
-    // 如果有多个命中，降低 MAPQ
-    let mapq = if total_hits > 1 {
-        mapq / 2
-    } else {
-        mapq
-    };
-
-    mapq.min(255) as u8
+/// 与 C++ BSMAP 保持一致：固定输出 255（表示 mapping quality 不可用）。
+fn calculate_mapq(_snps: u32, _is_unique: bool, _total_hits: usize) -> u8 {
+    255
 }
 
 /// 获取参考序列名称。
-fn get_reference_name(chr: u32, coll: &BinSeqCollection) -> String {
-    // 从 BinSeqCollection 获取染色体名称
-    // 简化实现：返回 chr{chr}
-    let _ = coll;
-    format!("chr{}", chr + 1)
+pub fn get_reference_name(chr: u32, coll: &BinSeqCollection) -> String {
+    // chr 是染色体索引 (0-based)
+    let chr_idx = chr as usize;
+    if chr_idx < coll.chr_names.len() {
+        // 只取空格前的部分（与 C++ BSMAP 一致）
+        coll.chr_names[chr_idx]
+            .split_whitespace()
+            .next()
+            .unwrap_or(&coll.chr_names[chr_idx])
+            .to_string()
+    } else {
+        format!("chr{}", chr + 1)
+    }
+}
+
+/// 获取染色体长度。
+///
+/// 从 ref_anchor 计算染色体长度（不包括 BINSEQPAD padding）。
+pub fn get_chromosome_length(chr: u32, coll: &BinSeqCollection) -> u32 {
+    let chr_idx = chr as usize;
+    if chr_idx + 1 >= coll.ref_anchor.len() {
+        return 0;
+    }
+    // ref_anchor 存储的是以碱基为单位的偏移量（包括 REF_MARGIN 和 BINSEQPAD）
+    // 实际序列长度 = (end - start) - BINSEQPAD * SEGLEN
+    let start = coll.ref_anchor[chr_idx];
+    let end = coll.ref_anchor[chr_idx + 1];
+    let padded_len = (end - start) as u32;
+    // BINSEQPAD = 2, SEGLEN = 32
+    let padding = 2 * 32;
+    let chr_len = if padded_len > padding {
+        padded_len - padding
+    } else {
+        0
+    };
+    
+    // 对于单染色体情况，使用 sum_length 以获得更精确的长度
+    if coll.total_num == 2 && chr_idx == 0 {
+        coll.sum_length as u32
+    } else {
+        chr_len
+    }
 }
 
 /// 生成 SAM 文件头。
@@ -380,18 +415,26 @@ pub fn generate_sam_header(
 ) -> String {
     let mut header = String::new();
 
-    // HD 行
-    header.push_str("@HD\tVN:1.0\tSO:unsorted\n");
+    // HD 行（与 C++ BSMAP 格式对齐）
+    header.push_str("@HD\tVN:1.0\n");
 
-    // SQ 行（参考序列）
-    // 简化实现，实际需要遍历所有染色体
-    let _ = coll;
-    header.push_str("@SQ\tSN:chr1\tLN:1000000\n");
+    // SQ 行（参考序列）- 只输出 Accession，不包含描述
+    for (i, name) in coll.chr_names.iter().enumerate() {
+        // 提取 Accession（第一个空格前的部分）
+        let accession = name.split_whitespace().next().unwrap_or(name);
+        // 计算该染色体的长度
+        let len = if i + 1 < coll.ref_anchor.len() {
+            coll.ref_anchor[i + 1] - coll.ref_anchor[i]
+        } else {
+            coll.sum_length as u32
+        };
+        header.push_str(&format!("@SQ\tSN:{}\tLN:{}\n", accession, len));
+    }
 
-    // PG 行（程序信息）
+    // PG 行（程序信息）- 与 C++ BSMAP 格式对齐
     header.push_str(&format!(
-        "@PG\tID:{}\tPN:{}\tVN:{}\n",
-        program_name, program_name, program_version
+        "@PG\tID:{}\tVN:{}\n",
+        program_name, program_version
     ));
 
     header

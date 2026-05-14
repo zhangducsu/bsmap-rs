@@ -273,18 +273,42 @@ impl AlignmentReader {
     }
 
     /// 从 STDIN 创建 reader
+    /// 自动检测输入格式（BSP 或 SAM）
     pub fn from_stdin(config: Config, ref_seqs: HashMap<String, Vec<u8>>) -> Result<Self> {
         let coverage = HashMap::new();
         let stdin = io::stdin();
         let lines: Vec<String> = stdin.lock().lines().filter_map(|l| l.ok()).collect();
 
+        // 自动检测格式：找第一个非空、非注释行
+        let format = lines.iter()
+            .find(|l| !l.is_empty() && !l.starts_with('@'))
+            .map(|l| detect_line_format(l))
+            .unwrap_or(InputFormat::Sam);
+
         Ok(Self {
             lines: Box::new(lines.into_iter()),
-            format: InputFormat::Sam,
+            format,
             config,
             ref_seqs,
             coverage,
         })
+    }
+}
+
+/// 根据单行内容检测是 BSP 还是 SAM 格式
+/// BSP 第2列是染色体名（字母开头），SAM 第2列是数字 FLAG
+fn detect_line_format(line: &str) -> InputFormat {
+    let col: Vec<&str> = line.split('\t').collect();
+    if col.len() >= 2 {
+        // SAM: 第2列是数字 FLAG
+        // BSP: 第2列是染色体名（字母开头）
+        if col[1].chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+            InputFormat::Sam
+        } else {
+            InputFormat::Bsp
+        }
+    } else {
+        InputFormat::Sam
     }
 }
 

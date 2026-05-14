@@ -328,7 +328,9 @@ impl From<&AlignArgs> for AlignConfig {
         let mut config = AlignConfig::default();
 
         // 种子参数
-        config.set_seed_size(args.seed_size);
+        let is_rrbs = !args.digestion_sites.is_empty();
+        let seed_size = if is_rrbs && args.seed_size == 16 { 12 } else { args.seed_size };
+        config.set_seed_size(seed_size);
 
         // 错配参数：0 < v < 1 编码为百分比，否则直接使用
         if args.max_mismatch > 0.0 && args.max_mismatch < 1.0 {
@@ -393,6 +395,9 @@ impl From<&AlignArgs> for AlignConfig {
                 Some("bam") => 2,
                 _ => 0, // BSP 格式
             };
+        } else if config.stdout {
+            // 管道模式（stdout）默认输出 SAM 格式，便于下游工具（如 methratio）解析
+            config.out_sam = 1;
         }
 
         // 并行参数

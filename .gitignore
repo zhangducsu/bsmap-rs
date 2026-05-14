@@ -28,3 +28,6 @@ Thumbs.db
 # Misc
 .env
 *.log
+
+# BSMAP index files (large binary, regenerated at runtime)
+*.bsi

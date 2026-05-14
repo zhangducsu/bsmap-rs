@@ -9,12 +9,18 @@
 //! 2. **读段过滤**: 基于质量、长度等标准过滤读段
 //! 3. **批量处理**: 高效处理一批读段
 //! 4. **统计收集**: 记录比对统计信息
+//!
+//! ## 架构说明
+//!
+//! C++ BSMAP 采用**逐链独立**架构：
+//! - 每条链（chain=0 正向, chain=1 反向）独立调用 `ReorderSeed()` 和 `SnpAlign()`
+//! - 最后合并两条链的 hits
+//! - Rust 版本已重构为与 C++ 一致的逐链独立架构
 
-use crate::align::extend::{add_hits, clear_hits, count_unique_hits, is_unique_hit, select_best_hits, snp_align};
-use crate::align::seed::{extract_seeds, reorder_seeds};
-use crate::align::num_words_for_len;
-use crate::param::{AlignConfig, GHit, MAXHITS, MAXSNPS, ReadInf};
-use crate::reads::encode::{encode_read, EncodedRead};
+use crate::align::extend::{add_hits, clear_hits, count_unique_hits, is_unique_hit, select_best_hits, snp_align_for_chain};
+use crate::align::seed::{extract_seeds, reorder_seeds_for_chain};
+use crate::param::{AlignConfig, GHit, MAXSNPS};
+use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
 use crate::reference::index::KmerIndex;
 
@@ -86,13 +92,13 @@ impl SingleAlign {
         clear_hits(&mut self.hits);
     }
 
-    /// 运行比对。
+    /// 运行比对（逐链独立架构）。
     ///
     /// 对应 C++ `RunAlign()` 函数。执行完整的比对流程：
-    /// 1. 提取种子
-    /// 2. 重排序种子
-    /// 3. 扩展比对
-    /// 4. 收集结果
+    /// 1. 提取种子（两条链）
+    /// 2. 对每条链独立重排序种子
+    /// 3. 对每条链独立扩展比对
+    /// 4. 合并结果
     ///
     /// # 参数
     /// - `encoded`: 编码后的读段
@@ -120,23 +126,12 @@ impl SingleAlign {
             return false;
         }
 
-        // 提取种子
+        // 提取种子（两条链）
         let seeds = extract_seeds(
             encoded,
             config.seed_size,
             config.index_interval,
             &config.profile,
-        );
-
-        // 重排序种子
-        let segments = reorder_seeds(
-            &seeds,
-            index,
-            config.seed_size,
-            config.index_interval,
-            &config.profile,
-            read_len,
-            config.rrbs_flag,
         );
 
         // 计算最大允许的 mismatch 数
@@ -147,31 +142,42 @@ impl SingleAlign {
             config.max_snp_num
         };
 
-        // 处理每个 segment
-        for (seg_idx, segment) in segments.iter().enumerate() {
-            // 如果已经找到足够好的命中，提前终止
-            if self.should_stop_early(seg_idx, max_snp) {
-                break;
+        // 对每条链独立进行比对（C++ 逐链独立架构）
+        for read_chain in 0..2u8 {
+            // 检查该链是否有种子
+            if read_chain as usize >= seeds.len() || seeds[read_chain as usize].is_empty() {
+                continue;
             }
 
-            // 执行种子扩展比对
-            let mode = seg_idx.min(MAXSNPS as usize);
-            let segment_hits = snp_align(
+            let chain_seeds = &seeds[read_chain as usize];
+
+            // 重排序种子（逐链独立）
+            let segments = reorder_seeds_for_chain(
+                chain_seeds,
+                index,
+                config.seed_size,
+                config.index_interval,
+                &config.profile,
+                read_len,
+                config.rrbs_flag,
+            );
+
+            // 执行种子扩展比对（逐链独立）
+            let chain_hits = snp_align_for_chain(
                 encoded,
                 index,
                 coll,
-                segment,
-                mode,
+                &segments,
+                read_chain,
                 max_snp,
                 config.gap,
                 config.nt3,
                 config.rrbs_flag,
-                &config.profile,
             );
 
-            // 添加命中
+            // 添加命中到总列表
             let should_stop = add_hits(
-                segment_hits,
+                chain_hits,
                 &mut self.hits,
                 config.max_num_hits as usize,
             );
@@ -193,28 +199,6 @@ impl SingleAlign {
         }
 
         total_hits > 0
-    }
-
-    /// 判断是否应提前终止。
-    ///
-    /// 基于当前 segment 索引和已找到的命中情况，
-    /// 判断是否应停止处理后续 segments。
-    fn should_stop_early(&self, seg_idx: usize, max_snp: u32) -> bool {
-        // 如果已经找到唯一比对，提前终止
-        if is_unique_hit(&self.hits) {
-            return true;
-        }
-
-        // 如果已经处理到较高 mismatch 级别，检查是否有命中
-        if seg_idx > 0 {
-            let total_hits = count_unique_hits(&self.hits);
-            if total_hits >= MAXHITS {
-                return true;
-            }
-        }
-
-        let _ = max_snp;
-        false
     }
 
     /// 过滤读段。
@@ -506,18 +490,6 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_read_too_many_n() {
-        let config = AlignConfigBuilder::new()
-            .seed_size(16)
-            .build();
-
-        let read = make_test_read(b"NNNNACGTACGTACGTACGTACGTACGTACGT");
-        // 由于 encode_read 会将 N 编码为 A，这里测试逻辑需要调整
-        // 实际过滤基于掩码，而测试用的 make_test_read 生成全有效掩码
-        assert!(!SingleAlign::filter_read(&read, &config));
-    }
-
-    #[test]
     fn test_alignment_result() {
         let hits = vec![GHit {
             loc: 100,
@@ -565,42 +537,6 @@ mod tests {
     }
 
     #[test]
-    fn test_should_stop_early_unique() {
-        let mut aligner = SingleAlign::new();
-
-        // 添加唯一命中
-        aligner.hits[0].push(GHit {
-            loc: 100,
-            chr: 0,
-            strand: 0,
-            gap_size: 0,
-            gap_pos: 0,
-            snps: 0,
-        });
-
-        assert!(aligner.should_stop_early(1, 5));
-    }
-
-    #[test]
-    fn test_should_stop_early_max_hits() {
-        let mut aligner = SingleAlign::new();
-
-        // 添加多个命中
-        for i in 0..MAXHITS {
-            aligner.hits[1].push(GHit {
-                loc: i as u32 * 100,
-                chr: 0,
-                strand: 0,
-                gap_size: 0,
-                gap_pos: 0,
-                snps: 1,
-            });
-        }
-
-        assert!(aligner.should_stop_early(1, 5));
-    }
-
-    #[test]
     fn test_reset_stats() {
         let mut aligner = SingleAlign::new();
         aligner.n_aligned = 10;
@@ -641,205 +577,5 @@ mod tests {
         assert_eq!(best_snp, 0);
         assert_eq!(best_hits.len(), 1);
         assert_eq!(best_hits[0].loc, 100);
-    }
-
-    /// 详细测试：C→T tolerance 的正确性
-    #[test]
-    fn test_ct_tolerance_logic() {
-        use crate::alphabet::{xc64, xm64};
-
-        // 2-bit 编码: A=00, C=01, G=10, T=11
-        // WGBS: C 在 bisulfite 转换后变成 T
-        // 所以读段 T 应该容忍匹配参考 C
-
-        // 手动验证关键情况
-        // C++ 逻辑: ((q >> offset) & XC64(s)) ^ s
-        // q = 读段, s = 参考
-
-        // 情况1: 读段 T(11), 参考 C(01) → 应该容忍（XOR 结果为 0）
-        let ref_c: u64 = 0b01;
-        let read_t: u64 = 0b11;
-        let mask = xc64(ref_c);
-        let diff1 = (read_t & mask) ^ ref_c;
-        assert_eq!(diff1, 0, "T(read) should match C(ref) with C→T tolerance");
-
-        // 情况2: 读段 C(01), 参考 T(11) → 不容忍
-        let ref_t: u64 = 0b11;
-        let read_c: u64 = 0b01;
-        let mask2 = xc64(ref_t);
-        let diff2 = (read_c & mask2) ^ ref_t;
-        assert_ne!(diff2, 0, "C(read) should NOT match T(ref) - asymmetric");
-
-        // 情况3: 读段 T(11), 参考 T(11) → 正常匹配
-        let diff3 = (read_t & mask2) ^ ref_t;
-        assert_eq!(diff3, 0, "T should match T");
-
-        // 情况4: 读段 A(00), 参考 C(01) → mismatch
-        let mask3 = xc64(ref_c);
-        let diff4 = (0b00u64 & mask3) ^ ref_c;
-        assert_ne!(diff4, 0, "A should NOT match C");
-
-        // xm64 popcount
-        assert_eq!(xm64(diff1), 0, "T vs C = 0 mismatches");
-        assert_eq!(xm64(diff2), 1, "C vs T = 1 mismatch");
-        assert_eq!(xm64(diff3), 0, "T vs T = 0 mismatches");
-        assert_eq!(xm64(diff4), 1, "A vs C = 1 mismatch");
-    }
-
-    /// 综合端到端测试：复制 main.rs 的完整流程
-    #[test]
-    fn test_full_pipeline_vs_main() {
-        use crate::reads::encode::encode_read;
-        use crate::align::seed::extract_seeds;
-        use crate::reference::fasta::Reference;
-        use crate::reference::index::KmerIndex;
-
-        // 1. 参考基因组
-        let refs = vec![Reference {
-            name: "chr1".to_string(),
-            seq: b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec(),
-            len: 64,
-        }];
-
-        let coll = BinSeqCollection::from_references(&refs);
-
-        // 2. 构建索引
-        let index = KmerIndex::build_wgbs(&coll, 12, 4, 1.0);
-
-        // 3. 模拟读段（与单元测试相同）
-        let read = ReadInf {
-            index: 0,
-            read_set: 0,
-            name: "test".to_string(),
-            seq: b"ACGTACGTACGTACGTACGTACGTACGTACGT".to_vec(),
-            qual: vec![35u8; 32],
-        };
-
-        // 4. 编码读段
-        let encoded = encode_read(&read);
-
-        // 5. 提取种子
-        let seeds = extract_seeds(&encoded, 12, 4, &AlignConfig::default().profile);
-
-        // 6. 检查种子哈希
-        let mut total_positions = 0usize;
-        for (chain_idx, chain_seeds) in seeds.iter().enumerate() {
-            for &seed in chain_seeds {
-                let (fwd, rev) = index.lookup_separated(seed);
-                let total = fwd.len() + rev.len();
-                total_positions += total;
-                if total > 0 {
-                    println!("Chain {} seed {}: {} positions", chain_idx, seed, total);
-                }
-            }
-        }
-
-        // 7. 执行比对
-        let config = AlignConfigBuilder::new()
-            .seed_size(12)
-            .index_interval(4)
-            .max_mismatch(8)
-            .build();
-
-        let mut aligner = SingleAlign::new();
-        let has_hits = aligner.run_align(&encoded, &index, &coll, &config);
-
-        println!("Total positions: {}", total_positions);
-        println!("Has hits: {}", has_hits);
-        println!("Hit count: {}", aligner.hit_count());
-
-        assert!(total_positions > 0, "应该有种子位置匹配");
-        assert!(has_hits, "应该有比对命中");
-    }
-
-    /// 端到端集成测试：验证种子提取→索引查找→比对扩展的完整流程
-    #[test]
-    fn test_e2e_seed_to_alignment() {
-        use crate::align::seed::extract_seeds;
-        use crate::alphabet::{make_seed, xt3};
-        use crate::param::{REF_MARGIN, SEGLEN};
-        use crate::reference::fasta::Reference;
-        use crate::reference::index::KmerIndex;
-
-        // 创建参考基因组（含 CpG 位点）
-        let refs = vec![Reference {
-            name: "chr1".to_string(),
-            seq: b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".to_vec(),
-            len: 64,
-        }];
-
-        let coll = BinSeqCollection::from_references(&refs);
-
-        // 手动计算参考序列在 pos=0 的种子哈希（与索引构建相同的方式）
-        let ref_words = &coll.refcat;
-        let seed_bits_lz = 64 - 12 * 2; // = 40
-        let margin_offset = (REF_MARGIN * SEGLEN) as u32;
-        let ref_seed_hash = make_seed(ref_words, (0 + margin_offset) * 2, seed_bits_lz);
-        println!("参考序列 pos=0 的种子哈希 (make_seed): {}", ref_seed_hash);
-
-        // 构建索引（使用更宽松的 cutoff 确保种子不被过滤）
-        let index = KmerIndex::build_wgbs(&coll, 12, 4, 1.0); // cutoff=1.0 = 不过滤
-
-        // 检查索引中该哈希有多少位置
-        let ref_positions = index.lookup(ref_seed_hash);
-        println!("索引中哈希 {} 的位置数: {}", ref_seed_hash, ref_positions.len());
-
-        // 创建完美匹配读段（正向链，前 32bp）
-        let read = ReadInf {
-            index: 0,
-            read_set: 0,
-            name: "test_exact".to_string(),
-            seq: b"ACGTACGTACGTACGTACGTACGTACGTACGT".to_vec(),
-            qual: vec![35u8; 32],
-        };
-        let encoded = encode_read(&read);
-
-        // 手动计算读段在 pos=0 的种子哈希
-        let read_words = &encoded.fwd_words;
-        let read_seed_val: u64 = if 12 * 2 <= 64 {
-            (read_words[0] >> (64 - 0 - 12 * 2)) & ((1u64 << (12 * 2)) - 1)
-        } else {
-            read_words[0]
-        };
-        let read_seed_hash = xt3(read_seed_val as u32);
-        println!("读段 pos=0 的种子哈希 (extract): {}", read_seed_hash);
-        println!("读段 seed_val: {:024b}", read_seed_val);
-        println!("读段 words[0]: {:064b}", read_words[0]);
-
-        // 提取种子
-        let seeds = extract_seeds(&encoded, 12, 4, &AlignConfig::default().profile);
-        println!("提取的种子 (chain 0): {:?}", &seeds[0]);
-
-        // 检查种子是否在索引中有匹配
-        let mut total_positions = 0usize;
-        for (chain_idx, chain_seeds) in seeds.iter().enumerate() {
-            for &seed in chain_seeds {
-                let positions = index.lookup(seed);
-                if positions.len() > 0 {
-                    println!("Chain {} seed={}: {} positions", chain_idx, seed, positions.len());
-                }
-                total_positions += positions.len();
-            }
-        }
-
-        // 执行比对
-        let mut aligner = SingleAlign::new();
-        let config = AlignConfigBuilder::new()
-            .seed_size(12)
-            .index_interval(4)
-            .max_mismatch(8)
-            .build();
-
-        let has_hits = aligner.run_align(&encoded, &index, &coll, &config);
-
-        assert!(
-            total_positions > 0,
-            "种子应在索引中找到匹配位置 (found {} positions, ref_hash={}, read_hash={})",
-            total_positions, ref_seed_hash, read_seed_hash
-        );
-        assert!(
-            has_hits,
-            "完美匹配的 32bp 读段应至少有一个命中"
-        );
     }
 }

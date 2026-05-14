@@ -6,7 +6,7 @@
 //! - `StringAlignPair()`: 配对结果格式化
 //! - `StringAlignUnpair()`: 未配对结果格式化
 
-use crate::align::output::{make_cigar, make_zs_tag, select_output_seq};
+use crate::align::output::{get_chromosome_length, make_cigar, make_zs_tag, select_output_seq};
 use crate::align::Chain;
 use crate::param::{AlignConfig, GHit, ReadInf};
 use crate::pairs::pair::PairHit;
@@ -48,7 +48,7 @@ pub fn format_pair_sam(
         &pair_hit.b,
         true,  // is_first
         pair_hit.chain,
-        pair_hit.insert as i32,
+        pair_hit.insert,
         coll,
         config,
         is_unique,
@@ -61,7 +61,7 @@ pub fn format_pair_sam(
         &pair_hit.a,
         false, // is_second
         pair_hit.chain,
-        -(pair_hit.insert as i32),
+        pair_hit.insert,
         coll,
         config,
         is_unique,
@@ -72,13 +72,24 @@ pub fn format_pair_sam(
 }
 
 /// 格式化单个配对读段的 SAM 记录。
+///
+/// 对应 C++ `s_OutHitPair()` 中的单条记录输出。
+///
+/// # C++ BSMAP 关键逻辑
+///
+/// - FLAG 0x10: `pp.chain ^ (pp.a.chr % 2)`，Rust 中为 `chain ^ (hit.strand >> 1)`
+/// - FLAG 0x20: 当 0x10 未设置时设置（mate 反向）
+/// - POS: `hit.loc + 1`（直接使用内部链坐标，不做转换）
+/// - PNEXT: `mate_hit.loc + 1`（直接使用）
+/// - TLEN: 当 FLAG 0x10 设置时为负，否则为正
+/// - ZS: `chain_flag[ref_chain]` + `chain_flag[chain]`
 fn format_pair_read(
     read: &ReadInf,
     hit: &GHit,
     mate_hit: &GHit,
     is_first: bool,
     chain: u8,
-    tlen: i32,
+    insert: u32,
     coll: &BinSeqCollection,
     _config: &AlignConfig,
     is_unique: bool,
@@ -87,31 +98,30 @@ fn format_pair_read(
     // 获取参考名称
     let ref_name = get_reference_name(hit.chr, coll);
 
-    // 解析链信息
-    let read_chain = if chain == 0 {
-        // chain=0: a+ vs b-
-        if is_first { Chain::PlusPlus } else { Chain::PlusMinus }
+    // ref_chain: hit.strand >> 1（对应 C++ 的 pp.a.chr % 2）
+    let ref_chain = hit.strand >> 1;
+
+    // FLAG 0x10 判定：
+    //   C++ read_a: pp.chain ^ (pp.a.chr % 2)
+    //   C++ read_b: (!pp.chain) ^ (pp.b.chr % 2)
+    // is_first=true 时使用 chain，is_first=false 时使用 !chain
+    let effective_chain = if is_first { chain } else { 1 - chain };
+    let is_reverse = (effective_chain ^ ref_chain) == 1;
+
+    // TLEN: 当 FLAG 0x10 设置时为负，否则为正
+    let tlen: i32 = if is_reverse {
+        -(insert as i32)
     } else {
-        // chain=1: a- vs b+
-        if is_first { Chain::MinusPlus } else { Chain::MinusMinus }
+        insert as i32
     };
 
     // 计算 FLAG
-    let is_reverse = !read_chain.is_read_forward();
-    let mate_is_reverse = if chain == 0 {
-        // chain=0: a+ vs b-, mate 是反向
-        !is_first
-    } else {
-        // chain=1: a- vs b+, mate 是反向
-        is_first
-    };
-
     let flag = make_pair_flag(
         is_first,
         true,  // is_mapped
         is_reverse,
         true,  // mate_mapped
-        mate_is_reverse,
+        !is_reverse, // mate_is_reverse: 与当前相反
         true,  // is_proper
         !is_unique && total_hits > 1,
     );
@@ -126,14 +136,20 @@ fn format_pair_read(
         hit.gap_pos as u8,
     );
 
-    // 选择输出序列
+    // 选择输出序列（当 FLAG 0x10 设置时反转）
     let (seq, qual) = select_output_seq(read, is_reverse);
 
     // 构建 ZS 标签
-    let zs = make_zs_tag(
-        if read_chain.is_ref_forward() { 0 } else { 1 },
-        if read_chain.is_read_forward() { 0 } else { 1 },
-    );
+    // C++ read_a: chain_flag[pp.a.chr%2] + chain_flag[pp.chain]
+    // C++ read_b: chain_flag[pp.b.chr%2] + chain_flag[!pp.chain]
+    // read_b 使用 !chain
+    let ref_chain_char = if ref_chain == 0 { '+' } else { '-' };
+    let chain_char = if is_first {
+        if chain == 0 { '+' } else { '-' }
+    } else {
+        if chain == 0 { '-' } else { '+' }  // read_b: !chain
+    };
+    let zs = format!("ZS:Z:{}{}", ref_chain_char, chain_char);
 
     // 获取 mate 的参考名称和位置
     let mate_ref_name = if hit.chr == mate_hit.chr {
@@ -141,16 +157,32 @@ fn format_pair_read(
     } else {
         get_reference_name(mate_hit.chr, coll)
     };
-    let mate_pos = mate_hit.loc + 1; // 转换为 1-based
+
+    // POS: 反向参考链需要坐标转换（与单端 output.rs 一致）
+    let pos = if ref_chain == 0 {
+        hit.loc + 1
+    } else {
+        let chr_len = get_chromosome_length(hit.chr, coll);
+        chr_len - hit.loc - read.seq.len() as u32 + 1
+    };
+
+    // PNEXT: mate 也需要坐标转换
+    let mate_ref_chain = mate_hit.strand >> 1;
+    let mate_pos = if mate_ref_chain == 0 {
+        mate_hit.loc + 1
+    } else {
+        let mate_chr_len = get_chromosome_length(mate_hit.chr, coll);
+        mate_chr_len - mate_hit.loc - read.seq.len() as u32 + 1
+    };
 
     // SAM 格式：
     // QNAME FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL [TAG:TYPE:VALUE...]
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tNM:i:{}\tZS:Z:{}",
-        read.name,
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tNM:i:{}\t{}",
+        strip_r_suffix(&read.name),
         flag,
         ref_name,
-        hit.loc + 1, // 转换为 1-based
+        pos,
         mapq,
         cigar,
         mate_ref_name,
@@ -290,7 +322,7 @@ fn format_mapped_unpair(
     // SAM 格式
     format!(
         "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tNM:i:{}\tZS:Z:{}",
-        read.name,
+        strip_r_suffix(&read.name),
         flag,
         ref_name,
         hit.loc + 1,
@@ -349,7 +381,7 @@ fn format_unmapped_unpair(
     // SAM 格式
     format!(
         "{}\t{}\t*\t0\t0\t*\t{}\t{}\t0\t{}\t{}",
-        read.name,
+        strip_r_suffix(&read.name),
         flag,
         mate_ref,
         mate_pos,
@@ -500,32 +532,36 @@ fn make_unpair_flag(
 ///
 /// # 返回值
 /// MAPQ 分数（0-255）
-fn calculate_mapq(snps: u32, is_unique: bool, total_hits: usize) -> u8 {
-    if !is_unique {
-        // 多重比对，MAPQ 较低
-        return 0;
-    }
+/// 与 C++ BSMAP 保持一致：固定输出 255（表示 mapping quality 不可用）。
+fn calculate_mapq(_snps: u32, _is_unique: bool, _total_hits: usize) -> u8 {
+    255
+}
 
-    // 基于 mismatch 数计算 MAPQ
-    // 公式：MAPQ = 40 - 3 * snps
-    let mapq = 40u32.saturating_sub(snps * 3);
-
-    // 如果有多个命中，降低 MAPQ
-    let mapq = if total_hits > 1 {
-        mapq / 2
+/// 去除 QNAME 的 read 编号后缀（与 C++ BSMAP 保持一致）。
+/// 支持 _R1/_R2、_r1/_r2、/1//2 格式。
+fn strip_r_suffix(name: &str) -> &str {
+    if name.ends_with("_R1") || name.ends_with("_R2") || 
+       name.ends_with("_r1") || name.ends_with("_r2") {
+        &name[..name.len()-3]
+    } else if name.ends_with("/1") || name.ends_with("/2") {
+        &name[..name.len()-2]
     } else {
-        mapq
-    };
-
-    mapq.min(255) as u8
+        name
+    }
 }
 
 /// 获取参考序列名称。
 fn get_reference_name(chr: u32, coll: &BinSeqCollection) -> String {
-    // 从 BinSeqCollection 获取染色体名称
-    // 简化实现：返回 chr{chr+1}
-    let _ = coll;
-    format!("chr{}", chr + 1)
+    // 与 C++ BSMAP 保持一致：只输出 Accession（第一个空格前的部分）
+    if (chr as usize) < coll.chr_names.len() {
+        coll.chr_names[chr as usize]
+            .split_whitespace()
+            .next()
+            .unwrap_or(&coll.chr_names[chr as usize])
+            .to_string()
+    } else {
+        format!("chr{}", chr + 1)
+    }
 }
 
 /// 格式化未配对读段对为 SAM 记录。
@@ -695,20 +731,12 @@ mod tests {
 
     #[test]
     fn test_calculate_mapq() {
-        // 唯一比对，0 mismatch
-        assert_eq!(calculate_mapq(0, true, 1), 40);
-
-        // 唯一比对，1 mismatch
-        assert_eq!(calculate_mapq(1, true, 1), 37);
-
-        // 唯一比对，5 mismatch
-        assert_eq!(calculate_mapq(5, true, 1), 25);
-
-        // 多重比对
-        assert_eq!(calculate_mapq(0, false, 2), 0);
-
-        // 多个命中
-        assert_eq!(calculate_mapq(0, true, 2), 20); // 40 / 2
+        // 与 C++ BSMAP 保持一致：固定输出 255
+        assert_eq!(calculate_mapq(0, true, 1), 255);
+        assert_eq!(calculate_mapq(1, true, 1), 255);
+        assert_eq!(calculate_mapq(5, true, 1), 255);
+        assert_eq!(calculate_mapq(0, false, 2), 255);
+        assert_eq!(calculate_mapq(0, true, 2), 255);
     }
 
     #[test]
@@ -737,7 +765,7 @@ mod tests {
         assert!(fields[1].parse::<u16>().unwrap() & 0x40 != 0); // FLAG & 0x40 (first)
         assert_eq!(fields[2], "chr1"); // RNAME
         assert_eq!(fields[3], "101"); // POS (1-based)
-        assert_eq!(fields[4], "40"); // MAPQ
+        assert_eq!(fields[4], "255"); // MAPQ
         assert_eq!(fields[5], "16M"); // CIGAR
         // SEQ 字段可能是正向或反向互补，取决于比对链
         assert!(!fields[10].is_empty()); // SEQ 不为空
