@@ -22,7 +22,7 @@ use log::{info, warn, LevelFilter};
 
 use bsmap::align::{format_bsp, format_sam, AlignmentResult, SingleAlign};
 use bsmap::cli::{resolve_command, resolve_index_args, AlignArgs, Cli};
-use bsmap::pairs::{format_pair_sam, format_unpair_sam_pair, PairAlign, PairBatchResult};
+use bsmap::pairs::{format_pair_sam, PairAlign, PairBatchResult};
 use bsmap::param::{AlignConfig, AlignStats, BATCH_SIZE, ReadInf};
 use bsmap::reads::{encode_read, process_batch, EncodedRead, FastqReader};
 use bsmap::reference::{
@@ -232,6 +232,13 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
         run_single_align(args, &config, &index, &coll, &mut output, &stats)?;
     }
 
+    // BAM 输出需要关闭 BGZF 流
+    if let OutputWriter::BamFile { writer, .. } = &mut output {
+        writer
+            .try_finish()
+            .with_context(|| "关闭 BAM BGZF 流失败")?;
+    }
+
     // 打印统计信息
     print_stats(&stats, &config);
 
@@ -362,14 +369,17 @@ fn load_or_build_index(
 /// 支持三种输出方式：
 /// - Stdout: 输出到标准输出
 /// - SamFile: 输出到 SAM 文件
-/// - BamFile: 输出到 BAM 文件（使用 noodles bgzf）
+/// - BamFile: 输出到 BAM 文件（使用 noodles bam writer，内置 BGZF 压缩）
 pub enum OutputWriter {
     /// 标准输出。
     Stdout,
     /// SAM 文件输出。
     SamFile(BufWriter<File>),
-    /// BAM 文件输出（使用 noodles bgzf 压缩）。
-    BamFile(noodles::bgzf::Writer<File>),
+    /// BAM 文件输出（使用 noodles bam writer，内置 BGZF 压缩）。
+    BamFile {
+        writer: noodles::bam::io::Writer<noodles::bgzf::Writer<File>>,
+        header: noodles::sam::Header,
+    },
 }
 
 /// 打开输出文件。
@@ -392,10 +402,14 @@ fn open_output(args: &AlignArgs) -> Result<OutputWriter> {
 
             match ext.as_deref() {
                 Some("bam") => {
-                    // BAM 输出（使用 bgzf 压缩）
+                    // BAM 输出（使用 bam::io::Writer，内置 BGZF 压缩）
                     let file = File::create(path)
                         .with_context(|| format!("无法创建 BAM 文件: {}", path.display()))?;
-                    Ok(OutputWriter::BamFile(noodles::bgzf::Writer::new(file)))
+                    let writer = noodles::bam::io::Writer::new(file);
+                    Ok(OutputWriter::BamFile {
+                        writer,
+                        header: noodles::sam::Header::default(),
+                    })
                 }
                 Some("sam") | _ => {
                     // SAM 输出（或其他扩展名默认为 SAM）
@@ -424,9 +438,10 @@ fn write_sam_header(
     // @HD 行
     header.push_str("@HD\tVN:1.0\tSO:unsorted\n");
 
-    // @SQ 行
+    // @SQ 行（只取名称的第一个空白字符前的部分）
     for (name, r) in ref_names.iter().zip(refs.iter()) {
-        header.push_str(&format!("@SQ\tSN:{}\tLN:{}\n", name, r.len));
+        let sn = name.split_whitespace().next().unwrap_or(name);
+        header.push_str(&format!("@SQ\tSN:{}\tLN:{}\n", sn, r.len));
     }
 
     // @PG 行
@@ -442,9 +457,16 @@ fn write_sam_header(
         OutputWriter::SamFile(w) => {
             w.write_all(header.as_bytes())?;
         }
-        OutputWriter::BamFile(_w) => {
-            // BAM header 需要特殊处理
-            // 暂时跳过，后续实现
+        OutputWriter::BamFile { writer, header: sam_header } => {
+            // 解析 SAM header 字符串为 noodles::sam::Header
+            let parsed: noodles::sam::Header = header
+                .parse()
+                .with_context(|| "解析 SAM header 为 noodles Header 失败")?;
+            writer
+                .write_header(&parsed)
+                .with_context(|| "写入 BAM header 失败")?;
+            // 将解析后的 header 存回 OutputWriter，供后续 write_record 使用
+            *sam_header = parsed;
         }
     }
 
@@ -580,7 +602,10 @@ fn run_paired_align(
     // 批量处理
     let mut batch_a = Vec::with_capacity(BATCH_SIZE);
     let mut batch_b = Vec::with_capacity(BATCH_SIZE);
-    let mut read_start = config.read_start;
+    // 修复：两个 reader 必须使用独立的 read_start，否则 reader_a 读取后
+    // read_start 被更新，导致 reader_b 跳过所有读段
+    let mut read_start_a = config.read_start;
+    let mut read_start_b = config.read_start;
     let read_end = config.read_end;
 
     loop {
@@ -588,8 +613,8 @@ fn run_paired_align(
         batch_b.clear();
 
         // 读取一批读段
-        let n_a = reader_a.read_batch(&mut batch_a, BATCH_SIZE, &mut read_start, read_end)?;
-        let n_b = reader_b.read_batch(&mut batch_b, BATCH_SIZE, &mut read_start, read_end)?;
+        let n_a = reader_a.read_batch(&mut batch_a, BATCH_SIZE, &mut read_start_a, read_end)?;
+        let n_b = reader_b.read_batch(&mut batch_b, BATCH_SIZE, &mut read_start_b, read_end)?;
 
         if n_a == 0 || n_b == 0 {
             break;
@@ -636,14 +661,20 @@ fn run_paired_align(
                 }
             } else {
                 // 未配对，输出单端结果
-                if !result.unpair_hits_a.is_empty() {
+                // C++ 行为：有 hit 的未配对 reads 始终输出，无 hit 的只在 out_unmap 时输出
+                let has_hit_a = !result.unpair_hits_a.is_empty();
+                let has_hit_b = !result.unpair_hits_b.is_empty();
+
+                if has_hit_a {
                     stats.n_aligned_a.fetch_add(1, Ordering::Relaxed);
                 }
-                if !result.unpair_hits_b.is_empty() {
+                if has_hit_b {
                     stats.n_aligned_b.fetch_add(1, Ordering::Relaxed);
                 }
 
-                if config.out_unmap {
+                // 有 hit 的未配对 reads 始终输出（与 C++ 一致）
+                // 无 hit 的 reads 只在 out_unmap 时输出
+                if has_hit_a || has_hit_b || config.out_unmap {
                     output_unpaired(
                         output,
                         &reads_a[idx],
@@ -770,6 +801,11 @@ fn output_unmapped(
 }
 
 /// 输出未配对读段。
+///
+/// 与 C++ `s_OutHitUnpair` 行为一致：
+/// - 只输出有 hit 的 read（不输出无 hit 的 mate）
+/// - 设置 0x40 (first in pair) 或不设置
+/// - 当 mate 无 hit 时设置 0x8 (mate unmapped)
 fn output_unpaired(
     output: &mut OutputWriter,
     read_a: &ReadInf,
@@ -778,35 +814,152 @@ fn output_unpaired(
     coll: &BinSeqCollection,
     config: &AlignConfig,
 ) -> Result<()> {
-    let (line_a, line_b) = match config.out_sam {
-        0 => {
-            // BSP 格式
-            let hit_type_a = if result.unpair_hits_a.is_empty() { "NM" } else { "MA" };
-            let hit_type_b = if result.unpair_hits_b.is_empty() { "NM" } else { "MA" };
+    let has_hit_a = !result.unpair_hits_a.is_empty();
+    let has_hit_b = !result.unpair_hits_b.is_empty();
 
-            (
-                if let Some(hit) = result.unpair_hits_a.first() {
-                    format_bsp(read_a, hit, coll, config, hit_type_a)
-                } else {
-                    bsmap::align::output::format_unmapped(read_a, bsmap::align::OutputFormat::Bsp)
-                },
-                if let Some(hit) = result.unpair_hits_b.first() {
-                    format_bsp(read_b, hit, coll, config, hit_type_b)
-                } else {
-                    bsmap::align::output::format_unmapped(read_b, bsmap::align::OutputFormat::Bsp)
-                },
+    // read_a 有 hit → 输出
+    if has_hit_a {
+        let line = if config.out_sam == 0 {
+            format_bsp(read_a, &result.unpair_hits_a[0], coll, config, "MA")
+        } else {
+            format_unpair_sam_single(
+                read_a,
+                &result.unpair_hits_a[0],
+                result.unpair_hits_a.len(),
+                has_hit_b,
+                result.unpair_hits_b.first(),
+                true, // is_first
+                coll,
+                config,
             )
-        }
-        _ => {
-            // SAM 格式
-            format_unpair_sam_pair(read_a, read_b, result, coll, config)
-        }
-    };
+        };
+        write_output_line(output, &line)?;
+    }
 
-    write_output_line(output, &line_a)?;
-    write_output_line(output, &line_b)?;
+    // read_b 有 hit → 输出
+    if has_hit_b {
+        let line = if config.out_sam == 0 {
+            format_bsp(read_b, &result.unpair_hits_b[0], coll, config, "MA")
+        } else {
+            format_unpair_sam_single(
+                read_b,
+                &result.unpair_hits_b[0],
+                result.unpair_hits_b.len(),
+                has_hit_a,
+                result.unpair_hits_a.first(),
+                false, // is_second
+                coll,
+                config,
+            )
+        };
+        write_output_line(output, &line)?;
+    }
 
     Ok(())
+}
+
+/// 格式化单条未配对 read 的 SAM 记录。
+///
+/// 与 C++ `s_OutHitUnpair` 行为一致：
+/// - 只输出一条记录
+/// - 设置 0x40 (first in pair) 当 is_first=true
+/// - 设置 0x8 (mate unmapped) 当 mate 无 hit
+/// - 当 mate 无 hit 时 RNEXT=*, PNEXT=0
+fn format_unpair_sam_single(
+    read: &ReadInf,
+    hit: &bsmap::param::GHit,
+    total_hits: usize,
+    mate_has_hit: bool,
+    mate_hit: Option<&bsmap::param::GHit>,
+    is_first: bool,
+    coll: &bsmap::reference::binseq::BinSeqCollection,
+    config: &bsmap::param::AlignConfig,
+) -> String {
+    use bsmap::align::output::{get_chromosome_length, make_cigar, make_zs_tag, select_output_seq};
+
+    let ref_chain = hit.strand >> 1;
+    let read_chain = hit.strand & 1;
+
+    // FLAG: 与 C++ s_OutHitUnpair 一致
+    let mut flag: u16 = 0x1; // paired
+    if is_first {
+        flag |= 0x40; // first in pair
+    } else {
+        flag |= 0x80; // second in pair
+    }
+    if !mate_has_hit {
+        flag |= 0x8; // mate unmapped
+    }
+
+    // 0x10: reverse strand
+    // 与 C++ s_OutHitUnpair 一致: rev_seq = chain_a ^ (ha.chr % 2) = read_chain ^ ref_chain
+    if (read_chain ^ ref_chain) == 1 {
+        flag |= 0x10;
+    }
+
+    // 多重命中标记
+    if total_hits > 1 {
+        flag |= 0x100;
+    }
+
+    let mapq: u8 = 255;
+    let cigar = make_cigar(read.seq.len() as u32, hit.gap_size as i8, hit.gap_pos as u8);
+    let (seq, qual) = select_output_seq(read, flag & 0x10 != 0);
+
+    // POS: 反向参考链坐标转换
+    let pos = if ref_chain == 0 {
+        hit.loc + 1
+    } else {
+        let chr_len = get_chromosome_length(hit.chr, coll);
+        chr_len - hit.loc - read.seq.len() as u32 + 1
+    };
+
+    // RNEXT/PNEXT: mate 信息
+    let (rnext, pnext) = if mate_has_hit {
+        if let Some(mh) = mate_hit {
+            let mate_ref_chain = mh.strand >> 1;
+            let mate_pos = if mate_ref_chain == 0 {
+                mh.loc + 1
+            } else {
+                let mate_chr_len = get_chromosome_length(mh.chr, coll);
+                mate_chr_len - mh.loc - read.seq.len() as u32 + 1
+            };
+            ("=".to_string(), mate_pos)
+        } else {
+            ("*".to_string(), 0)
+        }
+    } else {
+        ("*".to_string(), 0)
+    };
+
+    // ZS tag
+    let zs = make_zs_tag(
+        if ref_chain == 0 { 0 } else { 1 },
+        if read_chain == 0 { 0 } else { 1 },
+    );
+
+    // QNAME: 去除后缀
+    let qname = strip_r_suffix_for_unpair(&read.name);
+
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0\t{}\t{}\tNM:i:{}\tZS:Z:{}",
+        qname, flag,
+        bsmap::align::output::get_reference_name(hit.chr, coll),
+        pos, mapq, cigar, rnext, pnext, seq, qual,
+        hit.snps, zs,
+    )
+}
+
+/// 去除 QNAME 的 read 编号后缀。
+fn strip_r_suffix_for_unpair(name: &str) -> &str {
+    if name.ends_with("_R1") || name.ends_with("_R2") ||
+       name.ends_with("_r1") || name.ends_with("_r2") {
+        &name[..name.len()-3]
+    } else if name.ends_with("/1") || name.ends_with("/2") {
+        &name[..name.len()-2]
+    } else {
+        name
+    }
 }
 
 /// 写入一行输出。
@@ -818,10 +971,14 @@ fn write_output_line(output: &mut OutputWriter, line: &str) -> Result<()> {
         OutputWriter::SamFile(w) => {
             writeln!(w, "{}", line)?;
         }
-        OutputWriter::BamFile(_w) => {
-            // BAM 输出需要特殊处理
-            // 暂时输出为 SAM 格式到日志
-            log::debug!("BAM output: {}", line);
+        OutputWriter::BamFile { writer, header } => {
+            // 将 SAM 文本行解析为 sam::Record，然后写入 BAM
+            use noodles::sam::alignment::io::Write;
+            let record = noodles::sam::Record::try_from(line.as_bytes())
+                .with_context(|| format!("解析 SAM 行为 Record 失败: {}", line))?;
+            writer
+                .write_alignment_record(header, &record)
+                .with_context(|| "写入 BAM 记录失败")?;
         }
     }
     Ok(())
