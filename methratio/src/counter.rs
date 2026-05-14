@@ -13,6 +13,7 @@ pub fn count_methylation(
     config: &Config,
 ) -> HashMap<String, ChromosomeCounts> {
     let mut counts: HashMap<String, ChromosomeCounts> = HashMap::new();
+    let mut nmap: u64 = 0;
 
     for record in records {
         let ref_seq = match ref_seqs.get(&record.chrom) {
@@ -23,6 +24,11 @@ pub fn count_methylation(
         let chrom_counts = counts.entry(record.chrom.clone()).or_default();
 
         count_single_record(&record, ref_seq, chrom_counts, config);
+        nmap += 1;
+    }
+
+    if !config.quiet {
+        eprintln!("[methratio] processed {} valid mappings", nmap);
     }
 
     if config.combine_cpg {
@@ -47,10 +53,11 @@ fn count_single_record(
 
     // 查找 BS_conversion 对应的转换规则
     // BS_conversion = {'+': ('C','T','G','A'), '-': ('G','A','C','T')}
-    // (match_base, convert_base, methyl_base, rc_match_base)
-    let (match_base, convert_base, methyl_base) = match strand {
-        '+' => (b'C', b'T', b'G'),
-        '-' => (b'G', b'A', b'C'),
+    // (match_base, convert_base)
+    // 甲基化判定：read_base == match_base（与参考碱基相同 = 未被 BS 转换 = 甲基化）
+    let (match_base, convert_base) = match strand {
+        '+' => (b'C', b'T'),
+        '-' => (b'G', b'A'),
         _ => return,
     };
 
@@ -67,13 +74,13 @@ fn count_single_record(
 
             // 只计入有效碱基（非 gap 占位符）
             if read_base == convert_base {
-                // 未甲基化
+                // 未甲基化（BS 转换后的碱基）
                 let depth_entry = counts.depth.entry(index).or_insert(0);
                 if *depth_entry < 65535 {
                     *depth_entry += 1;
                 }
-            } else if read_base == methyl_base {
-                // 甲基化
+            } else if read_base == match_base {
+                // 甲基化（未被 BS 转换，与参考碱基相同）
                 let depth_entry = counts.depth.entry(index).or_insert(0);
                 if *depth_entry < 65535 {
                     *depth_entry += 1;

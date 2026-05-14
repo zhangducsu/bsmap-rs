@@ -189,17 +189,31 @@ fn parse_alignment(line: &str, format: InputFormat, config: &Config, ref_seqs: &
     }
 
     // paired overlap for SAM (methratio.py 第 90 行)
+    // Python: if sam_format and insert > 0: seq = seq[:int(col[7])-1-pos]
+    // 注意 Python 切片语义：seq[:n] 当 n < 0 时等价于 seq[:len(seq)+n]
+    // 即从末尾截取 |n| 个字符，而非完全清空
     if is_sam {
         let insert: i64 = col.get(8).and_then(|s| s.parse().ok()).unwrap_or(0);
         if insert > 0 {
             // col[7] 是 PNEXT (mate position, 1-based)
             if let Some(pnext_str) = col.get(7) {
-                if let Ok(pnext) = pnext_str.parse::<usize>() {
+                if let Ok(pnext) = pnext_str.parse::<i64>() {
                     if pnext > 0 {
-                        let overlap_end = pnext.saturating_sub(1); // 转为 0-based
-                        if overlap_end < pos + seq.len() {
-                            seq.truncate(overlap_end - pos);
+                        // 使用 i64 避免下溢，精确复制 Python seq[:n] 语义
+                        let n = pnext - 1 - (pos as i64); // pnext-1-pos
+                        let seq_len = seq.len() as i64;
+                        if n < 0 {
+                            // Python seq[:n] 当 n<0 等价于 seq[:seq_len+n]
+                            let effective_len = seq_len + n;
+                            if effective_len <= 0 {
+                                seq.clear();
+                            } else {
+                                seq.truncate(effective_len as usize);
+                            }
+                        } else if n < seq_len {
+                            seq.truncate(n as usize);
                         }
+                        // n >= seq_len: 不截断
                     }
                 }
             }

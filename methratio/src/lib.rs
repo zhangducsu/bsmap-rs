@@ -67,9 +67,10 @@ impl Default for Config {
 
 /// BS 转换规则
 /// 对应 methratio.py: BS_conversion = {'+': ('C','T','G','A'), '-': ('G','A','C','T')}
-pub const BS_CONVERSION: [(char, char, char, char); 2] = [
-    ('+', 'C', 'T', 'G'),  // (match, convert, methyl_base, rc_match)
-    ('-', 'G', 'A', 'C'),
+/// (match_base, convert_base) - 甲基化判定: read_base == match_base
+pub const BS_CONVERSION: [(char, char, char); 2] = [
+    ('+', 'C', 'T'),  // (strand, match, convert)
+    ('-', 'G', 'A'),
 ];
 
 pub mod input;
