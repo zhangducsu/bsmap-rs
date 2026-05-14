@@ -102,24 +102,45 @@ pub fn format_bsp(
     let ref_strand = if chain.is_ref_forward() { '+' } else { '-' };
     let read_strand = if chain.is_read_forward() { '+' } else { '-' };
 
-    // 构建 CIGAR
-    let cigar = make_cigar(
-        read.seq.len() as u32,
-        hit.gap_size as i8,
-        hit.gap_pos as u8,
-    );
+    // 列 1: read name
+    // 列 2: mapped read sequence
+    let seq = String::from_utf8_lossy(&read.seq);
+    // 列 3: quality scores
+    let qual: String = read.qual.iter().map(|&b| b as char).collect();
+    // 列 4: hit_type (UM/MA/OF)
+    // 列 5: ref_name
+    // 列 6: 1-based position
+    let pos = hit.loc + 1;
+    // 列 7: strand combination
+    let strand = format!("{}{}", ref_strand, read_strand);
+    // 列 8: insert size (no pair info available in ReadInf, use 0)
+    let ins_size = 0;
+    // 列 9: Watson strand reference sequence (placeholder, not used by bsp2sam)
+    let refseq = "*";
+    // 列 10: mismatch info
+    let mm_info = if hit.gap_size != 0 {
+        format!("{}:{}:{}", hit.snps, hit.gap_size.unsigned_abs(), hit.gap_pos)
+    } else {
+        format!("{}", hit.snps)
+    };
+    // 列 11: mismatch hit count distribution (placeholder)
+    let mismatch_info = "0";
 
-    // BSP 格式：read_name\tref_name\tpos\tref_strand\tread_strand\tmm_count\tcigar\thit_type
+    // BSP 11-column format (tab-separated):
+    // id\tseq\tqual\tmap_flag\tref\tref_loc\tstrand\tins_size\trefseq\tmm_info\tmismatch_info
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         read.name,
+        seq,
+        qual,
+        hit_type,
         ref_name,
-        hit.loc + 1, // 转换为 1-based
-        ref_strand,
-        read_strand,
-        hit.snps,
-        cigar,
-        hit_type
+        pos,
+        strand,
+        ins_size,
+        refseq,
+        mm_info,
+        mismatch_info,
     )
 }
 
@@ -460,8 +481,13 @@ pub fn format_unmapped(read: &ReadInf, format: OutputFormat) -> String {
             )
         }
         OutputFormat::Bsp => {
-            // BSP 格式：NM 表示无命中
-            format!("{}\t*\t0\t*\t*\t0\t*\tNM", read.name)
+            // BSP 11-column format: NM (no hit)
+            let seq = String::from_utf8_lossy(&read.seq);
+            let qual: String = read.qual.iter().map(|&b| b as char).collect();
+            format!(
+                "{}\t{}\t{}\tNM\t*\t0\t*\t0\t*\t0\t0",
+                read.name, seq, qual
+            )
         }
     }
 }
@@ -486,8 +512,13 @@ pub fn format_qc_failed(read: &ReadInf, format: OutputFormat) -> String {
             )
         }
         OutputFormat::Bsp => {
-            // BSP 格式：QC 表示质量控制失败
-            format!("{}\t*\t0\t*\t*\t0\t*\tQC", read.name)
+            // BSP 11-column format: QC (quality control failed)
+            let seq = String::from_utf8_lossy(&read.seq);
+            let qual: String = read.qual.iter().map(|&b| b as char).collect();
+            format!(
+                "{}\t{}\t{}\tQC\t*\t0\t*\t0\t*\t0\t0",
+                read.name, seq, qual
+            )
         }
     }
 }
