@@ -4,7 +4,7 @@ members = [
     "bsmap",
     "methratio",
     # "methdiff",
-    # "bsp2sam",
+    "bsp2sam",
 ]
 
 [workspace.package]
