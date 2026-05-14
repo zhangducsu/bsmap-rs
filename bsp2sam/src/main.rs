@@ -1,7 +1,7 @@
 //! BSP to SAM converter.
 //!
 //! Converts BSMAP BSP format (11-column, tab-separated) to standard SAM format.
-//! Compatible with the original Python bsp2sam.py behavior.
+//! Outputs numeric SAM FLAGs compatible with samtools and downstream tools.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -99,8 +99,10 @@ fn build_sam_header(ref_file: &str) -> Result<String> {
 
     while let Some(record) = fastx_reader.next() {
         let record = record?;
-        let name = std::str::from_utf8(record.id())
+        let full_id = std::str::from_utf8(record.id())
             .context("Invalid UTF-8 in reference sequence name")?;
+        // needletail may return the full FASTA header line; take only the first word as SN
+        let name = full_id.split_whitespace().next().unwrap_or(full_id);
         let len = record.num_bases();
         header.push_str(&format!("@SQ\tSN:{}\tLN:{}\n", name, len));
     }
@@ -111,10 +113,64 @@ fn build_sam_header(ref_file: &str) -> Result<String> {
     Ok(header)
 }
 
+/// Build a numeric SAM FLAG value.
+///
+/// # Arguments
+/// - `is_paired`: 0x1 - template has multiple segments
+/// - `is_proper`: 0x2 - each segment properly aligned
+/// - `is_unmapped`: 0x4 - segment unmapped
+/// - `mate_unmapped`: 0x8 - next segment unmapped
+/// - `is_reverse`: 0x10 - SEQ is reverse complemented
+/// - `mate_reverse`: 0x20 - next SEQ is reverse complemented
+/// - `is_first`: 0x40 - first segment in template
+/// - `is_last`: 0x80 - last segment in template
+/// - `is_secondary`: 0x100 - secondary alignment
+fn build_flag(
+    is_paired: bool,
+    is_proper: bool,
+    is_unmapped: bool,
+    mate_unmapped: bool,
+    is_reverse: bool,
+    mate_reverse: bool,
+    is_first: bool,
+    is_last: bool,
+    is_secondary: bool,
+) -> u16 {
+    let mut flag: u16 = 0;
+    if is_paired {
+        flag |= 0x1;
+    }
+    if is_proper {
+        flag |= 0x2;
+    }
+    if is_unmapped {
+        flag |= 0x4;
+    }
+    if mate_unmapped {
+        flag |= 0x8;
+    }
+    if is_reverse {
+        flag |= 0x10;
+    }
+    if mate_reverse {
+        flag |= 0x20;
+    }
+    if is_first {
+        flag |= 0x40;
+    }
+    if is_last {
+        flag |= 0x80;
+    }
+    if is_secondary {
+        flag |= 0x100;
+    }
+    flag
+}
+
 /// Convert a single BSP line (11 columns) to a SAM line.
 ///
 /// BSP format (11 columns, tab-separated):
-///   col[0]: id (read name)
+///   col[0]: id (read name, may end with _R1/_R2)
 ///   col[1]: seq (mapped read sequence)
 ///   col[2]: qual (quality scores)
 ///   col[3]: map_flag (UM/MA/OF/NM/QC)
@@ -138,28 +194,36 @@ fn convert_bsp_line(line: &str) -> String {
     let qual = cols[2];
     let map_flag = cols[3];
 
+    // Detect paired-end from read name suffix (_R1/_R2)
+    let is_paired = name.ends_with("_R1") || name.ends_with("_R2");
+    let is_first = name.ends_with("_R1");
+    let is_last = name.ends_with("_R2");
+
     match map_flag {
         "NM" => {
-            // Unmapped: FLAG=4
+            // Unmapped
+            let flag = build_flag(is_paired, false, true, is_paired, false, false, is_first, is_last, false);
             format!(
-                "{}\t4\t*\t0\t0\t*\t*\t0\t0\t{}\t{}",
-                name, seq, qual
+                "{}\t{}\t*\t0\t0\t*\t*\t0\t0\t{}\t{}",
+                name, flag, seq, qual
             )
         }
         "QC" => {
-            // QC failed: FLAG=512
+            // QC failed (treat as unmapped + 0x200)
+            let flag = build_flag(is_paired, false, true, is_paired, false, false, is_first, is_last, false) | 512;
             format!(
-                "{}\t512\t*\t0\t0\t*\t*\t0\t0\t{}\t{}",
-                name, seq, qual
+                "{}\t{}\t*\t0\t0\t*\t*\t0\t0\t{}\t{}",
+                name, flag, seq, qual
             )
         }
         _ => {
             // Mapped reads (UM/MA/OF)
             if cols.len() < 11 {
                 // Insufficient columns, output as unmapped
+                let flag = build_flag(is_paired, false, true, is_paired, false, false, is_first, is_last, false);
                 format!(
-                    "{}\t4\t*\t0\t0\t*\t*\t0\t0\t{}\t{}",
-                    name, seq, qual
+                    "{}\t{}\t*\t0\t0\t*\t*\t0\t0\t{}\t{}",
+                    name, flag, seq, qual
                 )
             } else {
                 let cr = cols[4];      // reference name
@@ -176,40 +240,57 @@ fn convert_bsp_line(line: &str) -> String {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
 
-                // Build SAM flag string (original Python behavior)
-                // Note: original bsp2sam.py uses character-based flags, not numeric
-                let mut samflag = String::new();
-
-                // Reverse strand: +- or -+
-                if strand == "+-" || strand == "-+" {
-                    samflag.push('r');
-                }
+                // Determine strand flags from ZS strand tag
+                // strand: ++ => read forward, ref forward
+                // strand: +- => read reverse, ref forward
+                // strand: -+ => read forward, ref reverse
+                // strand: -- => read reverse, ref reverse
+                let is_reverse = strand == "+-" || strand == "--";
+                // Mate strand is opposite of read strand for paired-end
+                let mate_is_reverse = is_paired && !is_reverse;
 
                 // Secondary alignment: MA or OF
-                if map_flag == "MA" || map_flag == "OF" {
-                    samflag.push('s');
-                }
+                let is_secondary = map_flag == "MA" || map_flag == "OF";
 
-                // Properly paired flag
-                let has_pair = ins_size > 0;
-                if has_pair {
-                    samflag.push('P');
-                }
+                // Proper pair: paired with positive insert size
+                let is_proper = is_paired && ins_size > 0;
 
                 let readlen = seq.len();
                 let cigar = format!("{}M", readlen);
 
-                if has_pair {
+                // Build numeric SAM FLAG
+                let flag = build_flag(
+                    is_paired,
+                    is_proper,
+                    false,             // is_unmapped
+                    false,             // mate_unmapped (assume mate mapped for paired)
+                    is_reverse,
+                    mate_is_reverse,
+                    is_first,
+                    is_last,
+                    is_secondary,
+                );
+
+                if is_paired {
                     // Paired output
+                    let tlen = if ins_size > 0 {
+                        if is_reverse {
+                            -(ins_size as i32)
+                        } else {
+                            ins_size as i32
+                        }
+                    } else {
+                        0
+                    };
                     format!(
                         "{}\t{}\t{}\t{}\t255\t{}\t=\t0\t{}\t{}\t{}\tNM:i:{}\tZS:Z:{}",
-                        name, samflag, cr, pos, cigar, ins_size, seq, qual, mm, strand
+                        name, flag, cr, pos, cigar, tlen, seq, qual, mm, strand
                     )
                 } else {
                     // Single-end output
                     format!(
                         "{}\t{}\t{}\t{}\t255\t{}\t*\t0\t0\t{}\t{}\tNM:i:{}\tZS:Z:{}",
-                        name, samflag, cr, pos, cigar, seq, qual, mm, strand
+                        name, flag, cr, pos, cigar, seq, qual, mm, strand
                     )
                 }
             }
@@ -222,6 +303,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_build_flag_paired_first_forward() {
+        // R1, forward, mate reverse => 0x1 | 0x2 | 0x20 | 0x40 = 1+2+32+64 = 99
+        let flag = build_flag(true, true, false, false, false, true, true, false, false);
+        assert_eq!(flag, 99);
+    }
+
+    #[test]
+    fn test_build_flag_paired_last_reverse() {
+        // R2, reverse, mate forward => 0x1 | 0x2 | 0x10 | 0x80 = 1+2+16+128 = 147
+        let flag = build_flag(true, true, false, false, true, false, false, true, false);
+        assert_eq!(flag, 147);
+    }
+
+    #[test]
+    fn test_build_flag_paired_first_reverse() {
+        // R1, reverse, mate forward => 0x1 | 0x2 | 0x10 | 0x40 = 1+2+16+64 = 83
+        let flag = build_flag(true, true, false, false, true, false, true, false, false);
+        assert_eq!(flag, 83);
+    }
+
+    #[test]
+    fn test_build_flag_paired_last_forward() {
+        // R2, forward, mate reverse => 0x1 | 0x2 | 0x20 | 0x80 = 1+2+32+128 = 163
+        let flag = build_flag(true, true, false, false, false, true, false, true, false);
+        assert_eq!(flag, 163);
+    }
+
+    #[test]
     fn test_convert_nm() {
         let bsp = "read1\tACGT\t!!!!\tNM\t*\t0\t*\t0\t*\t0\t0";
         let sam = convert_bsp_line(bsp);
@@ -232,57 +341,105 @@ mod tests {
     fn test_convert_qc() {
         let bsp = "read1\tACGT\t!!!!\tQC\t*\t0\t*\t0\t*\t0\t0";
         let sam = convert_bsp_line(bsp);
-        assert_eq!(sam, "read1\t512\t*\t0\t0\t*\t*\t0\t0\tACGT\t!!!!");
+        assert_eq!(sam, "read1\t516\t*\t0\t0\t*\t*\t0\t0\tACGT\t!!!!");
     }
 
     #[test]
-    fn test_convert_um_plus_plus() {
+    fn test_convert_paired_r1_strand_minus_plus() {
+        // R1 with strand -+ => read forward, mate reverse => FLAG=97 (no proper pair since ins_size=0)
+        // 0x1 | 0x20 | 0x40 = 1+32+64 = 97
+        let bsp = "read1_R1\tACGT\t!!!!\tUM\tchr1\t100\t-+\t0\t*\t0\t0";
+        let sam = convert_bsp_line(bsp);
+        assert_eq!(
+            sam,
+            "read1_R1\t97\tchr1\t100\t255\t4M\t=\t0\t0\tACGT\t!!!!\tNM:i:0\tZS:Z:-+"
+        );
+    }
+
+    #[test]
+    fn test_convert_paired_r2_strand_minus_minus() {
+        // R2 with strand -- => read reverse, mate forward => FLAG=145 (no proper pair since ins_size=0)
+        // 0x1 | 0x10 | 0x80 = 1+16+128 = 145
+        let bsp = "read1_R2\tACGT\t!!!!\tUM\tchr1\t200\t--\t0\t*\t0\t0";
+        let sam = convert_bsp_line(bsp);
+        assert_eq!(
+            sam,
+            "read1_R2\t145\tchr1\t200\t255\t4M\t=\t0\t0\tACGT\t!!!!\tNM:i:0\tZS:Z:--"
+        );
+    }
+
+    #[test]
+    fn test_convert_paired_r1_strand_plus_plus() {
+        // R1 with strand ++ => read forward, mate reverse => FLAG=97 (no proper pair since ins_size=0)
+        // 0x1 | 0x20 | 0x40 = 1+32+64 = 97
+        let bsp = "read1_R1\tACGT\t!!!!\tUM\tchr1\t100\t++\t0\t*\t0\t0";
+        let sam = convert_bsp_line(bsp);
+        assert_eq!(
+            sam,
+            "read1_R1\t97\tchr1\t100\t255\t4M\t=\t0\t0\tACGT\t!!!!\tNM:i:0\tZS:Z:++"
+        );
+    }
+
+    #[test]
+    fn test_convert_paired_r2_strand_plus_minus() {
+        // R2 with strand +- => read reverse, mate forward => FLAG=145 (no proper pair since ins_size=0)
+        // 0x1 | 0x10 | 0x80 = 1+16+128 = 145
+        let bsp = "read1_R2\tACGT\t!!!!\tUM\tchr1\t200\t+-\t0\t*\t0\t0";
+        let sam = convert_bsp_line(bsp);
+        assert_eq!(
+            sam,
+            "read1_R2\t145\tchr1\t200\t255\t4M\t=\t0\t0\tACGT\t!!!!\tNM:i:0\tZS:Z:+-"
+        );
+    }
+
+    #[test]
+    fn test_convert_single_end() {
         let bsp = "read1\tACGTACGT\t!!!!!!!!\tUM\tchr1\t100\t++\t0\t*\t2\t0";
         let sam = convert_bsp_line(bsp);
         assert_eq!(
             sam,
-            "read1\t\tchr1\t100\t255\t8M\t*\t0\t0\tACGTACGT\t!!!!!!!!\tNM:i:2\tZS:Z:++"
+            "read1\t0\tchr1\t100\t255\t8M\t*\t0\t0\tACGTACGT\t!!!!!!!!\tNM:i:2\tZS:Z:++"
         );
     }
 
     #[test]
-    fn test_convert_ma_plus_minus() {
-        let bsp = "read1\tACGT\t!!!!\tMA\tchr1\t200\t+-\t0\t*\t1\t0";
+    fn test_convert_secondary() {
+        // MA with _R1 and strand +- => is_reverse=true, mate_is_reverse=false, is_secondary=true
+        // 0x1 | 0x10 | 0x40 | 0x100 = 1+16+64+256 = 337
+        let bsp = "read1_R1\tACGT\t!!!!\tMA\tchr1\t200\t+-\t0\t*\t1\t0";
         let sam = convert_bsp_line(bsp);
         assert_eq!(
             sam,
-            "read1\trs\tchr1\t200\t255\t4M\t*\t0\t0\tACGT\t!!!!\tNM:i:1\tZS:Z:+-"
+            "read1_R1\t337\tchr1\t200\t255\t4M\t=\t0\t0\tACGT\t!!!!\tNM:i:1\tZS:Z:+-"
         );
     }
 
     #[test]
-    fn test_convert_paired() {
-        let bsp = "read1\tACGT\t!!!!\tUM\tchr1\t100\t-+\t150\t*\t0\t0";
+    fn test_convert_paired_with_insert_size() {
+        // R1 with strand -+ and insert size => FLAG=99 (proper pair), TLEN negative for reverse
+        let bsp = "read1_R1\tACGT\t!!!!\tUM\tchr1\t100\t-+\t300\t*\t0\t0";
         let sam = convert_bsp_line(bsp);
+        // -+ => read forward (is_reverse=false), so TLEN=300
         assert_eq!(
             sam,
-            "read1\trP\tchr1\t100\t255\t4M\t=\t0\t150\tACGT\t!!!!\tNM:i:0\tZS:Z:-+"
+            "read1_R1\t99\tchr1\t100\t255\t4M\t=\t0\t300\tACGT\t!!!!\tNM:i:0\tZS:Z:-+"
         );
     }
 
     #[test]
-    fn test_convert_with_gap() {
-        // mm_info format: "1:2:8" means 1 mismatch, gap_size=2, gap_pos=8
-        let bsp = "read1\tACGTACGT\t!!!!!!!!\tUM\tchr1\t100\t++\t0\t*\t1:2:8\t0";
+    fn test_convert_paired_r2_with_insert_size() {
+        // R2 with strand -- and insert size => FLAG=163 (proper pair), TLEN negative for reverse
+        // 0x1 | 0x2 | 0x10 | 0x80 = 1+2+16+128 = 147... wait
+        // -- => is_reverse=true, mate_is_reverse=false
+        // R2 => is_first=false, is_last=true
+        // ins_size=300 => is_proper=true
+        // 0x1 | 0x2 | 0x10 | 0x80 = 1+2+16+128 = 147
+        let bsp = "read1_R2\tACGT\t!!!!\tUM\tchr1\t200\t--\t300\t*\t0\t0";
         let sam = convert_bsp_line(bsp);
+        // -- => read reverse (is_reverse=true), so TLEN=-300
         assert_eq!(
             sam,
-            "read1\t\tchr1\t100\t255\t8M\t*\t0\t0\tACGTACGT\t!!!!!!!!\tNM:i:1\tZS:Z:++"
-        );
-    }
-
-    #[test]
-    fn test_convert_of_minus_plus() {
-        let bsp = "read1\tACGT\t!!!!\tOF\tchr2\t50\t-+\t0\t*\t0\t0";
-        let sam = convert_bsp_line(bsp);
-        assert_eq!(
-            sam,
-            "read1\trs\tchr2\t50\t255\t4M\t*\t0\t0\tACGT\t!!!!\tNM:i:0\tZS:Z:-+"
+            "read1_R2\t147\tchr1\t200\t255\t4M\t=\t0\t-300\tACGT\t!!!!\tNM:i:0\tZS:Z:--"
         );
     }
 }

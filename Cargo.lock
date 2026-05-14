@@ -116,6 +116,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bsp2sam"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "log",
+ "needletail",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
