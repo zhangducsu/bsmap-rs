@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "bsmap",
-    # "methratio",
+    "methratio",
     # "methdiff",
     # "bsp2sam",
 ]
