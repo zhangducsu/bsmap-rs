@@ -391,6 +391,104 @@ pub fn revcomp_in_place(seq: &mut [u8]) {
     }
 }
 
+// ── SIMD Encoding (AVX2) ─────────────────────────────────────────────────
+
+/// SIMD 优化的正向编码（x86_64 AVX2）。
+/// 运行时检测 AVX2 支持，不支持时回退标量版本。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn pack_forward_simd(seq: &[u8], n_words: usize) -> Vec<u64> {
+    if is_x86_feature_detected!("avx2") {
+        unsafe { pack_forward_avx2(seq, n_words) }
+    } else {
+        pack_forward(seq, n_words)
+    }
+}
+
+/// AVX2 正向编码内部实现。
+/// 使用 pcmpeqb + blendv 批量查表，每次处理 32 字节。
+/// 对每个字节分别与 A/a/C/c/G/g/T/t 比较，得到 2-bit 编码，再标量打包为 u64。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn pack_forward_avx2(seq: &[u8], n_words: usize) -> Vec<u64> {
+    use std::arch::x86_64::*;
+
+    let c_upper = _mm256_set1_epi8(b'C' as i8);
+    let c_lower = _mm256_set1_epi8(b'c' as i8);
+    let g_upper = _mm256_set1_epi8(b'G' as i8);
+    let g_lower = _mm256_set1_epi8(b'g' as i8);
+    let t_upper = _mm256_set1_epi8(b'T' as i8);
+    let t_lower = _mm256_set1_epi8(b't' as i8);
+    let one = _mm256_set1_epi8(1);
+    let two = _mm256_set1_epi8(2);
+    let three = _mm256_set1_epi8(3);
+
+    let mut words = vec![0u64; n_words];
+    let mut word_idx = 0;
+    let mut seq_pos = 0;
+
+    // 每次处理 32 个碱基 = 1 个 u64 word (SEGLEN=32)
+    while seq_pos + 32 <= seq.len() && word_idx < n_words {
+        let input = _mm256_loadu_si256(seq.as_ptr().add(seq_pos) as *const __m256i);
+
+        // 默认编码 0 (A)，逐级叠加：C=1, G=2, T=3
+        let is_c = _mm256_or_si256(
+            _mm256_cmpeq_epi8(input, c_upper),
+            _mm256_cmpeq_epi8(input, c_lower),
+        );
+        let is_g = _mm256_or_si256(
+            _mm256_cmpeq_epi8(input, g_upper),
+            _mm256_cmpeq_epi8(input, g_lower),
+        );
+        let is_t = _mm256_or_si256(
+            _mm256_cmpeq_epi8(input, t_upper),
+            _mm256_cmpeq_epi8(input, t_lower),
+        );
+
+        // blendv: mask 为全1时取 val，否则取 arg1 (0)
+        let mut encoded = _mm256_setzero_si256();
+        encoded = _mm256_blendv_epi8(encoded, one, is_c);
+        encoded = _mm256_blendv_epi8(encoded, two, is_g);
+        encoded = _mm256_blendv_epi8(encoded, three, is_t);
+
+        // 将 32 字节编码结果打包为 1 个 u64（每碱基取低 2 位）
+        let mut buf = [0u8; 32];
+        _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, encoded);
+
+        let mut w: u64 = 0;
+        for &b in &buf {
+            w = (w << 2) | (b & 0x03) as u64;
+        }
+        words[word_idx] = w;
+        word_idx += 1;
+        seq_pos += 32;
+    }
+
+    // 标量处理剩余不足 32 碱基的部分
+    if word_idx < n_words {
+        let remaining = &seq[seq_pos..];
+        let chunk_len = remaining.len().min(SEGLEN);
+        if chunk_len > 0 {
+            let mut w: u64 = 0;
+            for &base in remaining.iter().take(chunk_len) {
+                w = (w << 2) | ALPHABET[base as usize] as u64;
+            }
+            w <<= (SEGLEN - chunk_len) * 2;
+            words[word_idx] = w;
+        }
+    }
+
+    words
+}
+
+/// 非 x86_64 平台的 SIMD 存根（直接调用标量版本）。
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn pack_forward_simd(seq: &[u8], n_words: usize) -> Vec<u64> {
+    pack_forward(seq, n_words)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -610,5 +708,30 @@ mod tests {
 
         // 验证 xt3 的结果是我们选择的统一哈希函数
         assert_eq!(hash_xt3, 106288);
+    }
+
+    #[test]
+    fn test_pack_forward_simd_consistency() {
+        let test_cases: Vec<&[u8]> = vec![
+            b"",
+            b"A",
+            b"AC",
+            b"ACG",
+            b"ACGT",
+            b"ACGTACGTACGTACGTACGTACGTACGTACGT", // 32 bases = 1 word
+            b"ACGTACGTACGTACGTACGTACGTACGTACGTA", // 33 bases = 2 words
+            b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT", // 64 bases = 2 words
+            b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTA", // 65 bases = 3 words
+            b"NNNNNNNN",
+            b"ACNTGNCATGC",
+            b"acgtnACGTN", // mixed case
+        ];
+
+        for seq in &test_cases {
+            let n_words = if seq.is_empty() { 1 } else { (seq.len() + SEGLEN - 1) / SEGLEN };
+            let scalar = pack_forward(seq, n_words);
+            let simd = pack_forward_simd(seq, n_words);
+            assert_eq!(scalar, simd, "pack_forward_simd mismatch for seq len={}", seq.len());
+        }
     }
 }

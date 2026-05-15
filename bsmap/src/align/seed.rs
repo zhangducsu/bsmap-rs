@@ -412,7 +412,7 @@ pub fn count_n_bases(encoded: &EncodedRead) -> u32 {
 mod tests {
     use super::*;
     use crate::alphabet::pack_forward;
-    use crate::param::{ReadInf, MAXSNPS};
+    use crate::param::{ReadInf, MAXSNPS, SEGLEN};
 
     fn make_test_read(seq: &[u8]) -> EncodedRead {
         let read = ReadInf {

@@ -422,6 +422,7 @@ mod tests {
     use super::*;
     use crate::alphabet::pack_forward;
     use crate::param::ReadInf;
+    use crate::reads::encode_read;
     use crate::reference::fasta::Reference;
 
     fn make_test_read(seq: &[u8]) -> EncodedRead {
