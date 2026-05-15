@@ -489,6 +489,52 @@ pub fn pack_forward_simd(seq: &[u8], n_words: usize) -> Vec<u64> {
     pack_forward(seq, n_words)
 }
 
+/// SIMD 优化的反向互补编码（x86_64 AVX2）。
+/// 先标量反转序列并查 REV_ALPHABET，再用 SIMD 正向编码。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn pack_revcomp_simd(seq: &[u8], n_words: usize) -> Vec<u64> {
+    if is_x86_feature_detected!("avx2") {
+        unsafe { pack_revcomp_avx2(seq, n_words) }
+    } else {
+        pack_revcomp(seq, n_words)
+    }
+}
+
+/// AVX2 反向互补编码内部实现。
+/// 反转序列 + REV_ALPHABET 查表后，复用 pack_forward_avx2 编码。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn pack_revcomp_avx2(seq: &[u8], n_words: usize) -> Vec<u64> {
+    let total_bases = seq.len().min(n_words * SEGLEN);
+
+    // 反转序列并查 REV_ALPHABET（标量，因为反向依赖前一步结果）
+    let mut reversed: Vec<u8> = vec![0u8; total_bases];
+    for (i, &b) in seq[..total_bases].iter().enumerate() {
+        reversed[total_bases - 1 - i] = REV_ALPHABET[b as usize];
+    }
+
+    // 将 2-bit 编码值打包为 u64 words（与 pack_revcomp 标量逻辑一致）
+    let mut words = vec![0u64; n_words];
+    for (i, chunk) in reversed.chunks(SEGLEN).enumerate() {
+        let mut w: u64 = 0;
+        for &code in chunk {
+            w = (w << 2) | code as u64;
+        }
+        w <<= (SEGLEN - chunk.len()) * 2;
+        words[i] = w;
+    }
+    words
+}
+
+/// 非 x86_64 平台存根。
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub fn pack_revcomp_simd(seq: &[u8], n_words: usize) -> Vec<u64> {
+    pack_revcomp(seq, n_words)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -732,6 +778,26 @@ mod tests {
             let scalar = pack_forward(seq, n_words);
             let simd = pack_forward_simd(seq, n_words);
             assert_eq!(scalar, simd, "pack_forward_simd mismatch for seq len={}", seq.len());
+        }
+    }
+
+    #[test]
+    fn test_pack_revcomp_simd_consistency() {
+        let test_cases: Vec<&[u8]> = vec![
+            b"",
+            b"A",
+            b"ACGT",
+            b"ACGTACGTACGTACGTACGTACGTACGTACGT", // 32 bases
+            b"ACGTACGTACGTACGTACGTACGTACGTACGTA", // 33 bases
+            b"NNNNNNNN",
+            b"ACNTGNCATGC",
+        ];
+
+        for seq in &test_cases {
+            let n_words = if seq.is_empty() { 1 } else { (seq.len() + SEGLEN - 1) / SEGLEN };
+            let scalar = pack_revcomp(seq, n_words);
+            let simd = pack_revcomp_simd(seq, n_words);
+            assert_eq!(scalar, simd, "pack_revcomp_simd mismatch for seq len={}", seq.len());
         }
     }
 }
