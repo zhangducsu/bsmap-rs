@@ -89,8 +89,8 @@ impl KmerIndex {
         let mut rev_counts = vec![0u32; total_kmers as usize];
 
         count_frequencies_separated(
-            &coll.refcat,
-            &coll.crefcat,
+            coll.refcat.as_slice(),
+            coll.crefcat.as_slice(),
             &coll.blocks,
             coll,
             index_interval,
@@ -165,7 +165,7 @@ impl KmerIndex {
 
         // Fill forward chain positions (chain=0)
         fill_positions_chain(
-            &coll.refcat,
+            coll.refcat.as_slice(),
             &coll.blocks,
             coll,
             0, // chain=0 (forward)
@@ -180,7 +180,7 @@ impl KmerIndex {
 
         // Fill reverse chain positions (chain=1)
         fill_positions_chain(
-            &coll.crefcat,
+            coll.crefcat.as_slice(),
             &coll.blocks,
             coll,
             1, // chain=1 (reverse)
@@ -308,7 +308,7 @@ impl KmerIndex {
                 }
                 let entries = &ccgg_index[seg][chain as usize];
                 for &(block_id, pos) in entries {
-                    let words = if chain == 0 { &coll.refcat } else { &coll.crefcat };
+                    let words = if chain == 0 { coll.refcat.as_slice() } else { coll.crefcat.as_slice() };
                     let margin_offset = (REF_MARGIN * SEGLEN) as u32;
                     if let Some(hash) = try_make_seed(words, (pos + margin_offset) * 2, seed_bits_lz) {
                         if (hash as usize) < rrbs_index.len() {

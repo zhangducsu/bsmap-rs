@@ -121,7 +121,7 @@ pub fn snp_align_for_chain(
             // 对每条参考链进行比对
             for ref_chain in 0..2u8 {
                 let positions = if ref_chain == 0 { fwd_positions } else { rev_positions };
-                let ref_seq = if ref_chain == 0 { &coll.refcat } else { &coll.crefcat };
+                let ref_seq = if ref_chain == 0 { coll.refcat.as_slice() } else { coll.crefcat.as_slice() };
 
                 if positions.is_empty() {
                     continue;

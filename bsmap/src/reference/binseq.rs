@@ -11,6 +11,7 @@ use crate::alphabet::{ALPHABET, REG_ALPHABET, REV_ALPHABET};
 use crate::param::{BINSEQPAD, REF_MARGIN, SEGLEN};
 
 use super::fasta::Reference;
+use super::storage::{BinSeqStorage, VecStorage};
 
 // ── Binary Sequence ───────────────────────────────────────────────────────────
 
@@ -47,9 +48,9 @@ pub struct BinSeqCollection {
     /// Total genome size in bases.
     pub sum_length: u64,
     /// Concatenated forward-strand binary sequences.
-    pub refcat: Vec<u64>,
+    pub refcat: Box<dyn BinSeqStorage>,
     /// Concatenated reverse-complement binary sequences.
-    pub crefcat: Vec<u64>,
+    pub crefcat: Box<dyn BinSeqStorage>,
     /// Anchor positions: ref_anchor[chr/2] + loc → flattened offset.
     /// Length = total_num + 1 (sentinel at end).
     pub ref_anchor: Vec<u32>,
@@ -137,8 +138,8 @@ impl BinSeqCollection {
         Self {
             total_num,
             sum_length,
-            refcat,
-            crefcat,
+            refcat: Box::new(VecStorage::new(refcat)),
+            crefcat: Box::new(VecStorage::new(crefcat)),
             ref_anchor,
             blocks,
             seqs,

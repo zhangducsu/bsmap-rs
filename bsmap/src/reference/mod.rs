@@ -8,8 +8,10 @@ pub mod binseq;
 pub mod index;
 pub mod index_io;
 pub mod rrbs;
+pub mod storage;
 
 pub use fasta::Reference;
 pub use binseq::{BinarySeq, BinSeqCollection, Block};
 pub use index::KmerIndex;
 pub use index_io::{default_index_path, is_index_compatible, load_index, save_index, IndexMeta};
+pub use storage::{BinSeqStorage, VecStorage, MmapStorage};
