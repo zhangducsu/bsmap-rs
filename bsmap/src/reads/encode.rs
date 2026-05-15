@@ -4,7 +4,7 @@
 //! 并生成有效碱基掩码，用于比对引擎的快速匹配。
 //! 对应 C++ `align.cpp` 中的 `ConvertBinarySeq()`。
 
-use crate::alphabet::{pack_forward, pack_revcomp, REG_ALPHABET};
+use crate::alphabet::{pack_forward, pack_forward_simd, pack_revcomp, pack_revcomp_simd, REG_ALPHABET};
 use crate::param::{ReadInf, SEGLEN};
 
 /// 编码后的读段（用于比对引擎）。
@@ -60,10 +60,10 @@ pub fn encode_read(read: &ReadInf) -> EncodedRead {
     };
 
     // 正向编码
-    let fwd_words = pack_forward(seq, num_words);
+    let fwd_words = pack_forward_simd(seq, num_words);
 
     // 反向互补编码
-    let rev_words = pack_revcomp(seq, num_words);
+    let rev_words = pack_revcomp_simd(seq, num_words);
 
     // 正向有效碱基掩码
     let fwd_mask = build_mask(seq, num_words, false);
@@ -261,5 +261,31 @@ mod tests {
 
         // ACGTA 不是回文，正向和反向互补编码应不同
         assert_ne!(*fwd, *rev, "非回文序列的正向和反向互补编码应不同");
+    }
+
+    /// 验证使用 SIMD 编码的 encode_read 与标量版本输出一致。
+    /// 注意：由于 encode_read 内部已切换到 SIMD，此测试验证 SIMD 路径的正确性。
+    #[test]
+    fn test_encode_read_simd_correctness() {
+        let test_seqs: Vec<&[u8]> = vec![
+            b"ACGT",
+            b"ACGTACGTACGTACGTACGTACGTACGTACGT", // 32 bases
+            b"ACGTACGTACGTACGTACGTACGTACGTACGTA", // 33 bases
+            b"ACNT",
+            b"NNNNNNNN",
+            b"acgtACGT", // mixed case
+        ];
+
+        for seq in &test_seqs {
+            let read = make_read("test", seq);
+            let encoded = encode_read(&read);
+
+            // 验证正向编码与标量 pack_forward 一致
+            let num_words = if seq.is_empty() { 1 } else { (seq.len() + SEGLEN - 1) / SEGLEN };
+            let expected_fwd = pack_forward(seq, num_words);
+            let expected_rev = pack_revcomp(seq, num_words);
+            assert_eq!(encoded.fwd_words, expected_fwd, "fwd_words mismatch for len={}", seq.len());
+            assert_eq!(encoded.rev_words, expected_rev, "rev_words mismatch for len={}", seq.len());
+        }
     }
 }
