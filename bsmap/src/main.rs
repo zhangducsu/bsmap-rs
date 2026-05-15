@@ -26,8 +26,8 @@ use bsmap::pairs::{format_pair_sam, PairAlign, PairBatchResult};
 use bsmap::param::{AlignConfig, AlignStats, BATCH_SIZE, ReadInf};
 use bsmap::reads::{encode_read, process_batch, EncodedRead, FastqReader};
 use bsmap::reference::{
-    default_index_path, is_index_compatible, load_index, save_index, BinSeqCollection, KmerIndex,
-    Reference,
+    default_index_path, is_index_compatible, load_index_with_mode, save_index_v2,
+    BinSeqCollection, KmerIndex, LoadMode, Reference,
 };
 use bsmap::utils::Timer;
 
@@ -150,9 +150,10 @@ fn run_index_command(args: &bsmap::cli::IndexArgs) -> Result<()> {
     info!("索引构建完成，耗时 {:.2}s", timer.step());
 
     // 5. 保存索引
-    match save_index(
+    match save_index_v2(
         &index_path,
         &index,
+        &coll,
         seed_size,
         args.index_interval,
         args.kmer_cutoff,
@@ -307,13 +308,13 @@ fn load_or_build_index(
 
     if use_cache {
         info!("从缓存加载索引: {}", index_path.display());
-        match load_index(&index_path) {
-            Ok((index, _meta)) => {
-                info!("索引加载完成，耗时 {:.2}s", timer.step());
-                return Ok((index, coll));
+        match load_index_with_mode(&index_path, LoadMode::Mmap) {
+            Ok((loaded_coll, index, _meta)) => {
+                info!("索引已从缓存加载: {}", index_path.display());
+                return Ok((index, loaded_coll));
             }
             Err(e) => {
-                warn!("索引加载失败: {}，将重新构建", e);
+                info!("无法加载索引: {}, 将重新构建: {}", index_path.display(), e);
             }
         }
     }
@@ -345,9 +346,10 @@ fn load_or_build_index(
     info!("索引构建完成，耗时 {:.2}s", timer.step());
 
     // 保存索引到缓存
-    if let Err(e) = save_index(
+    if let Err(e) = save_index_v2(
         &index_path,
         &index,
+        &coll,
         config.seed_size,
         config.index_interval,
         config.max_kmer_ratio,
