@@ -311,7 +311,11 @@ fn load_or_build_index(
         match load_index_with_mode(&index_path, LoadMode::Mmap) {
             Ok((loaded_coll, index, _meta)) => {
                 info!("索引已从缓存加载: {}", index_path.display());
-                return Ok((index, loaded_coll));
+                // 用 mmap 加载的 refcat/crefcat 替换内存版本，保留其他元数据
+                let mut mmap_coll = coll;
+                mmap_coll.refcat = loaded_coll.refcat;
+                mmap_coll.crefcat = loaded_coll.crefcat;
+                return Ok((index, mmap_coll));
             }
             Err(e) => {
                 info!("无法加载索引: {}, 将重新构建: {}", index_path.display(), e);

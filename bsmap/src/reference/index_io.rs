@@ -252,6 +252,16 @@ pub fn save_index_v2(
         .serialize_into(&mut writer, &data)
         .context("Failed to serialize index data")?;
 
+    // ── Padding to 8-byte alignment for refcat ──
+    let current_pos = HEADER_SIZE + names_buf.len()
+        + bincode_opts().serialized_size(&data).unwrap() as usize;
+    let padding = (8 - (current_pos % 8)) % 8;
+    if padding > 0 {
+        writer.write_all(&[0u8; 8][..padding]).context("Failed to write alignment padding")?;
+    }
+    // Record actual refcat offset in header (overwrite bytes 64-71 which were reserved)
+    // We can't seek back in BufWriter easily, so we'll compute the offset on load side instead.
+
     // ── refcat raw data ──
     let refcat_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(refcat_slice.as_ptr() as *const u8, refcat_slice.len() * 8)
@@ -511,9 +521,12 @@ pub fn load_index_with_mode(
     let names_and_header_size = HEADER_SIZE + stored_names_len;
     let expected_refcat_bytes = refcat_len * 8;
     let expected_crefcat_bytes = crefcat_len * 8;
-    let index_data_size =
-        file_size - names_and_header_size - expected_refcat_bytes - expected_crefcat_bytes;
-    let refcat_offset = names_and_header_size + index_data_size;
+    let raw_data_size = expected_refcat_bytes + expected_crefcat_bytes;
+    let index_data_size = file_size - names_and_header_size - raw_data_size;
+    // index_data_size includes bincode data + alignment padding
+    // refcat starts at the next 8-byte boundary after bincode data
+    let bincode_end = names_and_header_size + index_data_size;
+    let refcat_offset = (bincode_end + 7) & !7; // round up to 8-byte alignment
     let crefcat_offset = refcat_offset + expected_refcat_bytes;
 
     match mode {
