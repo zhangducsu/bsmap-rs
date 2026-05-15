@@ -28,20 +28,25 @@
 //! ```
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use bincode::Options;
 use serde::{Deserialize, Serialize};
 
+use super::binseq::BinSeqCollection;
 use super::index::KmerIndex;
+use super::storage::{MmapStorage, VecStorage};
 
 /// Magic bytes identifying a BSMAP-rs index file.
 const INDEX_MAGIC: &[u8; 8] = b"BSMAPIDX";
 
 /// Current index file format version.
 const INDEX_VERSION: u32 = 1;
+
+/// Version 2: includes refcat/crefcat data segments, supports mmap.
+const INDEX_VERSION_V2: u32 = 2;
 
 /// WGBS alignment mode.
 const MODE_WGBS: u32 = 0;
@@ -195,6 +200,80 @@ pub fn save_index(
     Ok(())
 }
 
+/// Save index in version 2 format (includes refcat/crefcat data segments).
+pub fn save_index_v2(
+    path: &Path,
+    index: &KmerIndex,
+    coll: &BinSeqCollection,
+    seed_size: u32,
+    index_interval: u32,
+    max_kmer_ratio: f64,
+    ref_names: &[String],
+    is_rrbs: bool,
+) -> Result<()> {
+    let file = File::create(path)
+        .with_context(|| format!("Cannot create index file: {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+
+    // ── Header (version 2) ──
+    let mut header = [0u8; HEADER_SIZE];
+    header[0..8].copy_from_slice(INDEX_MAGIC);
+    header[8..12].copy_from_slice(&INDEX_VERSION_V2.to_le_bytes());
+    header[12..16].copy_from_slice(&seed_size.to_le_bytes());
+    let mode = if is_rrbs { MODE_RRBS } else { MODE_WGBS };
+    header[16..20].copy_from_slice(&mode.to_le_bytes());
+    header[20..24].copy_from_slice(&index.total_kmers.to_le_bytes());
+    header[24..28].copy_from_slice(&index.max_kmer_num.to_le_bytes());
+    header[28..32].copy_from_slice(&index_interval.to_le_bytes());
+    header[32..40].copy_from_slice(&max_kmer_ratio.to_le_bytes());
+    header[40..44].copy_from_slice(&(ref_names.len() as u32).to_le_bytes());
+
+    // Serialize reference names
+    let mut names_buf: Vec<u8> = Vec::new();
+    for name in ref_names {
+        let name_bytes = name.as_bytes();
+        names_buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        names_buf.extend_from_slice(name_bytes);
+    }
+    header[44..48].copy_from_slice(&(names_buf.len() as u32).to_le_bytes());
+
+    // Version 2 new fields: refcat/crefcat word counts
+    let refcat_slice = coll.refcat.as_slice();
+    let crefcat_slice = coll.crefcat.as_slice();
+    header[48..56].copy_from_slice(&(refcat_slice.len() as u64).to_le_bytes());
+    header[56..64].copy_from_slice(&(crefcat_slice.len() as u64).to_le_bytes());
+
+    writer.write_all(&header).context("Failed to write index header")?;
+    writer.write_all(&names_buf).context("Failed to write reference names")?;
+
+    // ── Index data (bincode) ──
+    let data = IndexData::from(index);
+    bincode_opts()
+        .serialize_into(&mut writer, &data)
+        .context("Failed to serialize index data")?;
+
+    // ── refcat raw data ──
+    let refcat_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(refcat_slice.as_ptr() as *const u8, refcat_slice.len() * 8)
+    };
+    writer.write_all(refcat_bytes).context("Failed to write refcat data")?;
+
+    // ── crefcat raw data ──
+    let crefcat_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(crefcat_slice.as_ptr() as *const u8, crefcat_slice.len() * 8)
+    };
+    writer.write_all(crefcat_bytes).context("Failed to write crefcat data")?;
+
+    writer.flush().context("Failed to flush index file")?;
+    log::info!(
+        "索引已保存到 {} (v2, refcat={} words, crefcat={} words)",
+        path.display(),
+        refcat_slice.len(),
+        crefcat_slice.len(),
+    );
+    Ok(())
+}
+
 /// Metadata read from an index file header.
 #[derive(Debug, Clone)]
 pub struct IndexMeta {
@@ -231,11 +310,12 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
 
     // Verify version
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    if version != INDEX_VERSION {
+    if version != INDEX_VERSION && version != INDEX_VERSION_V2 {
         bail!(
-            "Unsupported index version {} (expected {}): {}",
+            "Unsupported index version {} (expected {} or {}): {}",
             version,
             INDEX_VERSION,
+            INDEX_VERSION_V2,
             path.display()
         );
     }
@@ -348,6 +428,192 @@ pub fn load_index(path: &Path) -> Result<(KmerIndex, IndexMeta)> {
     );
 
     Ok((index, meta))
+}
+
+/// Index loading mode.
+#[derive(Debug, Clone, Copy)]
+pub enum LoadMode {
+    /// Load everything into heap memory.
+    Memory,
+    /// mmap reference sequence data segments (version 2 format only).
+    Mmap,
+}
+
+/// Load index (supports version 1 and version 2, optional mmap).
+pub fn load_index_with_mode(
+    path: &Path,
+    mode: LoadMode,
+) -> Result<(BinSeqCollection, KmerIndex, IndexMeta)> {
+    let meta = read_index_meta(path)?;
+
+    let file = File::open(path)
+        .with_context(|| format!("Cannot open index file: {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+
+    let mut header = [0u8; HEADER_SIZE];
+    reader.read_exact(&mut header)?;
+    let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
+
+    if version == 1 {
+        if matches!(mode, LoadMode::Mmap) {
+            bail!(
+                "Index {} is version 1, mmap not supported. Rebuild with `bsmap index`.",
+                path.display()
+            );
+        }
+        let stored_names_len = u32::from_le_bytes(header[44..48].try_into().unwrap()) as usize;
+        if stored_names_len > 0 {
+            let mut skip = vec![0u8; stored_names_len];
+            reader.read_exact(&mut skip)?;
+        }
+        let data: IndexData = bincode_opts()
+            .deserialize_from(&mut reader)
+            .context("Failed to deserialize index data")?;
+        let index = reconstruct_kmer_index(data);
+        let coll = BinSeqCollection {
+            total_num: 0,
+            sum_length: 0,
+            refcat: Box::new(VecStorage::new(vec![])),
+            crefcat: Box::new(VecStorage::new(vec![])),
+            ref_anchor: vec![],
+            blocks: vec![],
+            seqs: vec![],
+            chr_names: meta.ref_names.clone(),
+        };
+        return Ok((coll, index, meta));
+    }
+
+    if version != INDEX_VERSION_V2 {
+        bail!(
+            "Unsupported index version {}: {}",
+            version,
+            path.display()
+        );
+    }
+
+    // Version 2
+    let refcat_len = u64::from_le_bytes(header[48..56].try_into().unwrap()) as usize;
+    let crefcat_len = u64::from_le_bytes(header[56..64].try_into().unwrap()) as usize;
+    let stored_names_len = u32::from_le_bytes(header[44..48].try_into().unwrap()) as usize;
+    if stored_names_len > 0 {
+        let mut skip = vec![0u8; stored_names_len];
+        reader.read_exact(&mut skip)?;
+    }
+
+    let data: IndexData = bincode_opts()
+        .deserialize_from(&mut reader)
+        .context("Failed to deserialize index data")?;
+    let index = reconstruct_kmer_index(data);
+    drop(reader);
+
+    let file_meta = std::fs::metadata(path)?;
+    let file_size = file_meta.len() as usize;
+    let names_and_header_size = HEADER_SIZE + stored_names_len;
+    let expected_refcat_bytes = refcat_len * 8;
+    let expected_crefcat_bytes = crefcat_len * 8;
+    let index_data_size =
+        file_size - names_and_header_size - expected_refcat_bytes - expected_crefcat_bytes;
+    let refcat_offset = names_and_header_size + index_data_size;
+    let crefcat_offset = refcat_offset + expected_refcat_bytes;
+
+    match mode {
+        LoadMode::Memory => {
+            let file = File::open(path)?;
+            let mut reader = BufReader::new(file);
+            reader.seek(std::io::SeekFrom::Start(refcat_offset as u64))?;
+            let mut refcat_data = vec![0u64; refcat_len];
+            unsafe {
+                let bytes = std::slice::from_raw_parts_mut(
+                    refcat_data.as_mut_ptr() as *mut u8,
+                    expected_refcat_bytes,
+                );
+                reader.read_exact(bytes)?;
+            }
+            let mut crefcat_data = vec![0u64; crefcat_len];
+            unsafe {
+                let bytes = std::slice::from_raw_parts_mut(
+                    crefcat_data.as_mut_ptr() as *mut u8,
+                    expected_crefcat_bytes,
+                );
+                reader.read_exact(bytes)?;
+            }
+            let coll = BinSeqCollection {
+                total_num: 0,
+                sum_length: 0,
+                refcat: Box::new(VecStorage::new(refcat_data)),
+                crefcat: Box::new(VecStorage::new(crefcat_data)),
+                ref_anchor: vec![],
+                blocks: vec![],
+                seqs: vec![],
+                chr_names: meta.ref_names.clone(),
+            };
+            log::info!(
+                "索引已从 {} 加载 (v2, memory, refcat={} words, crefcat={} words)",
+                path.display(),
+                refcat_len,
+                crefcat_len,
+            );
+            Ok((coll, index, meta))
+        }
+        LoadMode::Mmap => {
+            let file1 = File::open(path)?;
+            let mmap1 = unsafe { memmap2::Mmap::map(&file1)? };
+            let file2 = File::open(path)?;
+            let mmap2 = unsafe { memmap2::Mmap::map(&file2)? };
+            let refcat_storage = MmapStorage::with_offset(mmap1, refcat_offset, refcat_len);
+            let crefcat_storage = MmapStorage::with_offset(mmap2, crefcat_offset, crefcat_len);
+            let coll = BinSeqCollection {
+                total_num: 0,
+                sum_length: 0,
+                refcat: Box::new(refcat_storage),
+                crefcat: Box::new(crefcat_storage),
+                ref_anchor: vec![],
+                blocks: vec![],
+                seqs: vec![],
+                chr_names: meta.ref_names.clone(),
+            };
+            log::info!(
+                "索引已从 {} 加载 (v2, mmap, refcat={} words, crefcat={} words)",
+                path.display(),
+                refcat_len,
+                crefcat_len,
+            );
+            Ok((coll, index, meta))
+        }
+    }
+}
+
+/// Reconstruct a KmerIndex from IndexData.
+fn reconstruct_kmer_index(data: IndexData) -> KmerIndex {
+    KmerIndex {
+        total_kmers: data.total_kmers,
+        max_kmer_num: data.max_kmer_num,
+        index2: data
+            .index2
+            .into_iter()
+            .map(|e| crate::param::KmerLoc2 {
+                n: e.n,
+                loc1: Vec::new(),
+            })
+            .collect(),
+        positions: data.positions,
+        start_offsets: data.start_offsets,
+        rrbs_index: data.rrbs_index.map(|ri| {
+            ri.into_iter()
+                .map(|e| crate::param::KmerLoc {
+                    n1: e.n1,
+                    loc1: e
+                        .loc1
+                        .into_iter()
+                        .map(|h| crate::param::Hit {
+                            chr: h.chr,
+                            loc: h.loc,
+                        })
+                        .collect(),
+                })
+                .collect()
+        }),
+    }
 }
 
 /// Check if a cached index file exists and is compatible with the given parameters.
