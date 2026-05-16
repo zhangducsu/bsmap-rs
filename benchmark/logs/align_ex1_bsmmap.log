@@ -1,0 +1,8 @@
+========================================
+[2026-05-16 04:06:23] Align_Ex1_BSMAP_WGBS_SE75_10x
+Command: /workspace/bsmap-original/bsmap-2.90/bsmap -a /workspace/bsmap-rs/benchmark/tmp/ex1_se75.fq -d data/chr22_tail_1M.fa -o /workspace/bsmap-rs/benchmark/results/example1_wgbs_se/bsmap.sam -v 0.08 -I 4
+----------------------------------------
+Exit code: 0
+Wall time: 3.36s
+Peak RSS: 869936 KB (849 MB)
+

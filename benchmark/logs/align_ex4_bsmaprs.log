@@ -1,0 +1,8 @@
+========================================
+[2026-05-16 04:06:57] Align_Ex4_bsmaprs_RRBS_PE150_10x
+Command: /workspace/bsmap-rs/target/release/bsmap align -a /workspace/bsmap-rs/benchmark/tmp/ex4_pe150_1.fq -b /workspace/bsmap-rs/benchmark/tmp/ex4_pe150_2.fq -d data/chr22_tail_1M.fa -o /workspace/bsmap-rs/benchmark/results/example4_rrbs_pe/bsmaprs.sam -v 0.08 -s 12 -I 4 -D C-CGG
+----------------------------------------
+Exit code: 0
+Wall time: 6.10s
+Peak RSS: 3749136 KB (3661 MB)
+

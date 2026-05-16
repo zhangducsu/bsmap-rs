@@ -1,0 +1,9 @@
+[2026-05-16T04:06:15Z INFO  bsmap] BSMAP-rs v0.1.0 [index]
+[2026-05-16T04:06:15Z INFO  bsmap] 参考序列: data/chr22_tail_1M.fa
+[2026-05-16T04:06:15Z INFO  bsmap] 加载参考序列...
+[2026-05-16T04:06:15Z INFO  bsmap] 加载 1 条参考序列，共 1000000 bp，耗时 0.00s
+[2026-05-16T04:06:15Z INFO  bsmap] 构建二进制序列集合...
+[2026-05-16T04:06:15Z INFO  bsmap] 二进制序列集合构建完成，耗时 0.01s
+[2026-05-16T04:06:15Z INFO  bsmap::reference::index_io] 缓存索引不兼容: 文件 seed_size=16, mode=WGBS，需要 seed_size=12, mode=RRBS
+[2026-05-16T04:06:15Z INFO  bsmap] 构建索引 (seed_size=12, interval=4, mode=RRBS)...
+/data/user/work/run_benchmark.sh: line 42: 113724 Killed                  /workspace/bsmap-rs/target/release/bsmap index -d data/chr22_tail_1M.fa -s 12 -I 4 -D C-CGG -o /workspace/bsmap-rs/benchmark/index/bsmaprs_rrbs.bsi

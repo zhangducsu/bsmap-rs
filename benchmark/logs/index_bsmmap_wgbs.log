@@ -1,0 +1,8 @@
+========================================
+[2026-05-16 04:06:01] Index_BSMAP_WGBS
+Command: /workspace/bsmap-original/bsmap-2.90/bsmap -a data/chr22_tail_1M.fa -d wgbs -o /workspace/bsmap-rs/benchmark/index/bsmap_wgbs.bsi -v 16 -I 4
+----------------------------------------
+Exit code: 0
+Wall time: 0.16s
+Peak RSS: 0 KB (0 MB)
+

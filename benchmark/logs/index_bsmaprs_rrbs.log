@@ -1,0 +1,8 @@
+========================================
+[2026-05-16 04:06:15] Index_bsmaprs_RRBS
+Command: /workspace/bsmap-rs/target/release/bsmap index -d data/chr22_tail_1M.fa -s 12 -I 4 -D C-CGG -o /workspace/bsmap-rs/benchmark/index/bsmaprs_rrbs.bsi
+----------------------------------------
+Exit code: 0
+Wall time: 7.49s
+Peak RSS: 3807468 KB (3718 MB)
+

@@ -1,0 +1,8 @@
+========================================
+[2026-05-16 04:06:47] Align_Ex3_BSMAP_RRBS_SE75_10x
+Command: /workspace/bsmap-original/bsmap-2.90/bsmap -a /workspace/bsmap-rs/benchmark/tmp/ex3_se75.fq -d data/chr22_tail_1M.fa -o /workspace/bsmap-rs/benchmark/results/example3_rrbs_se/bsmap.sam -v 0.08 -I 4 -D C-CGG
+----------------------------------------
+Exit code: 0
+Wall time: 1.16s
+Peak RSS: 734848 KB (717 MB)
+

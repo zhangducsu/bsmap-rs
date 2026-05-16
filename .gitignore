@@ -31,3 +31,9 @@ Thumbs.db
 
 # BSMAP index files (large binary, regenerated at runtime)
 *.bsi
+
+# Large index files
+*.bsi
+
+# Large SAM files
+*.sam

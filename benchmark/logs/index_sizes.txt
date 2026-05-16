@@ -1,0 +1,1 @@
+  chr22_tail_1M.fa.bsi: 519037808 bytes (494 MB)

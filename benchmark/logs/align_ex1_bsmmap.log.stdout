@@ -1,0 +1,8 @@
+[bsmap] @Sat May 16 04:06:23 2026 	loading reference file: data/chr22_tail_1M.fa 	(format: FASTA)
+[bsmap] @Sat May 16 04:06:23 2026 	1 reference seqs loaded, total size 1000000 bp. 0 secs passed
+[bsmap] @Sat May 16 04:06:26 2026 	create seed table. 3 secs passed
+[bsmap] @Sat May 16 04:06:26 2026 	Single-end alignment(3 threads),
+	Input read file: /workspace/bsmap-rs/benchmark/tmp/ex1_se75.fq 	(format: FASTQ)
+	Output file: /workspace/bsmap-rs/benchmark/results/example1_wgbs_se/bsmap.sam	 (format: SAM)
+[bsmap] @Sat May 16 04:06:26 2026 	total reads: 133334 	total time:  3 secs
+	aligned reads: 66120 (49.6%), unique reads: 64951 (48.7%), non-unique reads: 1169 (0.9%)

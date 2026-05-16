@@ -1,0 +1,8 @@
+========================================
+[2026-05-16 04:07:06] Align_Ex5_bsmaprs_WGBS_PE150_20x
+Command: /workspace/bsmap-rs/target/release/bsmap align -a /workspace/bsmap-rs/benchmark/tmp/ex5_pe150_1.fq -b /workspace/bsmap-rs/benchmark/tmp/ex5_pe150_2.fq -d data/chr22_tail_1M.fa -o /workspace/bsmap-rs/benchmark/results/example5_wgbs_pe_20x/bsmaprs.sam -v 0.08 -s 16 -I 4
+----------------------------------------
+Exit code: 0
+Wall time: 16.75s
+Peak RSS: 1857448 KB (1813 MB)
+

@@ -1,0 +1,8 @@
+[bsmap] @Sat May 16 04:06:35 2026 	loading reference file: data/chr22_tail_1M.fa 	(format: FASTA)
+[bsmap] @Sat May 16 04:06:35 2026 	1 reference seqs loaded, total size 1000000 bp. 0 secs passed
+[bsmap] @Sat May 16 04:06:38 2026 	create seed table. 3 secs passed
+[bsmap] @Sat May 16 04:06:38 2026 	Pair-end alignment(3 threads),
+	Input read file #1: /workspace/bsmap-rs/benchmark/tmp/ex2_pe150_1.fq 	(format: FASTQ)
+	Input read file #2: /workspace/bsmap-rs/benchmark/tmp/ex2_pe150_2.fq 	(format: FASTQ)
+	Output file: /workspace/bsmap-rs/benchmark/results/example2_wgbs_pe/bsmap.sam*** buffer overflow detected ***: terminated
+/data/user/work/run_benchmark.sh: line 42: 114701 Aborted                 /workspace/bsmap-original/bsmap-2.90/bsmap -a /workspace/bsmap-rs/benchmark/tmp/ex2_pe150_1.fq -b /workspace/bsmap-rs/benchmark/tmp/ex2_pe150_2.fq -d data/chr22_tail_1M.fa -o /workspace/bsmap-rs/benchmark/results/example2_wgbs_pe/bsmap.sam -v 0.08 -I 4

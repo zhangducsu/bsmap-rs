@@ -1,0 +1,8 @@
+========================================
+[2026-05-16 04:06:02] Index_BSMAP_RRBS
+Command: /workspace/bsmap-original/bsmap-2.90/bsmap -a data/chr22_tail_1M.fa -d rrbs -o /workspace/bsmap-rs/benchmark/index/bsmap_rrbs.bsi -v 16 -I 4 -e MspI
+----------------------------------------
+Exit code: 0
+Wall time: 0.17s
+Peak RSS: 0 KB (0 MB)
+
