@@ -1,0 +1,19 @@
+[package]
+name = "methratio"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Methylation ratio calculator for BS-seq data"
+
+[[bin]]
+name = "methratio"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+noodles = { workspace = true, features = ["bam", "sam", "bgzf"] }
+needletail = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+indicatif = { workspace = true }

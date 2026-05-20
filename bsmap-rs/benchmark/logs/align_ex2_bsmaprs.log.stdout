@@ -1,0 +1,21 @@
+[2026-05-16T04:06:38Z INFO  bsmap] BSMAP-rs v0.1.0 [align]
+[2026-05-16T04:06:38Z INFO  bsmap] 查询文件: /workspace/bsmap-rs/benchmark/tmp/ex2_pe150_1.fq
+[2026-05-16T04:06:38Z INFO  bsmap] 查询文件 (mate): /workspace/bsmap-rs/benchmark/tmp/ex2_pe150_2.fq
+[2026-05-16T04:06:38Z INFO  bsmap] 参考序列: data/chr22_tail_1M.fa
+[2026-05-16T04:06:38Z INFO  bsmap] 加载参考序列...
+[2026-05-16T04:06:38Z INFO  bsmap] 加载 1 条参考序列，共 1000000 bp，耗时 0.01s
+[2026-05-16T04:06:38Z INFO  bsmap] 构建二进制序列集合...
+[2026-05-16T04:06:38Z INFO  bsmap] 二进制序列集合构建完成，耗时 0.01s
+[2026-05-16T04:06:38Z INFO  bsmap] 从缓存加载索引: data/chr22_tail_1M.fa.bsi
+[2026-05-16T04:06:42Z INFO  bsmap::reference::index_io] 索引已从 data/chr22_tail_1M.fa.bsi 加载 (v2, mmap, refcat=32052 words, crefcat=32052 words)
+[2026-05-16T04:06:42Z INFO  bsmap] 索引已从缓存加载: data/chr22_tail_1M.fa.bsi
+[2026-05-16T04:06:42Z INFO  bsmap] 开始双端比对...
+[2026-05-16T04:06:47Z INFO  bsmap] 双端比对完成
+[2026-05-16T04:06:47Z INFO  bsmap] ========== 比对统计 ==========
+[2026-05-16T04:06:47Z INFO  bsmap] 配对比对数: 33478
+[2026-05-16T04:06:47Z INFO  bsmap]   唯一配对: 31821
+[2026-05-16T04:06:47Z INFO  bsmap]   多重配对: 1657
+[2026-05-16T04:06:47Z INFO  bsmap] 单端比对 (read_a): 0
+[2026-05-16T04:06:47Z INFO  bsmap] 单端比对 (read_b): 1
+[2026-05-16T04:06:47Z INFO  bsmap] ==============================
+[2026-05-16T04:06:47Z INFO  bsmap] 总耗时: 8.17s

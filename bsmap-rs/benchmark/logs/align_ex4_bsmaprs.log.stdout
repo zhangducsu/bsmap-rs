@@ -1,0 +1,11 @@
+[2026-05-16T04:06:57Z INFO  bsmap] BSMAP-rs v0.1.0 [align]
+[2026-05-16T04:06:57Z INFO  bsmap] 查询文件: /workspace/bsmap-rs/benchmark/tmp/ex4_pe150_1.fq
+[2026-05-16T04:06:57Z INFO  bsmap] 查询文件 (mate): /workspace/bsmap-rs/benchmark/tmp/ex4_pe150_2.fq
+[2026-05-16T04:06:57Z INFO  bsmap] 参考序列: data/chr22_tail_1M.fa
+[2026-05-16T04:06:57Z INFO  bsmap] 加载参考序列...
+[2026-05-16T04:06:57Z INFO  bsmap] 加载 1 条参考序列，共 1000000 bp，耗时 0.01s
+[2026-05-16T04:06:57Z INFO  bsmap] 构建二进制序列集合...
+[2026-05-16T04:06:57Z INFO  bsmap] 二进制序列集合构建完成，耗时 0.01s
+[2026-05-16T04:06:57Z INFO  bsmap::reference::index_io] 缓存索引不兼容: 文件 seed_size=16, mode=WGBS，需要 seed_size=12, mode=RRBS
+[2026-05-16T04:06:57Z INFO  bsmap] 构建索引 (seed_size=12, interval=4)...
+/data/user/work/run_benchmark.sh: line 42: 115735 Killed                  /workspace/bsmap-rs/target/release/bsmap align -a /workspace/bsmap-rs/benchmark/tmp/ex4_pe150_1.fq -b /workspace/bsmap-rs/benchmark/tmp/ex4_pe150_2.fq -d data/chr22_tail_1M.fa -o /workspace/bsmap-rs/benchmark/results/example4_rrbs_pe/bsmaprs.sam -v 0.08 -s 12 -I 4 -D C-CGG

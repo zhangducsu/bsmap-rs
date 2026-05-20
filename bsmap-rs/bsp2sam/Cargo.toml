@@ -1,0 +1,17 @@
+[package]
+name = "bsp2sam"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0"
+description = "Convert BSMAP BSP format to SAM format"
+
+[[bin]]
+name = "bsp2sam"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+anyhow = { workspace = true }
+needletail = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

@@ -1,0 +1,33 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.lib
+*.a
+
+# Cargo.lock for libraries — keep for binaries
+# (bsmap is a binary, so we DO commit Cargo.lock)
+
+# Misc
+.env
+*.log
+
+# BSMAP index files (large binary, regenerated at runtime)
+*.bsi
