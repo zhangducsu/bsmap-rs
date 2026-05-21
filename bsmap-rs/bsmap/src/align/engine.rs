@@ -17,7 +17,9 @@
 //! - 最后合并两条链的 hits
 //! - Rust 版本已重构为与 C++ 一致的逐链独立架构
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
+
+use rayon::prelude::*;
 
 use crate::align::extend::{add_hits, clear_hits, dedup_hits, is_unique_hit, select_best_hits, snp_align_segment, ExtHit};
 use crate::align::seed::{extract_seeds, reorder_seeds_for_chain};
@@ -70,9 +72,9 @@ pub struct SingleAlign {
     /// 多重比对读段数。
     pub n_multiple: u32,
     /// C++ hitset: 非 gap 命中去重集 (key: (chr>>1, loc))
-    dedup_no_gap: HashSet<(u32, u32)>,
+    dedup_no_gap: FxHashSet<(u32, u32)>,
     /// C++ ghitset: gap 命中去重集 (key: (chr>>1, loc))
-    dedup_gap: HashSet<(u32, u32)>,
+    dedup_gap: FxHashSet<(u32, u32)>,
     /// C++ 分层命中计数（用于动态 snp_thres 降低，跨链累计）
     level_counts: Vec<usize>,
 }
@@ -90,8 +92,8 @@ impl SingleAlign {
             n_aligned: 0,
             n_unique: 0,
             n_multiple: 0,
-            dedup_no_gap: HashSet::new(),
-            dedup_gap: HashSet::new(),
+            dedup_no_gap: FxHashSet::default(),
+            dedup_gap: FxHashSet::default(),
             level_counts: vec![0; MAXSNPS as usize + 1],
         }
     }
@@ -236,7 +238,7 @@ impl SingleAlign {
                 } else {
                     encoded.rev_mask.as_slice()
                 };
-                let n_count = crate::align::extend::count_n_in_mask(mask, read_len);
+                let n_count = encoded.n_count;
 
                 let mut seg_hits: Vec<ExtHit> = Vec::new();
                 let cur_counts = if read_chain == 0 {
@@ -379,42 +381,32 @@ impl SingleAlign {
     /// # 返回值
     /// 比对结果数组
     pub fn do_batch(
-        &mut self,
         reads: &[EncodedRead],
         index: &KmerIndex,
         coll: &BinSeqCollection,
         config: &AlignConfig,
     ) -> Vec<AlignmentResult> {
-        let mut results = Vec::with_capacity(reads.len());
-
-        for (idx, encoded) in reads.iter().enumerate() {
-            // 过滤读段
-            if Self::filter_read(encoded, config) {
-                results.push(AlignmentResult::new(idx as u32, Vec::new(), false, 0));
-                continue;
-            }
-
-            // 执行比对
-            let has_hits = self.run_align(encoded, index, coll, config);
-
-            // 收集结果
-            let (best_hits, best_snp) = if has_hits {
-                select_best_hits(&self.hits)
-            } else {
-                (Vec::new(), 0)
-            };
-
-            let is_unique = is_unique_hit(&self.hits);
-
-            results.push(AlignmentResult::new(
-                idx as u32,
-                best_hits,
-                is_unique,
-                best_snp,
-            ));
+        thread_local! {
+            static TL_ALIGNER: std::cell::RefCell<SingleAlign> = std::cell::RefCell::new(SingleAlign::new());
         }
 
-        results
+        reads.par_iter().enumerate().map(|(idx, encoded)| {
+            if Self::filter_read(encoded, config) {
+                return AlignmentResult::new(idx as u32, Vec::new(), false, 0);
+            }
+
+            TL_ALIGNER.with(|cell| {
+                let mut aligner = cell.borrow_mut();
+                let has_hits = aligner.run_align(encoded, index, coll, config);
+                let (best_hits, best_snp) = if has_hits {
+                    select_best_hits(&aligner.hits)
+                } else {
+                    (Vec::new(), 0)
+                };
+                let is_unique = is_unique_hit(&aligner.hits);
+                AlignmentResult::new(idx as u32, best_hits, is_unique, best_snp)
+            })
+        }).collect()
     }
 
     /// 获取最佳层命中数（对应 C++：第一个非空层的命中数）。

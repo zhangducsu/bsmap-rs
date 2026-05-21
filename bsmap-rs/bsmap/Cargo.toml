@@ -24,6 +24,8 @@ indicatif = { workspace = true }
 serde = { workspace = true }
 bincode = { workspace = true }
 memmap2 = { workspace = true }
+rustc-hash = { workspace = true }
+mimalloc = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

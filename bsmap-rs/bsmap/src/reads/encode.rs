@@ -25,6 +25,8 @@ pub struct EncodedRead {
     pub rev_mask: Vec<u64>,
     /// 原始读段信息。
     pub info: ReadInf,
+    /// 预计算的 N 碱基数量（fwd_mask 与 rev_mask 中 N 数量相同）。
+    pub n_count: u32,
 }
 
 /// 将读段编码为 2-bit 二进制格式（正向 + 反向互补）。
@@ -71,12 +73,16 @@ pub fn encode_read(read: &ReadInf) -> EncodedRead {
     // 反向互补有效碱基掩码
     let rev_mask = build_mask(seq, num_words, true);
 
+    // 预计算 N 碱基数量（正反向掩码中 N 数量相同）
+    let n_count = count_n_in_mask(&fwd_mask, len as u32);
+
     EncodedRead {
         fwd_words,
         rev_words,
         fwd_mask,
         rev_mask,
         info: read.clone(),
+        n_count,
     }
 }
 
@@ -129,6 +135,28 @@ fn build_mask(seq: &[u8], num_words: usize, reverse: bool) -> Vec<u64> {
     }
 
     mask
+}
+
+/// 计算掩码中 N 碱基的数量（仅统计 read 长度范围内）。
+fn count_n_in_mask(mask: &[u64], read_len: u32) -> u32 {
+    let mut count = 0u32;
+    let total_bits = read_len * 2;
+    let mut bits_processed = 0u32;
+    for &word in mask {
+        if bits_processed >= total_bits {
+            break;
+        }
+        let inverted = !word;
+        let remaining = ((total_bits - bits_processed) / 2).min(32);
+        for i in 0..remaining {
+            let bits = (inverted >> (62 - i * 2)) & 0b11;
+            if bits == 0b11 {
+                count += 1;
+            }
+        }
+        bits_processed += 64;
+    }
+    count
 }
 
 #[cfg(test)]

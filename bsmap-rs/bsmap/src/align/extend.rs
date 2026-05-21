@@ -10,10 +10,10 @@
 //! - segment 只包含该链的种子（无需 `seed_chains` 过滤）
 //! - 最后合并两条链的 hits
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::align::gap::gap_align;
-use crate::align::mismatch::count_mismatch;
+use crate::align::mismatch::count_mismatch_simd;
 use crate::align::seed::SeedSegment;
 use crate::param::GHit;
 use crate::reads::encode::EncodedRead;
@@ -68,10 +68,9 @@ pub fn snp_align_for_chain(
     level_counts: &mut [usize],
 ) -> Vec<GHit> {
     let mut all_hits: Vec<ExtHit> = Vec::new();
-    let read_len = encoded.info.seq.len() as u32;
     let query = if read_chain == 0 { &encoded.fwd_words } else { &encoded.rev_words };
     let mask = if read_chain == 0 { &encoded.fwd_mask } else { &encoded.rev_mask };
-    let n_count = count_n_in_mask(mask, read_len);
+    let n_count = encoded.n_count;
 
     for segment in segments.iter() {
         if snp_align_segment(
@@ -153,7 +152,7 @@ pub fn snp_align_segment(
                     continue;
                 }
 
-                let mm_count = count_mismatch(
+                let mm_count = count_mismatch_simd(
                     query, ref_offset, ref_seq, mask,
                     *snp_thres, n_count, nt3,
                 );
@@ -226,35 +225,13 @@ pub fn dedup_hits(hits: &mut Vec<ExtHit>) {
     hits.dedup_by(|a, b| a.chr == b.chr && a.loc == b.loc && a.strand == b.strand);
 }
 
-/// 计算掩码中 N 碱基的数量（仅统计 read 长度范围内）。
-pub fn count_n_in_mask(mask: &[u64], read_len: u32) -> u32 {
-    let mut count = 0u32;
-    let total_bits = read_len * 2;
-    let mut bits_processed = 0u32;
-    for &word in mask {
-        if bits_processed >= total_bits {
-            break;
-        }
-        let inverted = !word;
-        let remaining = ((total_bits - bits_processed) / 2).min(32);
-        for i in 0..remaining {
-            let bits = (inverted >> (62 - i * 2)) & 0b11;
-            if bits == 0b11 {
-                count += 1;
-            }
-        }
-        bits_processed += 64;
-    }
-    count
-}
-
 /// 添加命中到列表。
 ///
 /// 对应 C++ `AddHit()` 函数。将 segment 的命中添加到总命中列表。
 ///
 /// # 返回值
 /// 如果达到最大命中数限制，返回 true（应停止）
-pub fn add_hits(new_hits: Vec<GHit>, all_hits: &mut [Vec<GHit>], max_hits: usize, dedup_no_gap: &mut HashSet<(u32, u32)>, dedup_gap: &mut HashSet<(u32, u32)>) -> bool {
+pub fn add_hits(new_hits: Vec<GHit>, all_hits: &mut [Vec<GHit>], max_hits: usize, dedup_no_gap: &mut FxHashSet<(u32, u32)>, dedup_gap: &mut FxHashSet<(u32, u32)>) -> bool {
     for hit in new_hits {
         let snp_level = hit.snps as usize;
         if snp_level >= all_hits.len() {
@@ -295,9 +272,9 @@ pub fn clear_hits(hits: &mut [Vec<GHit>]) {
 
 /// 统计唯一命中数。
 pub fn count_unique_hits(hits: &[Vec<GHit>]) -> usize {
-    use std::collections::HashSet;
+    use rustc_hash::FxHashSet;
 
-    let mut unique = HashSet::new();
+    let mut unique = FxHashSet::default();
     for level in hits.iter() {
         for hit in level.iter() {
             unique.insert((hit.chr, hit.loc, hit.strand));
@@ -332,8 +309,8 @@ pub fn select_best_hits(hits: &[Vec<GHit>]) -> (Vec<GHit>, u8) {
     for (snp_level, level) in hits.iter().enumerate() {
         if !level.is_empty() {
             // 去重
-            use std::collections::HashSet;
-            let mut seen = HashSet::new();
+            use rustc_hash::FxHashSet;
+            let mut seen = FxHashSet::default();
             for hit in level.iter() {
                 let key = (hit.chr, hit.loc, hit.strand);
                 if seen.insert(key) {

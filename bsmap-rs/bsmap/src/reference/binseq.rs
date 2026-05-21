@@ -170,25 +170,19 @@ impl BinSeqCollection {
     /// The caller is responsible for determining the strand.
     #[inline]
     pub fn int2hit(&self, pos: u32) -> (u32, u32) {
-        // 找到对应的染色体
         if self.ref_anchor.is_empty() {
             return (0, pos);
         }
-        // Handle pos < ref_anchor[0] (shouldn't happen with valid positions)
         if pos < self.ref_anchor[0] {
             return (0, pos);
         }
-        for (i, &anchor) in self.ref_anchor.iter().enumerate().skip(1) {
-            if pos < anchor {
-                let chr = (i - 1) as u32;
-                let loc = pos - self.ref_anchor[i - 1];
-                return (chr, loc);
-            }
-        }
-        // 如果超出范围，返回最后一个染色体
-        let last_idx = self.ref_anchor.len().saturating_sub(2);
-        let chr = last_idx as u32;
-        let loc = pos - self.ref_anchor[last_idx];
+        let idx = match self.ref_anchor.binary_search(&pos) {
+            Ok(i) => i,
+            Err(i) => i.saturating_sub(1),
+        };
+        let max_chr = self.ref_anchor.len().saturating_sub(2);
+        let chr = idx.min(max_chr) as u32;
+        let loc = pos - self.ref_anchor[chr as usize];
         (chr, loc)
     }
 
@@ -241,35 +235,34 @@ pub fn encode_forward(seq: &[u8]) -> BinarySeq {
 }
 
 /// Encode in reverse-complement orientation (right-to-left, REV_ALPHABET).
+///
+/// Processes the original sequence in reverse SEGLEN-sized chunks,
+/// avoiding intermediate Vec<u8> allocations (~500 MB for large chromosomes).
 pub fn encode_revcomp(seq: &[u8]) -> BinarySeq {
     let n_words = (seq.len() + SEGLEN - 1) / SEGLEN;
     let mut words = vec![0u64; n_words];
     let mut mask = vec![0u64; n_words];
+    let total_bases = seq.len();
 
-    // Build RC bytes in natural order for chunking
-    let rev_seq: Vec<u8> = seq.iter().rev().copied().collect();
-    let rev_mask: Vec<u8> = seq
-        .iter()
-        .rev()
-        .map(|&c| REG_ALPHABET[c as usize])
-        .collect();
+    // Process chunks from the end of the sequence backwards.
+    // words[0] = RC of last SEGLEN bases, words[n_words-1] = RC of first SEGLEN bases.
+    for word_idx in 0..n_words {
+        let chunk_start = total_bases.saturating_sub((word_idx + 1) * SEGLEN);
+        let chunk_end = total_bases - word_idx * SEGLEN;
+        let chunk = &seq[chunk_start..chunk_end];
 
-    for (i, (chunk, mask_chunk)) in rev_seq
-        .chunks(SEGLEN)
-        .zip(rev_mask.chunks(SEGLEN))
-        .enumerate()
-    {
         let mut w: u64 = 0;
         let mut m: u64 = 0;
-        for (&base, &reg) in chunk.iter().zip(mask_chunk.iter()) {
+        // Reverse within chunk: iterate bases right-to-left
+        for &base in chunk.iter().rev() {
             w = (w << 2) | REV_ALPHABET[base as usize] as u64;
-            m = (m << 2) | reg as u64;
+            m = (m << 2) | REG_ALPHABET[base as usize] as u64;
         }
         let used = chunk.len() * 2;
         w <<= SEGLEN * 2 - used;
         m <<= SEGLEN * 2 - used;
-        words[i] = w;
-        mask[i] = m;
+        words[word_idx] = w;
+        mask[word_idx] = m;
     }
 
     BinarySeq {
@@ -410,7 +403,7 @@ mod tests {
         let coll = BinSeqCollection::from_references(&refs);
         assert_eq!(coll.total_num, 4); // 2 chr × 2 strands
         assert_eq!(coll.sum_length, 36);
-        // ref_anchor should have total_num + 1 entries
-        assert_eq!(coll.ref_anchor.len(), 5);
+        // ref_anchor has num_chromosomes + 1 entries (1 per chr + sentinel)
+        assert_eq!(coll.ref_anchor.len(), 3);
     }
 }
