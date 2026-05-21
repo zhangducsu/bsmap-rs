@@ -98,14 +98,10 @@ pub struct KmerLoc {
 /// The total hit count is `n[0] + n[1]`. Forward-chain positions start at
 /// offset 0 and span `n[1]` entries; reverse-chain positions follow
 /// immediately after, spanning `n[0]` entries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct KmerLoc2 {
     /// `n[0]` = reverse chain hit count, `n[1]` = forward chain hit count.
-    /// Together with the flat `positions` array, the layout is:
-    ///   positions[0 .. n[1]]           = forward chain hits
-    ///   positions[n[1] .. n[1]+n[0]]   = reverse chain hits
     pub n: [u32; 2],
-    pub loc1: Vec<u32>,
 }
 
 // ── Read-related ────────────────────────────────────────────────────────────

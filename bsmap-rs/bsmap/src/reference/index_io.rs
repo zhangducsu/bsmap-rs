@@ -409,7 +409,6 @@ pub fn load_index(path: &Path) -> Result<(KmerIndex, IndexMeta)> {
             .into_iter()
             .map(|e| crate::param::KmerLoc2 {
                 n: e.n,
-                loc1: Vec::new(), // positions are in the flat array
             })
             .collect(),
         positions: data.positions,
@@ -606,7 +605,6 @@ fn reconstruct_kmer_index(data: IndexData) -> KmerIndex {
             .into_iter()
             .map(|e| crate::param::KmerLoc2 {
                 n: e.n,
-                loc1: Vec::new(),
             })
             .collect(),
         positions: data.positions,

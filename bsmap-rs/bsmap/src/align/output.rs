@@ -184,15 +184,8 @@ fn build_record(
     );
 
     // 计算输出位置
-    // 对于反向参考链，需要将 crefcat 坐标转换为正向参考坐标
-    let pos = if chain.is_ref_forward() {
-        hit.loc + 1 // 正向链：直接转换为 1-based
-    } else {
-        // 反向链：hit.loc 是 crefcat 上的相对位置（不包括 REF_MARGIN）
-        // 转换为正向参考坐标：chr_len - hit.loc - read_len + 1
-        let chr_len = get_chromosome_length(hit.chr, coll);
-        chr_len - hit.loc - read.seq.len() as u32 + 1
-    };
+    // hit.loc 已统一为正向坐标（对应 C++ int2hit 行为）
+    let pos = hit.loc + 1;
 
     AlignmentRecord {
         read_name: read.name.clone(),
@@ -351,11 +344,6 @@ fn calculate_flag(chain: Chain, is_unique: bool, total_hits: usize) -> u16 {
     // 0x100: 二次比对
     if !is_unique && total_hits > 1 {
         flag |= 0x100;
-    }
-
-    // 0x800: 补充比对
-    if total_hits > 1 {
-        flag |= 0x800;
     }
 
     flag
@@ -601,23 +589,27 @@ mod tests {
     fn test_calculate_flag() {
         let chain_pp = Chain::PlusPlus;
         let chain_pm = Chain::PlusMinus;
+        let chain_mp = Chain::MinusPlus;
+        let chain_mm = Chain::MinusMinus;
 
+        // 正向参考链（++ 和 +-）：无 0x10
         assert_eq!(calculate_flag(chain_pp, true, 1), 0);
-        assert_eq!(calculate_flag(chain_pm, true, 1), 0x10);
+        assert_eq!(calculate_flag(chain_pm, true, 1), 0);
+        // 反向参考链（-+ 和 --）：设 0x10
+        assert_eq!(calculate_flag(chain_mp, true, 1), 0x10);
+        assert_eq!(calculate_flag(chain_mm, true, 1), 0x10);
+        // 非唯一比对：设 0x100
         assert!(calculate_flag(chain_pp, false, 2) & 0x100 != 0);
-        assert!(calculate_flag(chain_pp, true, 2) & 0x800 != 0);
+        // 非唯一比对不应设 0x800
+        assert_eq!(calculate_flag(chain_pp, true, 2) & 0x800, 0);
     }
 
     #[test]
     fn test_calculate_mapq() {
-        // 唯一比对，0 mismatch
-        assert_eq!(calculate_mapq(0, true, 1), 40);
-
-        // 唯一比对，1 mismatch
-        assert_eq!(calculate_mapq(1, true, 1), 37);
-
-        // 多重比对
-        assert_eq!(calculate_mapq(0, false, 2), 0);
+        // 与 C++ BSMAP 一致：MAPQ 固定输出 255
+        assert_eq!(calculate_mapq(0, true, 1), 255);
+        assert_eq!(calculate_mapq(1, true, 1), 255);
+        assert_eq!(calculate_mapq(0, false, 2), 255);
     }
 
     #[test]

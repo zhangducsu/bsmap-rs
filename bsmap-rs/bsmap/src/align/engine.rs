@@ -17,7 +17,9 @@
 //! - 最后合并两条链的 hits
 //! - Rust 版本已重构为与 C++ 一致的逐链独立架构
 
-use crate::align::extend::{add_hits, clear_hits, count_unique_hits, is_unique_hit, select_best_hits, snp_align_for_chain};
+use std::collections::HashSet;
+
+use crate::align::extend::{add_hits, clear_hits, dedup_hits, is_unique_hit, select_best_hits, snp_align_segment, ExtHit};
 use crate::align::seed::{extract_seeds, reorder_seeds_for_chain};
 use crate::param::{AlignConfig, GHit, MAXSNPS};
 use crate::reads::encode::EncodedRead;
@@ -67,6 +69,12 @@ pub struct SingleAlign {
     pub n_unique: u32,
     /// 多重比对读段数。
     pub n_multiple: u32,
+    /// C++ hitset: 非 gap 命中去重集 (key: (chr>>1, loc))
+    dedup_no_gap: HashSet<(u32, u32)>,
+    /// C++ ghitset: gap 命中去重集 (key: (chr>>1, loc))
+    dedup_gap: HashSet<(u32, u32)>,
+    /// C++ 分层命中计数（用于动态 snp_thres 降低，跨链累计）
+    level_counts: Vec<usize>,
 }
 
 impl SingleAlign {
@@ -82,14 +90,20 @@ impl SingleAlign {
             n_aligned: 0,
             n_unique: 0,
             n_multiple: 0,
+            dedup_no_gap: HashSet::new(),
+            dedup_gap: HashSet::new(),
+            level_counts: vec![0; MAXSNPS as usize + 1],
         }
     }
 
-    /// 清空命中集合。
+    /// 清空命中集合（含去重集和分层计数）。
     ///
     /// 对应 C++ `ClearHits()` 函数。在比对新读段前调用。
     pub fn clear(&mut self) {
         clear_hits(&mut self.hits);
+        self.dedup_no_gap.clear();
+        self.dedup_gap.clear();
+        self.level_counts.fill(0);
     }
 
     /// 运行比对（逐链独立架构）。
@@ -126,6 +140,12 @@ impl SingleAlign {
             return false;
         }
 
+        // C++ xflag_chain: 控制处理哪些链
+        //   xflag_chain[0] = chains || (read_set < 2)   → 单端总是 true
+        //   xflag_chain[1] = chains || (read_set == 2)  → 单端非 chains 模式为 false
+        let xflag_chain0 = config.chains || encoded.info.read_set < 2;
+        let xflag_chain1 = config.chains || encoded.info.read_set == 2;
+
         // 提取种子（两条链）
         let seeds = extract_seeds(
             encoded,
@@ -134,71 +154,169 @@ impl SingleAlign {
             &config.profile,
         );
 
-        // 计算最大允许的 mismatch 数
-        let max_snp = if config.max_snp_num >= 100 {
+        // 计算最大允许的 mismatch 数（C++ 动态阈值：在处理过程中会被降低）
+        let mut max_snp = if config.max_snp_num >= 100 {
             // 百分比模式：(val - 100)% of read length
             ((config.max_snp_num - 100) as f64 / 100.0 * read_len as f64) as u32
         } else {
             config.max_snp_num
         };
 
-        // 对每条链独立进行比对（C++ 逐链独立架构）
-        for read_chain in 0..2u8 {
-            // 检查该链是否有种子
-            if read_chain as usize >= seeds.len() || seeds[read_chain as usize].is_empty() {
-                continue;
+        // 预计算两条链的 segments（C++ 逐 segment 处理架构）
+        // 仅对启用的链（xflag_chain）进行重排序
+        let chain0_segments: Option<Vec<_>> =
+            if !xflag_chain0 || seeds.get(0).map_or(true, |s| s.is_empty()) {
+                None
+            } else {
+                Some(reorder_seeds_for_chain(
+                    &seeds[0],
+                    index,
+                    config.seed_size,
+                    config.index_interval,
+                    &config.profile,
+                    read_len,
+                    config.rrbs_flag,
+                ))
+            };
+        let chain1_segments: Option<Vec<_>> =
+            if !xflag_chain1 || seeds.get(1).map_or(true, |s| s.is_empty()) {
+                None
+            } else {
+                Some(reorder_seeds_for_chain(
+                    &seeds[1],
+                    index,
+                    config.seed_size,
+                    config.index_interval,
+                    &config.profile,
+                    read_len,
+                    config.rrbs_flag,
+                ))
+            };
+
+        let num_segments = chain0_segments.as_ref().map_or(0, |s| s.len())
+            .max(chain1_segments.as_ref().map_or(0, |s| s.len()));
+
+        // C++: max_snp is per-chain — each chain independently lowers its own threshold
+        let mut chain0_max_snp = max_snp;
+        let mut chain1_max_snp = max_snp;
+
+        // C++ 逐 segment 处理：segment → chain，找到命中即早停
+        for seg_idx in 0..num_segments {
+            // Per-segment level counts (match C++ cur_n_hit / cur_n_chit)
+            // Reset each segment like C++ memset(cur_n_hit, 0, ...)
+            let mut seg_n_hit = [0usize; MAXSNPS as usize + 1];
+            let mut seg_n_chit = [0usize; MAXSNPS as usize + 1];
+
+            for read_chain in 0..2u8 {
+                // C++ xflag_chain 过滤
+                if !match read_chain {
+                    0 => xflag_chain0,
+                    1 => xflag_chain1,
+                    _ => false,
+                } {
+                    continue;
+                }
+                let chain_segs = match read_chain {
+                    0 => chain0_segments.as_ref(),
+                    1 => chain1_segments.as_ref(),
+                    _ => unreachable!(),
+                };
+                if chain_segs.map_or(true, |s| seg_idx >= s.len()) {
+                    continue;
+                }
+                let segment = &chain_segs.unwrap()[seg_idx];
+
+                let query = if read_chain == 0 {
+                    encoded.fwd_words.as_slice()
+                } else {
+                    encoded.rev_words.as_slice()
+                };
+                let mask = if read_chain == 0 {
+                    encoded.fwd_mask.as_slice()
+                } else {
+                    encoded.rev_mask.as_slice()
+                };
+                let n_count = crate::align::extend::count_n_in_mask(mask, read_len);
+
+                let mut seg_hits: Vec<ExtHit> = Vec::new();
+                let cur_counts = if read_chain == 0 {
+                    &mut seg_n_hit
+                } else {
+                    &mut seg_n_chit
+                };
+                let cur_max_snp = if read_chain == 0 {
+                    &mut chain0_max_snp
+                } else {
+                    &mut chain1_max_snp
+                };
+                let _early_stop = snp_align_segment(
+                    encoded,
+                    index,
+                    coll,
+                    segment,
+                    read_chain,
+                    cur_max_snp,
+                    config.gap,
+                    config.nt3,
+                    config.max_num_hits as usize,
+                    cur_counts,
+                    query,
+                    mask,
+                    n_count,
+                    &mut seg_hits,
+                );
+
+                // 去重并转换为 GHit
+                dedup_hits(&mut seg_hits);
+                let chain_hits: Vec<_> = seg_hits.into_iter().map(|h| h.to_ghit()).collect();
+
+                add_hits(
+                    chain_hits,
+                    &mut self.hits,
+                    config.max_num_hits as usize,
+                    &mut self.dedup_no_gap,
+                    &mut self.dedup_gap,
+                );
+                // Note: we deliberately do NOT break the chain loop here.
+                // C++ processes both chains per segment before checking early stop.
             }
 
-            let chain_seeds = &seeds[read_chain as usize];
+            // C++ 早停：逐段检查，只检查当前段的命中（不是全局累计）
+            // 对应 C++: for(ii=0;ii<=i;ii++) if(cur_n_hit[ii]||cur_n_chit[ii]) return 1;
+            if !config.nt3 {
+                let check_levels = (seg_idx + 1).min(MAXSNPS as usize + 1);
+                let has_hits = (0..check_levels).any(|ii| seg_n_hit[ii] > 0 || seg_n_chit[ii] > 0);
+                if has_hits {
+                    break;
+                }
+            }
 
-            // 重排序种子（逐链独立）
-            let segments = reorder_seeds_for_chain(
-                chain_seeds,
-                index,
-                config.seed_size,
-                config.index_interval,
-                &config.profile,
-                read_len,
-                config.rrbs_flag,
-            );
-
-            // 执行种子扩展比对（逐链独立）
-            let chain_hits = snp_align_for_chain(
-                encoded,
-                index,
-                coll,
-                &segments,
-                read_chain,
-                max_snp,
-                config.gap,
-                config.nt3,
-                config.rrbs_flag,
-            );
-
-            // 添加命中到总列表
-            let should_stop = add_hits(
-                chain_hits,
-                &mut self.hits,
-                config.max_num_hits as usize,
-            );
-
-            if should_stop {
+            // 如果总命中数已达上限，也停止
+            let total_hits: usize = self.hits.iter().map(|l| l.len()).sum();
+            if total_hits >= config.max_num_hits as usize {
                 break;
             }
         }
 
-        // 更新统计
-        let total_hits = count_unique_hits(&self.hits);
-        if total_hits > 0 {
+        // 更新统计（对应 C++ StringAlign: 找最佳层，统计命中数）
+        let mut best_count = 0usize;
+        for level in &self.hits {
+            if !level.is_empty() {
+                best_count = level.len();
+                break;
+            }
+        }
+
+        if best_count > 0 {
             self.n_aligned += 1;
-            if is_unique_hit(&self.hits) {
+            if best_count == 1 {
                 self.n_unique += 1;
             } else {
                 self.n_multiple += 1;
             }
         }
 
-        total_hits > 0
+        best_count > 0
     }
 
     /// 过滤读段。
@@ -299,9 +417,14 @@ impl SingleAlign {
         results
     }
 
-    /// 获取当前命中数。
+    /// 获取最佳层命中数（对应 C++：第一个非空层的命中数）。
     pub fn hit_count(&self) -> usize {
-        count_unique_hits(&self.hits)
+        for level in &self.hits {
+            if !level.is_empty() {
+                return level.len();
+            }
+        }
+        0
     }
 
     /// 获取最佳命中。

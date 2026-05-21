@@ -1,0 +1,8 @@
+=== Ex2_PE_p4 三路对比 ===
+C++ (P7基线):  0
+N/A 行
+P7 Rust:       66957 行 (diff vs C++: 66958)
+P8 Rust:       66957 行 (diff vs C++: 66958)
+
+P7→P8 改善: diff 0 行
+

@@ -108,7 +108,12 @@ impl KmerIndex {
             .collect();
 
         let mut sorted_counts = total_counts.clone();
-        sorted_counts.sort_unstable();
+        // Match C++: sort(kmer_count, kmer_count + total_kmers - 1)
+        // C++ sorts only N-1 elements, leaving the last unsorted
+        let n = sorted_counts.len();
+        if n > 1 {
+            sorted_counts[..n - 1].sort_unstable();
+        }
 
         let cutoff_idx = ((total_kmers as f64) * (1.0 - max_kmer_ratio)) as usize;
         let max_kmer_num = if cutoff_idx > 0 {
@@ -121,19 +126,21 @@ impl KmerIndex {
         let mut index2: Vec<KmerLoc2> = Vec::with_capacity(total_kmers as usize);
         let mut total_positions: u32 = 0;
 
+        // C++ filters by n[0] which is the TOTAL count across both chains.
+        // Using fwd-only would exclude k-mers that only appear on the Crick strand (fwd=0, rev>0).
         for i in 0..total_kmers as usize {
-            let total = total_counts[i];
+            let fwd = fwd_counts[i];
+            let rev = rev_counts[i];
+            let total = fwd + rev;
             if total > 0 && total <= max_kmer_num {
                 // n[1] = forward count, n[0] = reverse count (C++ KmerLoc2 semantics)
                 index2.push(KmerLoc2 {
-                    n: [rev_counts[i], fwd_counts[i]],
-                    loc1: Vec::new(),
+                    n: [rev, fwd],
                 });
-                total_positions += total;
+                total_positions += fwd + rev;
             } else {
                 index2.push(KmerLoc2 {
                     n: [0, 0],
-                    loc1: Vec::new(),
                 });
             }
         }
@@ -150,11 +157,13 @@ impl KmerIndex {
         {
             let mut running_offset: u32 = 0;
             for i in 0..total_kmers as usize {
-                let total = total_counts[i];
+                let fwd = fwd_counts[i];
+                let rev = rev_counts[i];
+                let total = fwd + rev;
                 if total > 0 && total <= max_kmer_num {
                     fwd_write_offsets[i] = running_offset;
-                    rev_write_offsets[i] = running_offset + fwd_counts[i];
-                    running_offset += fwd_counts[i] + rev_counts[i];
+                    rev_write_offsets[i] = running_offset + fwd;
+                    running_offset += total;
                 }
                 // For filtered-out k-mers, offsets remain 0 (unused)
             }
@@ -192,6 +201,8 @@ impl KmerIndex {
             &total_counts,
             max_kmer_num,
         );
+
+        // Verify critical index entries for known test reads
 
         Self {
             total_kmers,
@@ -459,7 +470,7 @@ fn count_frequencies_separated(
 ///
 /// `chain` is 0 (forward/refcat) or 1 (reverse/crefcat).
 /// `write_offsets` is the per-hash write offset for this chain.
-/// `total_counts` and `max_kmer_num` are used to skip over-represented k-mers.
+/// `total_counts` and `max_kmer_num` are used to skip over-represented k-mers (by total count, matching C++).
 fn fill_positions_chain(
     words: &[u64],
     blocks: &[Block],

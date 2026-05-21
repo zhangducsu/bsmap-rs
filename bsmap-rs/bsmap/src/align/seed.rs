@@ -141,11 +141,11 @@ pub fn find_best_start_offset(
     seed_size: u32,
     index_interval: u32,
 ) -> u32 {
-    let mut best_offset = 0u32;
-    let mut min_candidates = u32::MAX;
-
     // C++ 搜索范围：0 到 (map_readlen - index_interval + 1) % seed_size - 1
     let num_offsets = ((map_readlen - index_interval + 1) % seed_size).max(1).min(index_interval);
+
+    let mut best_offset = 0u32;
+    let mut best_candidates = u32::MAX;
 
     for start_offset in 0..num_offsets {
         let mut total_candidates: u32 = 0;
@@ -155,16 +155,16 @@ pub fn find_best_start_offset(
 
         while pos + seed_size <= map_readlen && seed_idx < chain_seeds.len() {
             let seed_hash = chain_seeds[seed_idx];
+            // Match C++: CountSeeds uses ref.index2[s].n[0] which in C++ is total of both chains
             let (fwd, rev) = index.lookup_separated(seed_hash);
-            total_candidates += fwd.len() as u32 + rev.len() as u32;
+            total_candidates += (fwd.len() + rev.len()) as u32;
 
             pos += index_interval;
             seed_idx += index_interval as usize;
         }
 
-        // C++ 选择候选数最少的偏移
-        if total_candidates < min_candidates {
-            min_candidates = total_candidates;
+        if total_candidates > 0 && total_candidates < best_candidates {
+            best_candidates = total_candidates;
             best_offset = start_offset;
         }
     }
@@ -224,13 +224,9 @@ pub fn reorder_seeds_for_chain(
             }
         }
 
-        let seg_start = if !seg_positions.is_empty() {
-            seg_positions[0]
-        } else {
-            0
-        };
-
-        let mut segment = SeedSegment::new(seg_idx, seg_start, seg_seeds, seg_masks, seg_positions);
+        // Match C++: xseed_start_array[chain][i] = xseed_start_offset[chain]
+        // Each segment's start is the small offset, not the first seed position
+        let mut segment = SeedSegment::new(seg_idx, best_start_offset, seg_seeds, seg_masks, seg_positions);
 
         // 统计该 segment 的候选数
         segment.candidates = count_seeds_for_chain(&segment.seeds, &segment.reg_masks, index, is_rrbs);
@@ -239,7 +235,7 @@ pub fn reorder_seeds_for_chain(
     }
 
     // 4. 调整每个 segment 的起始位置（AdjustSeedStartArray）
-    adjust_seed_starts_for_chain(&mut segments, index, seed_size, index_interval, map_readlen);
+    adjust_seed_starts_for_chain(&mut segments, index, seed_size, index_interval, map_readlen, chain_seeds, profile);
 
     // 5. 按候选数升序排序
     segments.sort_by_key(|s| s.candidates);
@@ -286,6 +282,8 @@ fn adjust_seed_starts_for_chain(
     seed_size: u32,
     index_interval: u32,
     map_readlen: u32,
+    chain_seeds: &[u32],
+    profile: &[[u32; 16]],
 ) {
     if segments.is_empty() {
         return;
@@ -324,7 +322,7 @@ fn adjust_seed_starts_for_chain(
 
         // 在 [start_bound, end_bound] 范围内找使该 segment 候选数最小的 start
         for start in start_bound..=end_bound {
-            let candidates = count_seeds_at_offset(&segments[ptr], index, start, seed_size, index_interval, map_readlen);
+            let candidates = count_seeds_at_offset(ptr, start, chain_seeds, index, seed_size, index_interval, map_readlen, profile);
             if candidates < min_candidates {
                 min_candidates = candidates;
                 best_start = start;
@@ -334,26 +332,79 @@ fn adjust_seed_starts_for_chain(
         start_array[ptr] = best_start;
     }
 
-    // 应用调整后的起始位置
+    // 应用调整后的起始位置并重新提取种子
     for (i, segment) in segments.iter_mut().enumerate() {
-        segment.start_offset = start_array[i];
+        let new_start = start_array[i];
+        if new_start == segment.start_offset {
+            continue;
+        }
+        segment.start_offset = new_start;
+
+        // Re-extract seeds at the new start offset
+        segment.seeds.clear();
+        segment.reg_masks.clear();
+        segment.seed_positions.clear();
+
+        for ii in 0..index_interval as usize {
+            let profile_val = if i < profile.len() && ii < profile[i].len() {
+                profile[i][ii]
+            } else {
+                continue;
+            };
+
+            let seed_pos = (profile_val + new_start).saturating_sub(ii as u32);
+
+            if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
+                segment.seeds.push(chain_seeds[seed_pos as usize]);
+                segment.reg_masks.push(1);
+                segment.seed_positions.push(seed_pos);
+            }
+        }
+
+        // Update candidate count
+        segment.candidates = count_seeds_at_offset(i, new_start, chain_seeds, index, seed_size, index_interval, map_readlen, profile);
     }
 }
 
 /// 统计某个 segment 在指定起始偏移下的候选数。
+///
+/// 根据新的 start_offset 和 profile 重新选择种子位置，计算候选数。
 fn count_seeds_at_offset(
-    segment: &SeedSegment,
-    index: &KmerIndex,
+    seg_idx: usize,
     start_offset: u32,
+    chain_seeds: &[u32],
+    index: &KmerIndex,
     seed_size: u32,
     index_interval: u32,
     map_readlen: u32,
+    profile: &[[u32; 16]],
 ) -> u32 {
-    // 这里简化处理：使用 segment 已有的种子，但按新的 offset 重新计算
-    // 实际应该根据 profile 和新的 offset 重新选择种子
-    // 为简化，暂时返回 segment 当前的候选数
-    let _ = (start_offset, seed_size, index_interval, map_readlen);
-    segment.candidates
+    let mut total: u32 = 0;
+
+    for ii in 0..index_interval as usize {
+        let profile_val = if seg_idx < profile.len() && ii < profile[seg_idx].len() {
+            profile[seg_idx][ii]
+        } else {
+            continue;
+        };
+
+        let seed_pos = (profile_val + start_offset).saturating_sub(ii as u32);
+
+        if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
+            let seed_hash = chain_seeds[seed_pos as usize];
+            // Match C++: CountSeeds uses ref.index2[s].n[0] which in C++ is total of both chains
+            let (fwd, rev) = index.lookup_separated(seed_hash);
+            total += (fwd.len() + rev.len()) as u32;
+        }
+    }
+
+    // Match C++: if(total==0) total=9999999
+    // Without this, 0 candidates beats positive candidates, causing wrong pick
+    if total == 0 {
+        u32::MAX
+    } else {
+        total
+    }
 }
 
 /// 统计某个 segment 的总候选数（逐链独立）。
@@ -372,12 +423,13 @@ pub fn count_seeds_for_chain(seeds: &[u32], reg_masks: &[u32], index: &KmerIndex
             }
         }
     } else {
+        // Match C++: CountSeeds uses ref.index2[s].n[0] which in C++ is total of both chains
         for (i, &seed) in seeds.iter().enumerate() {
             if i < reg_masks.len() && reg_masks[i] == 0 {
                 continue;
             }
             let (fwd, rev) = index.lookup_separated(seed);
-            total += fwd.len() as u32 + rev.len() as u32;
+            total += (fwd.len() + rev.len()) as u32;
         }
     }
 
