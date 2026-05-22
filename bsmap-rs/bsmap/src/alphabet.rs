@@ -97,13 +97,13 @@ pub static REV_CHAR: [u8; 256] = {
 };
 
 /// Nucleotide codes in display order: A, C, G, T
-pub const NT_CODE: [u8; 4] = [b'A', b'C', b'G', b'T'];
+pub static NT_CODE: [u8; 4] = [b'A', b'C', b'G', b'T'];
 
 /// Reverse-complement nucleotide codes
-pub const REVNT_CODE: [u8; 4] = [b'T', b'G', b'C', b'A'];
+pub static REVNT_CODE: [u8; 4] = [b'T', b'G', b'C', b'A'];
 
 /// Chain (strand) flags
-pub const CHAIN_FLAG: [u8; 2] = [b'+', b'-'];
+pub static CHAIN_FLAG: [u8; 2] = [b'+', b'-'];
 
 // ── 3-Letter Seed Hashing (XT / XT64) ───────────────────────────────────────
 //

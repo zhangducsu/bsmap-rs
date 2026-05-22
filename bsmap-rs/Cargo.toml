@@ -29,8 +29,6 @@ indicatif = "0.17"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 memmap2 = "0.9"
-rustc-hash = "2"
-mimalloc = { version = "0.1", default-features = false }
 
 [workspace.dev-dependencies]
 criterion = "0.5"

@@ -488,7 +488,6 @@ mod tests {
             fwd_mask,
             rev_mask,
             info: read,
-            n_count: 0,
         }
     }
 

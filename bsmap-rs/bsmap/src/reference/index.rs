@@ -107,19 +107,17 @@ impl KmerIndex {
             .map(|(&f, &r)| f + r)
             .collect();
 
+        let mut sorted_counts = total_counts.clone();
         // Match C++: sort(kmer_count, kmer_count + total_kmers - 1)
-        // C++ sorts only N-1 elements, leaving the last unsorted.
-        // Use select_nth_unstable O(n) instead of clone+sort O(n log n),
-        // saving ~172 MB temporary allocation (43M × 4 bytes) at seed_size=16.
+        // C++ sorts only N-1 elements, leaving the last unsorted
+        let n = sorted_counts.len();
+        if n > 1 {
+            sorted_counts[..n - 1].sort_unstable();
+        }
+
         let cutoff_idx = ((total_kmers as f64) * (1.0 - max_kmer_ratio)) as usize;
         let max_kmer_num = if cutoff_idx > 0 {
-            let nth_idx = cutoff_idx.saturating_sub(1);
-            // Only sort elements before the nth to match C++ partial-sort behavior
-            let n = total_counts.len();
-            if n > 1 {
-                total_counts[..n - 1].select_nth_unstable(nth_idx.min(n - 2));
-            }
-            total_counts[nth_idx.min(n.saturating_sub(1))]
+            sorted_counts[cutoff_idx.saturating_sub(1)]
         } else {
             u32::MAX
         };

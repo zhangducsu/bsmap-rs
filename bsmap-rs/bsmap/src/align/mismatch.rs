@@ -79,10 +79,8 @@ pub fn count_mismatch(
             let mut diff = q_word ^ ref_word;
 
             // 应用 C→T 容忍掩码
-            // WGBS 中 C↔T 不算 mismatch（亚硫酸氢盐转换），nt3 模式不应用
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            // WGBS 中 C↔T 不算 mismatch（亚硫酸氢盐转换）
+            diff &= xc64(ref_word);
 
             // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
             diff &= m_word;
@@ -118,9 +116,7 @@ pub fn count_mismatch(
             let mut diff = q_word ^ ref_word;
 
             // 应用 C→T 容忍掩码
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            diff &= xc64(ref_word);
 
             // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
             diff &= m_word;
@@ -186,10 +182,8 @@ pub fn mismatch_pattern_0(
             // 计算差异
             let mut diff = q_word ^ ref_word;
 
-            // 应用 C→T 容忍掩码，nt3 模式不应用
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            // 应用 C→T 容忍掩码
+            diff &= xc64(ref_word);
 
             // 提取有效碱基对应的位（每 2-bit 一个碱基）
             // 将 diff 转换为每个碱基的 mismatch 指示
@@ -230,10 +224,8 @@ pub fn mismatch_pattern_0(
             // 计算差异
             let mut diff = q_word ^ ref_word;
 
-            // 应用 C→T 容忍掩码，nt3 模式不应用
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            // 应用 C→T 容忍掩码
+            diff &= xc64(ref_word);
 
             let bases_in_word = ((map_readlen - bases_processed).min(SEGLEN as u32)) as usize;
 
@@ -422,9 +414,7 @@ unsafe fn count_mismatch_avx2(
 
                 // 应用 C→T 容忍掩码
                 let ref_word = ref_seq[word_offset + i + j];
-                if !nt3 {
-                    diff &= xc64(ref_word);
-                }
+                diff &= xc64(ref_word);
 
                 total_mismatches += xm64(diff);
 
@@ -442,9 +432,7 @@ unsafe fn count_mismatch_avx2(
 
             let mut diff = q_word ^ ref_word;
 
-            if !nt3 {
-                diff &= xc64(ref_word);
-            }
+            diff &= xc64(ref_word);
 
             diff &= m_word;
             total_mismatches += xm64(diff);

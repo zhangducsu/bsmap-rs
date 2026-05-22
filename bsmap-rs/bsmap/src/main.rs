@@ -13,9 +13,6 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering;
-
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -510,6 +507,9 @@ fn run_single_align(
             .template("{elapsed} {wide_bar} {pos} reads ({per_sec})")?,
     );
 
+    // 创建比对引擎
+    let mut aligner = SingleAlign::new();
+
     // 批量处理
     let mut batch_raw = Vec::with_capacity(BATCH_SIZE);
     let mut read_start = config.read_start;
@@ -531,7 +531,7 @@ fn run_single_align(
         let encoded: Vec<EncodedRead> = reads.iter().map(|r| encode_read(r)).collect();
 
         // 执行比对
-        let results = SingleAlign::do_batch(&encoded, index, coll, config);
+        let results = aligner.do_batch(&encoded, index, coll, config);
 
         // 输出结果
         for result in &results {
@@ -709,7 +709,7 @@ fn run_paired_align(
 
 /// 输出单端比对结果。
 ///
-/// 根据配置输出 SAM 或 BSP 格式。BAM 输出直接构造 RecordBuf 跳过字符串解析。
+/// 根据配置输出 SAM 或 BSP 格式。
 fn output_alignment(
     output: &mut OutputWriter,
     read: &ReadInf,
@@ -717,11 +717,7 @@ fn output_alignment(
     coll: &BinSeqCollection,
     config: &AlignConfig,
 ) -> Result<()> {
-    use bsmap::align::output::build_bam_record_se;
-
     let total_hits = result.hits.len();
-    let is_bam = matches!(output, OutputWriter::BamFile { .. });
-    let mut buf = String::with_capacity(256);
 
     for (i, hit) in result.hits.iter().enumerate() {
         // 根据 report_repeat_hits 决定输出策略
@@ -734,18 +730,12 @@ fn output_alignment(
             break;
         }
 
-        if is_bam && config.out_sam != 0 {
-            // BAM 快速路径：直接构造 RecordBuf
-            let record = build_bam_record_se(read, hit, result.is_unique, total_hits);
-            write_bam_record(output, &record)?;
-        } else {
-            // SAM 文本路径（stdout/SAM 文件/BSP 格式）
-            match config.out_sam {
-                0 => format_bsp(&mut buf, read, hit, coll, config, if result.is_unique { "UM" } else { "MA" }),
-                _ => format_sam(&mut buf, read, hit, coll, config, result.is_unique, total_hits),
-            };
-            write_output_line(output, &buf)?;
-        }
+        let line = match config.out_sam {
+            0 => format_bsp(read, hit, coll, config, if result.is_unique { "UM" } else { "MA" }),
+            _ => format_sam(read, hit, coll, config, result.is_unique, total_hits),
+        };
+
+        write_output_line(output, &line)?;
     }
 
     Ok(())
@@ -763,8 +753,6 @@ fn output_pair_alignment(
     config: &AlignConfig,
 ) -> Result<()> {
     let total_hits = result.pair_hits.len();
-    let mut buf_a = String::with_capacity(256);
-    let mut buf_b = String::with_capacity(256);
 
     for (i, pair_hit) in result.pair_hits.iter().enumerate() {
         // 根据 report_repeat_hits 决定输出策略
@@ -775,24 +763,25 @@ fn output_pair_alignment(
             break;
         }
 
-        match config.out_sam {
+        let (line_a, line_b) = match config.out_sam {
             0 => {
                 // BSP 格式
                 let hit_type = if result.is_unique { "UM" } else { "MA" };
-                format_bsp(&mut buf_a, read_a, &pair_hit.a, coll, config, hit_type);
-                format_bsp(&mut buf_b, read_b, &pair_hit.b, coll, config, hit_type);
+                (
+                    format_bsp(read_a, &pair_hit.a, coll, config, hit_type),
+                    format_bsp(read_b, &pair_hit.b, coll, config, hit_type),
+                )
             }
             _ => {
                 // SAM 格式
                 format_pair_sam(
-                    &mut buf_a, &mut buf_b,
                     read_a, read_b, pair_hit, coll, config, result.is_unique, total_hits,
-                );
+                )
             }
         };
 
-        write_output_line(output, &buf_a)?;
-        write_output_line(output, &buf_b)?;
+        write_output_line(output, &line_a)?;
+        write_output_line(output, &line_b)?;
     }
 
     Ok(())
@@ -805,22 +794,14 @@ fn output_unmapped(
     config: &AlignConfig,
 ) -> Result<()> {
     use bsmap::align::OutputFormat;
-    use bsmap::align::output::build_bam_record_unmapped;
 
-    let is_bam_sam = matches!(output, OutputWriter::BamFile { .. }) && config.out_sam != 0;
+    let format = match config.out_sam {
+        0 => OutputFormat::Bsp,
+        _ => OutputFormat::Sam,
+    };
 
-    if is_bam_sam {
-        let record = build_bam_record_unmapped(read);
-        write_bam_record(output, &record)?;
-    } else {
-        let format = match config.out_sam {
-            0 => OutputFormat::Bsp,
-            _ => OutputFormat::Sam,
-        };
-        let mut buf = String::with_capacity(256);
-        bsmap::align::output::format_unmapped(&mut buf, read, format);
-        write_output_line(output, &buf)?;
-    }
+    let line = bsmap::align::output::format_unmapped(read, format);
+    write_output_line(output, &line)?;
 
     Ok(())
 }
@@ -842,15 +823,12 @@ fn output_unpaired(
     let has_hit_a = !result.unpair_hits_a.is_empty();
     let has_hit_b = !result.unpair_hits_b.is_empty();
 
-    let mut buf = String::with_capacity(256);
-
     // read_a 有 hit → 输出
     if has_hit_a {
-        if config.out_sam == 0 {
-            format_bsp(&mut buf, read_a, &result.unpair_hits_a[0], coll, config, "MA");
+        let line = if config.out_sam == 0 {
+            format_bsp(read_a, &result.unpair_hits_a[0], coll, config, "MA")
         } else {
             format_unpair_sam_single(
-                &mut buf,
                 read_a,
                 &result.unpair_hits_a[0],
                 result.unpair_hits_a.len(),
@@ -859,18 +837,17 @@ fn output_unpaired(
                 true, // is_first
                 coll,
                 config,
-            );
+            )
         };
-        write_output_line(output, &buf)?;
+        write_output_line(output, &line)?;
     }
 
     // read_b 有 hit → 输出
     if has_hit_b {
-        if config.out_sam == 0 {
-            format_bsp(&mut buf, read_b, &result.unpair_hits_b[0], coll, config, "MA");
+        let line = if config.out_sam == 0 {
+            format_bsp(read_b, &result.unpair_hits_b[0], coll, config, "MA")
         } else {
             format_unpair_sam_single(
-                &mut buf,
                 read_b,
                 &result.unpair_hits_b[0],
                 result.unpair_hits_b.len(),
@@ -879,9 +856,9 @@ fn output_unpaired(
                 false, // is_second
                 coll,
                 config,
-            );
+            )
         };
-        write_output_line(output, &buf)?;
+        write_output_line(output, &line)?;
     }
 
     Ok(())
@@ -895,7 +872,6 @@ fn output_unpaired(
 /// - 设置 0x8 (mate unmapped) 当 mate 无 hit
 /// - 当 mate 无 hit 时 RNEXT=*, PNEXT=0
 fn format_unpair_sam_single(
-    buf: &mut String,
     read: &ReadInf,
     hit: &bsmap::param::GHit,
     total_hits: usize,
@@ -903,10 +879,9 @@ fn format_unpair_sam_single(
     mate_hit: Option<&bsmap::param::GHit>,
     is_first: bool,
     coll: &bsmap::reference::binseq::BinSeqCollection,
-    _config: &bsmap::param::AlignConfig,
-) {
-    use std::fmt::Write;
-    use bsmap::align::output::{get_chromosome_length, make_zs_tag, select_output_seq, write_cigar};
+    config: &bsmap::param::AlignConfig,
+) -> String {
+    use bsmap::align::output::{get_chromosome_length, make_cigar, make_zs_tag, select_output_seq};
 
     let ref_chain = hit.strand >> 1;
     let read_chain = hit.strand & 1;
@@ -923,6 +898,7 @@ fn format_unpair_sam_single(
     }
 
     // 0x10: reverse strand
+    // 与 C++ s_OutHitUnpair 一致: rev_seq = chain_a ^ (ha.chr % 2) = read_chain ^ ref_chain
     if (read_chain ^ ref_chain) == 1 {
         flag |= 0x10;
     }
@@ -931,6 +907,10 @@ fn format_unpair_sam_single(
     if total_hits > 1 {
         flag |= 0x100;
     }
+
+    let mapq: u8 = 255;
+    let cigar = make_cigar(read.seq.len() as u32, hit.gap_size as i8, hit.gap_pos as u8);
+    let (seq, qual) = select_output_seq(read, flag & 0x10 != 0);
 
     // POS: 反向参考链坐标转换
     let pos = if ref_chain == 0 {
@@ -941,18 +921,22 @@ fn format_unpair_sam_single(
     };
 
     // RNEXT/PNEXT: mate 信息
-    let rnext = if mate_has_hit && mate_hit.is_some() { "=" } else { "*" };
-    let pnext = if mate_has_hit {
+    let (rnext, pnext) = if mate_has_hit {
         if let Some(mh) = mate_hit {
             let mate_ref_chain = mh.strand >> 1;
-            if mate_ref_chain == 0 {
+            let mate_pos = if mate_ref_chain == 0 {
                 mh.loc + 1
             } else {
                 let mate_chr_len = get_chromosome_length(mh.chr, coll);
                 mate_chr_len - mh.loc - read.seq.len() as u32 + 1
-            }
-        } else { 0 }
-    } else { 0 };
+            };
+            ("=".to_string(), mate_pos)
+        } else {
+            ("*".to_string(), 0)
+        }
+    } else {
+        ("*".to_string(), 0)
+    };
 
     // ZS tag
     let zs = make_zs_tag(
@@ -962,14 +946,14 @@ fn format_unpair_sam_single(
 
     // QNAME: 去除后缀
     let qname = strip_r_suffix_for_unpair(&read.name);
-    let ref_name = bsmap::align::output::get_reference_name(hit.chr, coll);
-    let (seq, qual) = select_output_seq(read, flag & 0x10 != 0);
 
-    buf.clear();
-    let _ = write!(buf, "{}\t{}\t{}\t{}\t255\t", qname, flag, ref_name, pos);
-    write_cigar(buf, read.seq.len() as u32, hit.gap_size as i8, hit.gap_pos as u8);
-    let _ = write!(buf, "\t{}\t{}\t0\t{}\t{}\tNM:i:{}\tZS:Z:{}",
-        rnext, pnext, seq, qual, hit.snps, zs);
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t0\t{}\t{}\tNM:i:{}\tZS:Z:{}",
+        qname, flag,
+        bsmap::align::output::get_reference_name(hit.chr, coll),
+        pos, mapq, cigar, rnext, pnext, seq, qual,
+        hit.snps, zs,
+    )
 }
 
 /// 去除 QNAME 的 read 编号后缀。
@@ -984,7 +968,7 @@ fn strip_r_suffix_for_unpair(name: &str) -> &str {
     }
 }
 
-/// 写入一行输出（SAM/BSP 文本格式，或 BAM 回退解析路径）。
+/// 写入一行输出。
 fn write_output_line(output: &mut OutputWriter, line: &str) -> Result<()> {
     match output {
         OutputWriter::Stdout => {
@@ -994,7 +978,7 @@ fn write_output_line(output: &mut OutputWriter, line: &str) -> Result<()> {
             writeln!(w, "{}", line)?;
         }
         OutputWriter::BamFile { writer, header } => {
-            // 回退路径：解析 SAM 文本行（用于尚不支持直接构造的 PE 路径）
+            // 将 SAM 文本行解析为 sam::Record，然后写入 BAM
             use noodles::sam::alignment::io::Write;
             let record = noodles::sam::Record::try_from(line.as_bytes())
                 .with_context(|| format!("解析 SAM 行为 Record 失败: {}", line))?;
@@ -1002,20 +986,6 @@ fn write_output_line(output: &mut OutputWriter, line: &str) -> Result<()> {
                 .write_alignment_record(header, &record)
                 .with_context(|| "写入 BAM 记录失败")?;
         }
-    }
-    Ok(())
-}
-
-/// 直接写入 BAM 记录（跳过 SAM 字符串格式化与解析）。
-fn write_bam_record(output: &mut OutputWriter, record: &noodles::sam::alignment::RecordBuf) -> Result<()> {
-    match output {
-        OutputWriter::BamFile { writer, header } => {
-            use noodles::sam::alignment::io::Write;
-            writer
-                .write_alignment_record(header, record)
-                .with_context(|| "写入 BAM 记录失败")?;
-        }
-        _ => unreachable!("write_bam_record 仅用于 BAM 输出"),
     }
     Ok(())
 }

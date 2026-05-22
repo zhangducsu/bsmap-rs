@@ -6,7 +6,7 @@
 //! - `StringAlignPair()`: 配对结果格式化
 //! - `StringAlignUnpair()`: 未配对结果格式化
 
-use crate::align::output::{get_chromosome_length, make_zs_tag, select_output_seq, write_cigar};
+use crate::align::output::{get_chromosome_length, make_cigar, make_zs_tag, select_output_seq};
 use crate::align::Chain;
 use crate::param::{AlignConfig, GHit, ReadInf};
 use crate::pairs::pair::PairHit;
@@ -34,8 +34,6 @@ use crate::reference::binseq::BinSeqCollection;
 /// # 返回值
 /// read_a 和 read_b 的 SAM 记录元组
 pub fn format_pair_sam(
-    buf_a: &mut String,
-    buf_b: &mut String,
     read_a: &ReadInf,
     read_b: &ReadInf,
     pair_hit: &PairHit,
@@ -43,9 +41,8 @@ pub fn format_pair_sam(
     config: &AlignConfig,
     is_unique: bool,
     total_hits: usize,
-) {
-    format_pair_read(
-        buf_a,
+) -> (String, String) {
+    let sam_a = format_pair_read(
         read_a,
         &pair_hit.a,
         &pair_hit.b,
@@ -58,8 +55,7 @@ pub fn format_pair_sam(
         total_hits,
     );
 
-    format_pair_read(
-        buf_b,
+    let sam_b = format_pair_read(
         read_b,
         &pair_hit.b,
         &pair_hit.a,
@@ -71,6 +67,8 @@ pub fn format_pair_sam(
         is_unique,
         total_hits,
     );
+
+    (sam_a, sam_b)
 }
 
 /// 格式化单个配对读段的 SAM 记录。
@@ -86,7 +84,6 @@ pub fn format_pair_sam(
 /// - TLEN: 当 FLAG 0x10 设置时为负，否则为正
 /// - ZS: `chain_flag[ref_chain]` + `chain_flag[chain]`
 fn format_pair_read(
-    buf: &mut String,
     read: &ReadInf,
     hit: &GHit,
     mate_hit: &GHit,
@@ -97,46 +94,71 @@ fn format_pair_read(
     _config: &AlignConfig,
     is_unique: bool,
     total_hits: usize,
-) {
-    use std::fmt::Write;
-
+) -> String {
+    // 获取参考名称
     let ref_name = get_reference_name(hit.chr, coll);
+
+    // ref_chain: hit.strand >> 1（对应 C++ 的 pp.a.chr % 2）
     let ref_chain = hit.strand >> 1;
 
+    // FLAG 0x10 判定：
+    //   C++ read_a: pp.chain ^ (pp.a.chr % 2)
+    //   C++ read_b: (!pp.chain) ^ (pp.b.chr % 2)
+    // is_first=true 时使用 chain，is_first=false 时使用 !chain
     let effective_chain = if is_first { chain } else { 1 - chain };
     let is_reverse = (effective_chain ^ ref_chain) == 1;
 
+    // TLEN: 当 FLAG 0x10 设置时为负，否则为正
     let tlen: i32 = if is_reverse {
         -(insert as i32)
     } else {
         insert as i32
     };
 
+    // 计算 FLAG
     let flag = make_pair_flag(
         is_first,
-        true,
+        true,  // is_mapped
         is_reverse,
-        true,
-        !is_reverse,
-        true,
+        true,  // mate_mapped
+        !is_reverse, // mate_is_reverse: 与当前相反
+        true,  // is_proper
         !is_unique && total_hits > 1,
     );
 
+    // 计算 MAPQ
+    let mapq = calculate_mapq(hit.snps as u32, is_unique, total_hits);
+
+    // 构建 CIGAR
+    let cigar = make_cigar(
+        read.seq.len() as u32,
+        hit.gap_size as i8,
+        hit.gap_pos as u8,
+    );
+
+    // 选择输出序列（当 FLAG 0x10 设置时反转）
     let (seq, qual) = select_output_seq(read, is_reverse);
 
+    // 构建 ZS 标签
+    // C++ read_a: chain_flag[pp.a.chr%2] + chain_flag[pp.chain]
+    // C++ read_b: chain_flag[pp.b.chr%2] + chain_flag[!pp.chain]
+    // read_b 使用 !chain
     let ref_chain_char = if ref_chain == 0 { '+' } else { '-' };
     let chain_char = if is_first {
         if chain == 0 { '+' } else { '-' }
     } else {
-        if chain == 0 { '-' } else { '+' }
+        if chain == 0 { '-' } else { '+' }  // read_b: !chain
     };
+    let zs = format!("ZS:Z:{}{}", ref_chain_char, chain_char);
 
+    // 获取 mate 的参考名称和位置
     let mate_ref_name = if hit.chr == mate_hit.chr {
         "=".to_string()
     } else {
         get_reference_name(mate_hit.chr, coll)
     };
 
+    // POS: 反向参考链需要坐标转换（与单端 output.rs 一致）
     let pos = if ref_chain == 0 {
         hit.loc + 1
     } else {
@@ -144,6 +166,7 @@ fn format_pair_read(
         chr_len - hit.loc - read.seq.len() as u32 + 1
     };
 
+    // PNEXT: mate 也需要坐标转换
     let mate_ref_chain = mate_hit.strand >> 1;
     let mate_pos = if mate_ref_chain == 0 {
         mate_hit.loc + 1
@@ -152,13 +175,24 @@ fn format_pair_read(
         mate_chr_len - mate_hit.loc - read.seq.len() as u32 + 1
     };
 
-    buf.clear();
-    let _ = write!(buf, "{}\t{}\t{}\t{}\t255\t",
-        strip_r_suffix(&read.name), flag, ref_name, pos);
-    write_cigar(buf, read.seq.len() as u32, hit.gap_size as i8, hit.gap_pos as u8);
-    let _ = write!(buf, "\t{}\t{}\t{}\t{}\t{}\tNM:i:{}\tZS:Z:{}{}",
-        mate_ref_name, mate_pos, tlen, seq, qual,
-        hit.snps, ref_chain_char, chain_char);
+    // SAM 格式：
+    // QNAME FLAG RNAME POS MAPQ CIGAR RNEXT PNEXT TLEN SEQ QUAL [TAG:TYPE:VALUE...]
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tNM:i:{}\t{}",
+        strip_r_suffix(&read.name),
+        flag,
+        ref_name,
+        pos,
+        mapq,
+        cigar,
+        mate_ref_name,
+        mate_pos,
+        tlen,
+        seq,
+        qual,
+        hit.snps,
+        zs
+    )
 }
 
 /// 格式化未配对读段为 SAM 记录。
@@ -182,7 +216,6 @@ fn format_pair_read(
 /// # 返回值
 /// SAM 格式的字符串
 pub fn format_unpair_sam(
-    buf: &mut String,
     read: &ReadInf,
     hit: Option<&GHit>,
     mate_chr: Option<u16>,
@@ -193,11 +226,11 @@ pub fn format_unpair_sam(
     is_unique: bool,
     total_hits: usize,
     mate_mapped: bool,
-) {
+) -> String {
     match hit {
         Some(hit) => {
+            // 该读段已比对
             format_mapped_unpair(
-                buf,
                 read,
                 hit,
                 mate_chr,
@@ -210,8 +243,8 @@ pub fn format_unpair_sam(
             )
         }
         None => {
+            // 该读段未比对
             format_unmapped_unpair(
-                buf,
                 read,
                 mate_chr,
                 mate_loc,
@@ -224,7 +257,6 @@ pub fn format_unpair_sam(
 
 /// 格式化已比对的未配对读段。
 fn format_mapped_unpair(
-    buf: &mut String,
     read: &ReadInf,
     hit: &GHit,
     mate_chr: Option<u16>,
@@ -234,28 +266,44 @@ fn format_mapped_unpair(
     is_unique: bool,
     total_hits: usize,
     mate_mapped: bool,
-) {
-    use std::fmt::Write;
-
+) -> String {
+    // 获取参考名称
     let ref_name = get_reference_name(hit.chr, coll);
+
+    // 解析链信息
     let chain = Chain::from_strand(hit.strand);
     let is_reverse = !chain.is_read_forward();
 
+    // 计算 FLAG
     let flag = make_unpair_flag(
         is_first,
-        true,
+        true,  // is_mapped
         is_reverse,
         mate_mapped,
-        false,
+        false, // mate_reverse (未知，设为 false)
         !is_unique && total_hits > 1,
     );
 
+    // 计算 MAPQ
+    let mapq = calculate_mapq(hit.snps as u32, is_unique, total_hits);
+
+    // 构建 CIGAR
+    let cigar = make_cigar(
+        read.seq.len() as u32,
+        hit.gap_size as i8,
+        hit.gap_pos as u8,
+    );
+
+    // 选择输出序列
     let (seq, qual) = select_output_seq(read, is_reverse);
+
+    // 构建 ZS 标签
     let zs = make_zs_tag(
         if chain.is_ref_forward() { 0 } else { 1 },
         if chain.is_read_forward() { 0 } else { 1 },
     );
 
+    // 获取 mate 信息
     let (mate_ref, mate_pos) = if mate_mapped {
         if let (Some(chr), Some(loc)) = (mate_chr, mate_loc) {
             let mate_ref_name = if hit.chr == chr as u32 {
@@ -271,38 +319,55 @@ fn format_mapped_unpair(
         ("*".to_string(), 0)
     };
 
-    buf.clear();
-    let _ = write!(buf, "{}\t{}\t{}\t{}\t255\t",
-        strip_r_suffix(&read.name), flag, ref_name, hit.loc + 1);
-    write_cigar(buf, read.seq.len() as u32, hit.gap_size as i8, hit.gap_pos as u8);
-    let _ = write!(buf, "\t{}\t{}\t0\t{}\t{}\tNM:i:{}\tZS:Z:{}",
-        mate_ref, mate_pos, seq, qual, hit.snps, zs);
+    // SAM 格式
+    format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tNM:i:{}\tZS:Z:{}",
+        strip_r_suffix(&read.name),
+        flag,
+        ref_name,
+        hit.loc + 1,
+        mapq,
+        cigar,
+        mate_ref,
+        mate_pos,
+        0, // TLEN=0 对于未配对
+        seq,
+        qual,
+        hit.snps,
+        zs
+    )
 }
 
 /// 格式化未比对的未配对读段。
 fn format_unmapped_unpair(
-    buf: &mut String,
     read: &ReadInf,
     mate_chr: Option<u16>,
     mate_loc: Option<u32>,
     is_first: bool,
     mate_mapped: bool,
-) {
-    use std::fmt::Write;
-
+) -> String {
+    // 计算 FLAG
     let mut flag: u16 = 0x1; // paired
+
     if is_first {
-        flag |= 0x40;
+        flag |= 0x40; // first in pair
     } else {
-        flag |= 0x80;
+        flag |= 0x80; // second in pair
     }
+
     flag |= 0x4; // unmapped
-    if !mate_mapped {
+
+    if mate_mapped {
+        flag |= 0x8; // mate unmapped (实际上是 mate mapped，但这里我们设为未比对)
+    } else {
         flag |= 0x8; // mate unmapped
     }
 
-    let seq = std::str::from_utf8(&read.seq).unwrap_or("");
+    // 序列和质量值
+    let seq = String::from_utf8_lossy(&read.seq);
+    let qual: String = read.qual.iter().map(|&b| b as char).collect();
 
+    // mate 信息
     let (mate_ref, mate_pos) = if mate_mapped {
         if let (Some(chr), Some(loc)) = (mate_chr, mate_loc) {
             (format!("chr{}", chr + 1), loc + 1)
@@ -313,12 +378,16 @@ fn format_unmapped_unpair(
         ("*".to_string(), 0)
     };
 
-    buf.clear();
-    let _ = write!(buf, "{}\t{}\t*\t0\t0\t*\t{}\t{}\t0\t{}\t",
-        strip_r_suffix(&read.name), flag, mate_ref, mate_pos, seq);
-    for &b in &read.qual {
-        buf.push(b as char);
-    }
+    // SAM 格式
+    format!(
+        "{}\t{}\t*\t0\t0\t*\t{}\t{}\t0\t{}\t{}",
+        strip_r_suffix(&read.name),
+        flag,
+        mate_ref,
+        mate_pos,
+        seq,
+        qual
+    )
 }
 
 /// 生成配对 SAM 的 FLAG。
@@ -509,19 +578,19 @@ fn get_reference_name(chr: u32, coll: &BinSeqCollection) -> String {
 /// # 返回值
 /// read_a 和 read_b 的 SAM 记录元组
 pub fn format_unpair_sam_pair(
-    buf_a: &mut String,
-    buf_b: &mut String,
     read_a: &ReadInf,
     read_b: &ReadInf,
     result: &crate::pairs::PairBatchResult,
     coll: &BinSeqCollection,
     config: &AlignConfig,
-) {
+) -> (String, String) {
+    // 获取 read_a 的命中信息
     let hit_a = result.unpair_hits_a.first();
     let mate_chr_a = result.unpair_hits_b.first().map(|h| h.chr as u16);
     let mate_loc_a = result.unpair_hits_b.first().map(|h| h.loc);
     let mate_mapped_a = !result.unpair_hits_b.is_empty();
 
+    // 获取 read_b 的命中信息
     let hit_b = result.unpair_hits_b.first();
     let mate_chr_b = result.unpair_hits_a.first().map(|h| h.chr as u16);
     let mate_loc_b = result.unpair_hits_a.first().map(|h| h.loc);
@@ -530,13 +599,12 @@ pub fn format_unpair_sam_pair(
     let total_hits_a = result.unpair_hits_a.len();
     let total_hits_b = result.unpair_hits_b.len();
 
-    format_unpair_sam(
-        buf_a,
+    let sam_a = format_unpair_sam(
         read_a,
         hit_a,
         mate_chr_a,
         mate_loc_a,
-        true,
+        true, // is_first
         coll,
         config,
         total_hits_a == 1,
@@ -544,19 +612,20 @@ pub fn format_unpair_sam_pair(
         mate_mapped_a,
     );
 
-    format_unpair_sam(
-        buf_b,
+    let sam_b = format_unpair_sam(
         read_b,
         hit_b,
         mate_chr_b,
         mate_loc_b,
-        false,
+        false, // is_second
         coll,
         config,
         total_hits_b == 1,
         total_hits_b,
         mate_mapped_b,
     );
+
+    (sam_a, sam_b)
 }
 
 #[cfg(test)]
@@ -677,9 +746,7 @@ mod tests {
         let coll = make_test_collection();
         let config = AlignConfig::default();
 
-        let mut buf = String::new();
-        format_unpair_sam(
-            &mut buf,
+        let sam = format_unpair_sam(
             &read,
             Some(&hit),
             Some(0),
@@ -692,13 +759,15 @@ mod tests {
             true,
         );
 
-        let fields: Vec<&str> = buf.split('\t').collect();
-        assert_eq!(fields[0], "read1"); // QNAME (strip_r_suffix 去除 /1)
+        // 验证 SAM 格式
+        let fields: Vec<&str> = sam.split('\t').collect();
+        assert_eq!(fields[0], "read1/1"); // QNAME
         assert!(fields[1].parse::<u16>().unwrap() & 0x40 != 0); // FLAG & 0x40 (first)
         assert_eq!(fields[2], "chr1"); // RNAME
         assert_eq!(fields[3], "101"); // POS (1-based)
         assert_eq!(fields[4], "255"); // MAPQ
         assert_eq!(fields[5], "16M"); // CIGAR
+        // SEQ 字段可能是正向或反向互补，取决于比对链
         assert!(!fields[10].is_empty()); // SEQ 不为空
     }
 
@@ -706,9 +775,7 @@ mod tests {
     fn test_format_unpair_sam_unmapped() {
         let read = make_test_read_a();
 
-        let mut buf = String::new();
-        format_unpair_sam(
-            &mut buf,
+        let sam = format_unpair_sam(
             &read,
             None,
             None,
@@ -721,8 +788,9 @@ mod tests {
             false,
         );
 
-        let fields: Vec<&str> = buf.split('\t').collect();
-        assert_eq!(fields[0], "read1"); // QNAME (strip_r_suffix 去除 /1)
+        // 验证 SAM 格式
+        let fields: Vec<&str> = sam.split('\t').collect();
+        assert_eq!(fields[0], "read1/1"); // QNAME
         let flag = fields[1].parse::<u16>().unwrap();
         assert!(flag & 0x4 != 0); // FLAG & 0x4 (unmapped)
         assert!(flag & 0x40 != 0); // FLAG & 0x40 (first)
@@ -738,10 +806,7 @@ mod tests {
         let coll = make_test_collection();
         let config = AlignConfig::default();
 
-        let mut buf_a = String::new();
-        let mut buf_b = String::new();
-        format_pair_sam(
-            &mut buf_a, &mut buf_b,
+        let (sam_a, sam_b) = format_pair_sam(
             &read_a,
             &read_b,
             &pair_hit,
@@ -752,8 +817,8 @@ mod tests {
         );
 
         // 验证 read_a 的 SAM
-        let fields_a: Vec<&str> = buf_a.split('\t').collect();
-        assert_eq!(fields_a[0], "read1"); // QNAME (strip_r_suffix 去除 /1)
+        let fields_a: Vec<&str> = sam_a.split('\t').collect();
+        assert_eq!(fields_a[0], "read1/1");
         let flag_a = fields_a[1].parse::<u16>().unwrap();
         assert!(flag_a & 0x1 != 0);  // paired
         assert!(flag_a & 0x2 != 0);  // proper pair
@@ -762,8 +827,8 @@ mod tests {
         assert_eq!(fields_a[3], "101"); // hit_a.loc + 1
 
         // 验证 read_b 的 SAM
-        let fields_b: Vec<&str> = buf_b.split('\t').collect();
-        assert_eq!(fields_b[0], "read1"); // QNAME (strip_r_suffix 去除 /2)
+        let fields_b: Vec<&str> = sam_b.split('\t').collect();
+        assert_eq!(fields_b[0], "read1/2");
         let flag_b = fields_b[1].parse::<u16>().unwrap();
         assert!(flag_b & 0x1 != 0);  // paired
         assert!(flag_b & 0x2 != 0);  // proper pair
