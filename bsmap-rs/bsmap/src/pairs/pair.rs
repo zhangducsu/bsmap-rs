@@ -690,7 +690,8 @@ impl PairAlign {
                         let total: usize = computed.iter().map(|v| v.len()).sum();
                         let unique = total == 1;
                         let best = computed.iter().position(|v| !v.is_empty()).unwrap_or(0) as u8;
-                        (unique, best, computed, Vec::new(), Vec::new())
+                        let flat_hits: Vec<PairHit> = computed.into_iter().flatten().collect();
+                        (unique, best, flat_hits, Vec::new(), Vec::new())
                     } else {
                         let (ua, _) = select_best_hits(hits_a);
                         let (ub, _) = select_best_hits(hits_b);

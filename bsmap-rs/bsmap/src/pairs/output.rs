@@ -153,7 +153,7 @@ fn format_pair_read(
 
     // 获取 mate 的参考名称和位置
     let mate_ref_name = if hit.chr == mate_hit.chr {
-        "="
+        "=".to_string()
     } else {
         get_reference_name(mate_hit.chr, coll)
     };

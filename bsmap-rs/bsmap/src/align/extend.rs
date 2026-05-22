@@ -81,6 +81,9 @@ pub fn snp_align_segment(
     all_hits: &mut Vec<GHit>,
 ) -> bool {
     let read_len = encoded.info.seq.len() as u32;
+    // P11-18: 缓存 as_slice() 避免循环内 dyn dispatch
+    let fwd_slice = coll.refcat.as_slice();
+    let rev_slice = coll.crefcat.as_slice();
 
     for (seed_idx, &seed_hash) in segment.seeds.iter().enumerate() {
         if seed_idx < segment.reg_masks.len() && segment.reg_masks[seed_idx] == 0 {
@@ -97,7 +100,7 @@ pub fn snp_align_segment(
 
         for ref_chain in 0..2u8 {
             let positions = if ref_chain == 0 { fwd_positions } else { rev_positions };
-            let ref_seq = if ref_chain == 0 { coll.refcat.as_slice() } else { coll.crefcat.as_slice() };
+            let ref_seq = if ref_chain == 0 { fwd_slice } else { rev_slice };
 
             if positions.is_empty() {
                 continue;

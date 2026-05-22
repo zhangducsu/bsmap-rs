@@ -217,7 +217,7 @@ pub struct AlignConfig {
 impl Default for AlignConfig {
     fn default() -> Self {
         let num_cpus = std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
+            .map(|n| n.get())
             .unwrap_or(4);
 
         let mut config = Self {

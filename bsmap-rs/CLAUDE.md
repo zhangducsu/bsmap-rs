@@ -107,6 +107,70 @@ Indices are written alongside the FASTA (e.g., `genome.fa.bsi`) and auto-detecte
 | `memmap2` | Memory-mapped index loading |
 | `indicatif` | Progress bars |
 
+## 性能优化工作流
+
+每次优化按以下流程逐步推进，每步完成后进行编译验证 + 基准测试 + 报告，确认无回归后再进行下一步。
+
+### 步骤
+
+1. **实施优化**：修改代码，一次只做一项优化
+2. **编译测试**：`cargo check -p bsmap` 和 `cargo test -p bsmap`，确保零错误、测试 0 失败
+3. **构建 release**：`cargo build --release -p bsmap`
+4. **基准测试**：用 example1 和 example2 数据运行 C++ BSMAP 和 Rust 版本（p=1 和 p=4），收集性能数据
+5. **SAM 一致性验证**：对比 SAM 输出与上一 P 版本（必须 0 diff），对比与 C++ 的差异
+6. **生成报告**：写入 `benchmark/PX_report_X.md`
+
+### 基准测试数据
+
+| 数据 | 文件 | 说明 |
+|------|------|------|
+| 参考基因组 | `chr22_tail_1M.fa` (1M bases) | `/home/zhang_i5edc0/bsmap_benchmark/data/` |
+| Example 1 | `ex1_se75_10x.fastq` | SE 75bp, 10x, 133,334 reads, 66,120 aligned |
+| Example 2 | `ex2_pe150_10x_1.fastq` + `ex2_pe150_10x_2.fastq` | PE 150bp, 10x, ~13,334 pairs |
+
+### 基准测试命令
+
+```bash
+# C++ BSMAP (SE)
+bsmap -a <reads.fastq> -d chr22_tail_1M.fa -o <out.sam> -s 16 -v 0.08 -I 4 -p 1
+bsmap -a <reads.fastq> -d chr22_tail_1M.fa -o <out.sam> -s 16 -v 0.08 -I 4 -p 4
+
+# C++ BSMAP (PE)
+bsmap -a <reads1.fastq> -b <reads2.fastq> -d chr22_tail_1M.fa -o <out.sam> -s 16 -v 0.08 -I 4 -p 1
+
+# Rust BSMAP (SE)
+bsmap align -a <reads.fastq> -d chr22_tail_1M.fa -o <out.sam> -s 16 -v 0.08 -I 4 -p 1
+
+# Rust BSMAP (PE)
+bsmap align -a <reads1.fastq> -b <reads2.fastq> -d chr22_tail_1M.fa -o <out.sam> -s 16 -v 0.08 -I 4 -p 1
+```
+
+性能数据通过 `/usr/bin/time -v` 收集（Elapsed time、Maximum resident set size、CPU utilization）。
+
+### 对比基线
+
+- **C++ BSMAP 2.90**（`/mnt/c/Users/zhang_i5edc0/OneDrive/Documents/TraeSOLO/BSMAP/bsmap-original/bsmap-2.90/bsmap`）
+- **上一个 P 版本**（如 P11-7~10 vs P11-12~14）
+
+### 报告要求
+
+每份报告须包含：
+- 优化项描述（编号、文件、改动内容、状态）
+- 基准测试用的完整代码（命令）和参数、参考基因组和数据
+- 性能对比表（耗时、峰值内存、CPU 利用率、比对读段数）
+- SAM 详情（读段数、unique/multiple 分布、vs C++ diff 行数、vs 上一版本 diff 行数）
+- 增量对比（vs C++、vs 上一 P 版本的速度/内存变化）
+- 总结（正确性、性能、降级项说明）
+
+### 计划降级原则
+
+计划中明确标注"建议降级"或"边际（< 1%）"的优化项可直接跳过，在报告中注明原因即可。
+
+### 已知问题
+
+- C++ BSMAP PE 模式在 chr22_tail_1M 测试数据上 buffer overflow 崩溃（0 条 SAM 输出），PE 对比仅限 Rust vs Rust
+- Rust vs C++ SE 有 ~3,000 行 SAM 差异，为已知比对逻辑差异（alternative alignment position 选择不同），非回归
+
 ## Current Status
 
 **Complete:** Core aligner (SE/PE WGBS + RRBS), methratio, bsp2sam. Validated 0-diff against C++ BSMAP on Lambda WGBS PE dataset. BAM output works via noodles.
