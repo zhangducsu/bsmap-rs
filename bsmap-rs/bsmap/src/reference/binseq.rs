@@ -7,7 +7,7 @@
 //! Mirrors C++ `RefSeq::BinSeq()`, `cBinSeq()`, `UnmaskRegion()`,
 //! and `Run_ConvertBinseq()`.
 
-use crate::alphabet::{ALPHABET, REG_ALPHABET, REV_ALPHABET};
+use crate::alphabet::{ALPHABET, REV_ALPHABET};
 use crate::param::{BINSEQPAD, REF_MARGIN, SEGLEN};
 
 use super::fasta::Reference;
@@ -22,8 +22,6 @@ pub struct BinarySeq {
     pub n: u32,
     /// 2-bit packed sequence words.
     pub words: Vec<u64>,
-    /// REG_ALPHABET mask words (0b11 for valid bases, 0 for N).
-    pub mask: Vec<u64>,
 }
 
 /// Unmasked (valid-nucleotide) region.
@@ -60,6 +58,9 @@ pub struct BinSeqCollection {
     pub seqs: Vec<BinarySeq>,
     /// Chromosome names (from FASTA headers).
     pub chr_names: Vec<String>,
+    /// Pre-computed chromosome accessions (first word of each name).
+    /// P11-8: used by get_reference_name() to avoid per-record String allocation.
+    pub chr_accessions: Vec<String>,
 }
 
 impl BinSeqCollection {
@@ -78,13 +79,11 @@ impl BinSeqCollection {
             let mut fwd = encode_forward(&r.seq);
             fwd.n = (r.len + SEGLEN as u32 - 1) / SEGLEN as u32 + BINSEQPAD as u32;
             pad_to_len(&mut fwd.words, fwd.n as usize);
-            pad_to_len(&mut fwd.mask, fwd.n as usize);
 
             // Reverse-complement strand
             let mut rev = encode_revcomp(&r.seq);
             rev.n = fwd.n;
             pad_to_len(&mut rev.words, rev.n as usize);
-            pad_to_len(&mut rev.mask, rev.n as usize);
 
             // Find unmasked regions on forward strand
             find_blocks(&mut blocks, chr_id * 2, &r.seq, total_bases);
@@ -135,6 +134,12 @@ impl BinSeqCollection {
         // Collect chromosome names
         let chr_names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
 
+        // P11-8: 预计算染色体 accession（取空格前第一个词），消除输出阶段 String 分配
+        let chr_accessions: Vec<String> = chr_names
+            .iter()
+            .map(|n| n.split_whitespace().next().unwrap_or(n).to_string())
+            .collect();
+
         Self {
             total_num,
             sum_length,
@@ -142,8 +147,9 @@ impl BinSeqCollection {
             crefcat: Box::new(VecStorage::new(crefcat)),
             ref_anchor,
             blocks,
-            seqs,
+            seqs: Vec::new(),
             chr_names,
+            chr_accessions,
         }
     }
 
@@ -216,27 +222,20 @@ impl BinSeqCollection {
 pub fn encode_forward(seq: &[u8]) -> BinarySeq {
     let n_words = (seq.len() + SEGLEN - 1) / SEGLEN;
     let mut words = vec![0u64; n_words];
-    let mut mask = vec![0u64; n_words];
 
     for (i, chunk) in seq.chunks(SEGLEN).enumerate() {
         let mut w: u64 = 0;
-        let mut m: u64 = 0;
         for &base in chunk {
             w = (w << 2) | ALPHABET[base as usize] as u64;
-            m = (m << 2) | REG_ALPHABET[base as usize] as u64;
         }
-        // Left-align: pad remaining positions with 0 (A code, mask 0)
         let used = chunk.len() * 2;
         w <<= SEGLEN * 2 - used;
-        m <<= SEGLEN * 2 - used;
         words[i] = w;
-        mask[i] = m;
     }
 
     BinarySeq {
         n: n_words as u32,
         words,
-        mask,
     }
 }
 
@@ -244,38 +243,22 @@ pub fn encode_forward(seq: &[u8]) -> BinarySeq {
 pub fn encode_revcomp(seq: &[u8]) -> BinarySeq {
     let n_words = (seq.len() + SEGLEN - 1) / SEGLEN;
     let mut words = vec![0u64; n_words];
-    let mut mask = vec![0u64; n_words];
 
-    // Build RC bytes in natural order for chunking
     let rev_seq: Vec<u8> = seq.iter().rev().copied().collect();
-    let rev_mask: Vec<u8> = seq
-        .iter()
-        .rev()
-        .map(|&c| REG_ALPHABET[c as usize])
-        .collect();
 
-    for (i, (chunk, mask_chunk)) in rev_seq
-        .chunks(SEGLEN)
-        .zip(rev_mask.chunks(SEGLEN))
-        .enumerate()
-    {
+    for (i, chunk) in rev_seq.chunks(SEGLEN).enumerate() {
         let mut w: u64 = 0;
-        let mut m: u64 = 0;
-        for (&base, &reg) in chunk.iter().zip(mask_chunk.iter()) {
+        for &base in chunk {
             w = (w << 2) | REV_ALPHABET[base as usize] as u64;
-            m = (m << 2) | reg as u64;
         }
         let used = chunk.len() * 2;
         w <<= SEGLEN * 2 - used;
-        m <<= SEGLEN * 2 - used;
         words[i] = w;
-        mask[i] = m;
     }
 
     BinarySeq {
         n: n_words as u32,
         words,
-        mask,
     }
 }
 
@@ -369,9 +352,6 @@ mod tests {
         // ACGT = 00 01 10 11, left-aligned: needs 32-4=28 bases padding (56 bits)
         let expected: u64 = 0b00011011u64 << 56;
         assert_eq!(bs.words[0], expected);
-        // Mask: each base is valid (3=11), padded with 0
-        let expected_mask: u64 = 0b11111111u64 << 56;
-        assert_eq!(bs.mask[0], expected_mask);
     }
 
     #[test]

@@ -338,6 +338,130 @@ pub fn mismatch_pattern_1(
     positions
 }
 
+/// 仅计数 mismatch 数量，不分配 Vec（针对 mismatch_pattern_0 的热路径调用）。
+#[inline]
+pub fn count_mismatch_positions_0(
+    query: &[u64],
+    ref_seq: &[u64],
+    offset: u32,
+    map_readlen: u32,
+    _nt3: bool,
+) -> u32 {
+    let mut count: u32 = 0;
+    let word_offset = (offset / 64) as usize;
+    let bit_offset = (offset % 64) as u32;
+    let mut bases_processed: u32 = 0;
+
+    if bit_offset == 0 {
+        for i in 0..query.len() {
+            if bases_processed >= map_readlen {
+                break;
+            }
+            let ref_word = ref_seq[word_offset + i];
+            let q_word = query[i];
+            let mut diff = q_word ^ ref_word;
+            diff &= xc64(ref_word);
+            let bases_in_word = ((map_readlen - bases_processed).min(SEGLEN as u32)) as usize;
+            for j in 0..bases_in_word {
+                let bit_pos = 62 - j * 2;
+                let mask = 0b11u64 << bit_pos;
+                if (diff & mask) != 0 {
+                    count += 1;
+                }
+            }
+            bases_processed += bases_in_word as u32;
+        }
+    } else {
+        let shift_left = bit_offset;
+        let shift_right = 64 - bit_offset;
+        for i in 0..query.len() {
+            if bases_processed >= map_readlen {
+                break;
+            }
+            let ref_low = ref_seq[word_offset + i] << shift_left;
+            let ref_high = if word_offset + i + 1 < ref_seq.len() {
+                ref_seq[word_offset + i + 1] >> shift_right
+            } else {
+                0
+            };
+            let ref_word = ref_low | ref_high;
+            let q_word = query[i];
+            let mut diff = q_word ^ ref_word;
+            diff &= xc64(ref_word);
+            let bases_in_word = ((map_readlen - bases_processed).min(SEGLEN as u32)) as usize;
+            for j in 0..bases_in_word {
+                let bit_pos = 62 - j * 2;
+                let mask = 0b11u64 << bit_pos;
+                if (diff & mask) != 0 {
+                    count += 1;
+                }
+            }
+            bases_processed += bases_in_word as u32;
+        }
+    }
+
+    count
+}
+
+/// 仅计数 mismatch 数量，不分配 Vec（针对 mismatch_pattern_1 的热路径调用）。
+#[inline]
+pub fn count_mismatch_positions_1(
+    query: &[u64],
+    ref_seq: &[u64],
+    offset: u32,
+    map_readlen: u32,
+    _nt3: bool,
+) -> u32 {
+    let mut count: u32 = 0;
+    let word_offset = (offset / 64) as usize;
+    let bit_offset = (offset % 64) as u32;
+    let num_words = ((map_readlen as usize + SEGLEN - 1) / SEGLEN).max(1);
+
+    if bit_offset == 0 {
+        for i in (0..num_words).rev() {
+            let ref_word = ref_seq[word_offset + i];
+            let q_word = query[i];
+            let mut diff = q_word ^ ref_word;
+            diff &= xc64(ref_word);
+            let word_start_base = i * SEGLEN;
+            let bases_in_word = ((map_readlen as usize).saturating_sub(word_start_base)).min(SEGLEN);
+            for j in (0..bases_in_word).rev() {
+                let bit_pos = 62 - j * 2;
+                let mask = 0b11u64 << bit_pos;
+                if (diff & mask) != 0 {
+                    count += 1;
+                }
+            }
+        }
+    } else {
+        let shift_left = bit_offset;
+        let shift_right = 64 - bit_offset;
+        for i in (0..num_words).rev() {
+            let ref_low = ref_seq[word_offset + i] << shift_left;
+            let ref_high = if word_offset + i + 1 < ref_seq.len() {
+                ref_seq[word_offset + i + 1] >> shift_right
+            } else {
+                0
+            };
+            let ref_word = ref_low | ref_high;
+            let q_word = query[i];
+            let mut diff = q_word ^ ref_word;
+            diff &= xc64(ref_word);
+            let word_start_base = i * SEGLEN;
+            let bases_in_word = ((map_readlen as usize).saturating_sub(word_start_base)).min(SEGLEN);
+            for j in (0..bases_in_word).rev() {
+                let bit_pos = 62 - j * 2;
+                let mask = 0b11u64 << bit_pos;
+                if (diff & mask) != 0 {
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    count
+}
+
 /// SIMD 优化版本（x86_64 AVX2）。
 ///
 /// 如果目标平台支持 AVX2，使用 256-bit 向量指令加速 mismatch 计数。

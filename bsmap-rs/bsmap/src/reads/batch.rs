@@ -35,7 +35,9 @@ pub fn process_batch(
         // 转换为可变序列
         let mut seq = raw.seq;
         let mut qual = raw.qual;
-        let name = String::from_utf8_lossy(&raw.name).to_string();
+        let name = String::from_utf8(raw.name).unwrap_or_else(|e| {
+            String::from_utf8_lossy(e.as_bytes()).into_owned()
+        });
 
         // 1. 截断超过 max_read_len 的读段
         let max_len = config.max_read_len as usize;

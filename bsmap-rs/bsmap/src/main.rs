@@ -224,6 +224,10 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
         write_sam_header(&mut output, &ref_names, &refs)?;
     }
 
+    // P11-3: 索引构建后立即释放原始 FASTA 序列 (~3 GB)
+    // 比对阶段仅使用 refcat/crefcat（2-bit 编码），refs 已无用途
+    drop(refs);
+
     // 运行比对
     let stats = Arc::new(AlignStats::default());
 
@@ -524,8 +528,8 @@ fn run_single_align(
             break;
         }
 
-        // 处理读段
-        let reads = process_batch(batch_raw.clone(), 0, config);
+        // 处理读段（P11-4: mem::take 代替 clone，消除每批深拷贝）
+        let reads = process_batch(std::mem::take(&mut batch_raw), 0, config);
 
         // 编码读段
         let encoded: Vec<EncodedRead> = reads.iter().map(|r| encode_read(r)).collect();
@@ -629,9 +633,9 @@ fn run_paired_align(
         // 确保两个文件读段数量一致
         let n = n_a.min(n_b);
 
-        // 处理读段
-        let reads_a = process_batch(batch_a.clone(), 1, config);
-        let reads_b = process_batch(batch_b.clone(), 2, config);
+        // 处理读段（P11-4: mem::take 代替 clone，消除每批深拷贝）
+        let reads_a = process_batch(std::mem::take(&mut batch_a), 1, config);
+        let reads_b = process_batch(std::mem::take(&mut batch_b), 2, config);
 
         // 编码读段
         let encoded_a: Vec<EncodedRead> = reads_a.iter().map(|r| encode_read(r)).collect();

@@ -153,7 +153,7 @@ fn format_pair_read(
 
     // 获取 mate 的参考名称和位置
     let mate_ref_name = if hit.chr == mate_hit.chr {
-        "=".to_string()
+        "="
     } else {
         get_reference_name(mate_hit.chr, coll)
     };
@@ -550,17 +550,13 @@ fn strip_r_suffix(name: &str) -> &str {
     }
 }
 
-/// 获取参考序列名称。
+/// 获取参考序列名称（P11-8: 返回预计算 accession，零分配）。
 fn get_reference_name(chr: u32, coll: &BinSeqCollection) -> String {
-    // 与 C++ BSMAP 保持一致：只输出 Accession（第一个空格前的部分）
-    if (chr as usize) < coll.chr_names.len() {
-        coll.chr_names[chr as usize]
-            .split_whitespace()
-            .next()
-            .unwrap_or(&coll.chr_names[chr as usize])
-            .to_string()
+    let chr_idx = chr as usize;
+    if chr_idx < coll.chr_accessions.len() {
+        coll.chr_accessions[chr_idx].clone()
     } else {
-        format!("chr{}", chr + 1)
+        "unknown".to_string()
     }
 }
 

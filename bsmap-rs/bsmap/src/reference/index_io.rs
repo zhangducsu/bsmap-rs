@@ -488,6 +488,11 @@ pub fn load_index_with_mode(
             blocks: vec![],
             seqs: vec![],
             chr_names: meta.ref_names.clone(),
+            chr_accessions: meta
+                .ref_names
+                .iter()
+                .map(|n| n.split_whitespace().next().unwrap_or(n).to_string())
+                .collect(),
         };
         return Ok((coll, index, meta));
     }
@@ -558,6 +563,11 @@ pub fn load_index_with_mode(
                 blocks: vec![],
                 seqs: vec![],
                 chr_names: meta.ref_names.clone(),
+                chr_accessions: meta
+                    .ref_names
+                    .iter()
+                    .map(|n| n.split_whitespace().next().unwrap_or(n).to_string())
+                    .collect(),
             };
             log::info!(
                 "索引已从 {} 加载 (v2, memory, refcat={} words, crefcat={} words)",
@@ -583,6 +593,11 @@ pub fn load_index_with_mode(
                 blocks: vec![],
                 seqs: vec![],
                 chr_names: meta.ref_names.clone(),
+                chr_accessions: meta
+                    .ref_names
+                    .iter()
+                    .map(|n| n.split_whitespace().next().unwrap_or(n).to_string())
+                    .collect(),
             };
             log::info!(
                 "索引已从 {} 加载 (v2, mmap, refcat={} words, crefcat={} words)",

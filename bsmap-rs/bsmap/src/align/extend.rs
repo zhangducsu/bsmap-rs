@@ -20,37 +20,6 @@ use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
 use crate::reference::index::KmerIndex;
 
-/// 扩展后的命中记录（内部使用）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ExtHit {
-    /// 染色体 ID。
-    chr: u32,
-    /// 位置。
-    loc: u32,
-    /// Mismatch 数。
-    snps: u8,
-    /// Strand 编码 (ref_chain << 1 | read_chain)。
-    strand: u8,
-    /// Gap 大小。
-    gap_size: i8,
-    /// Gap 位置。
-    gap_pos: u8,
-}
-
-impl ExtHit {
-    /// 转换为 GHit。
-    pub fn to_ghit(self) -> GHit {
-        GHit {
-            loc: self.loc,
-            chr: self.chr,
-            strand: self.strand,
-            gap_size: self.gap_size as i16,
-            gap_pos: self.gap_pos as u16,
-            snps: self.snps,
-        }
-    }
-}
-
 /// 种子扩展比对（逐链独立）。
 ///
 /// 对应 C++ `SnpAlign()` 函数。对单条链的所有 segment 进行比对。
@@ -67,7 +36,7 @@ pub fn snp_align_for_chain(
     max_hits: usize,
     level_counts: &mut [usize],
 ) -> Vec<GHit> {
-    let mut all_hits: Vec<ExtHit> = Vec::new();
+    let mut all_hits: Vec<GHit> = Vec::with_capacity(max_hits);
     let read_len = encoded.info.seq.len() as u32;
     let query = if read_chain == 0 { &encoded.fwd_words } else { &encoded.rev_words };
     let mask = if read_chain == 0 { &encoded.fwd_mask } else { &encoded.rev_mask };
@@ -84,7 +53,7 @@ pub fn snp_align_for_chain(
     }
 
     dedup_hits(&mut all_hits);
-    all_hits.into_iter().map(|h| h.to_ghit()).collect()
+    all_hits
 }
 
 /// 对单个 segment 执行种子扩展比对。
@@ -109,7 +78,7 @@ pub fn snp_align_segment(
     query: &[u64],
     mask: &[u64],
     n_count: u32,
-    all_hits: &mut Vec<ExtHit>,
+    all_hits: &mut Vec<GHit>,
 ) -> bool {
     let read_len = encoded.info.seq.len() as u32;
 
@@ -161,7 +130,7 @@ pub fn snp_align_segment(
                 if mm_count <= *snp_thres {
                     let snp_level = mm_count as usize;
                     level_counts[snp_level] += 1;
-                    all_hits.push(ExtHit {
+                    all_hits.push(GHit {
                         chr: chr / 2,
                         loc,
                         snps: mm_count as u8,
@@ -187,13 +156,13 @@ pub fn snp_align_segment(
                     ) {
                         let gap_snps = gap_result.snp_count as usize;
                         level_counts[gap_snps] += 1;
-                        all_hits.push(ExtHit {
+                        all_hits.push(GHit {
                             chr: chr / 2,
                             loc,
                             snps: gap_result.snp_count as u8,
                             strand,
-                            gap_size: gap_result.gap_size,
-                            gap_pos: gap_result.gap_pos,
+                            gap_size: gap_result.gap_size as i16,
+                            gap_pos: gap_result.gap_pos as u16,
                         });
                         // C++: GapAlign returns AddHit result, which stops if w==0 and max_hits reached
                         if gap_snps == 0 && level_counts[0] >= max_hits {
@@ -211,7 +180,7 @@ pub fn snp_align_segment(
 }
 
 /// 命中去重。
-pub fn dedup_hits(hits: &mut Vec<ExtHit>) {
+pub fn dedup_hits(hits: &mut Vec<GHit>) {
     if hits.len() <= 1 {
         return;
     }

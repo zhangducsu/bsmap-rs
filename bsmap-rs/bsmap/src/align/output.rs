@@ -363,19 +363,13 @@ fn calculate_mapq(_snps: u32, _is_unique: bool, _total_hits: usize) -> u8 {
     255
 }
 
-/// 获取参考序列名称。
+/// 获取参考序列名称（P11-8: 返回预计算 accession，零分配）。
 pub fn get_reference_name(chr: u32, coll: &BinSeqCollection) -> String {
-    // chr 是染色体索引 (0-based)
     let chr_idx = chr as usize;
-    if chr_idx < coll.chr_names.len() {
-        // 只取空格前的部分（与 C++ BSMAP 一致）
-        coll.chr_names[chr_idx]
-            .split_whitespace()
-            .next()
-            .unwrap_or(&coll.chr_names[chr_idx])
-            .to_string()
+    if chr_idx < coll.chr_accessions.len() {
+        coll.chr_accessions[chr_idx].clone()
     } else {
-        format!("chr{}", chr + 1)
+        "unknown".to_string()
     }
 }
 

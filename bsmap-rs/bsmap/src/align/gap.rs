@@ -15,8 +15,12 @@
 //! 3. 对每种组合，分别计算 gap 前后的 mismatch 数
 //! 4. 如果总 mismatch 数 <= 阈值，返回最佳 gap 结果
 
-use crate::align::mismatch::{count_mismatch, mismatch_pattern_0, mismatch_pattern_1};
+use crate::align::mismatch::{count_mismatch, count_mismatch_positions_0, count_mismatch_positions_1, mismatch_pattern_0, mismatch_pattern_1};
 use crate::param::{MAXGAPS, SEGLEN};
+
+/// 全 1 掩码常量（用于 quick_gap_check 中跳过 N 过滤）。
+/// 足够覆盖最长读段 (6 words = 192 bases)。
+static ALL_ONES_MASK: [u64; 32] = [u64::MAX; 32];
 
 /// Gap 比对结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,16 +152,9 @@ pub fn try_all_gaps(
                 continue;
             }
 
-            // 计算 gap 前的 mismatch（使用 MismatchPattern0）
+            // 计算 gap 前的 mismatch（P11-5: 使用计数版本，消除 Vec 分配）
             let left_mm = if left_len > 0 {
-                let left_positions = mismatch_pattern_0(
-                    query,
-                    ref_seq,
-                    ref_offset,
-                    left_len,
-                    nt3,
-                );
-                left_positions.len() as u32
+                count_mismatch_positions_0(query, ref_seq, ref_offset, left_len, nt3)
             } else {
                 0
             };
@@ -167,20 +164,17 @@ pub fn try_all_gaps(
                 continue;
             }
 
-            // 计算 gap 后的 mismatch（使用 MismatchPattern1，反向遍历）
-            // 参考序列偏移需要跳过 gap
+            // 计算 gap 后的 mismatch（P11-5: 使用计数版本）
             let right_ref_offset = ref_offset + left_len * 2;
             let right_mm = if right_len > 0 {
-                // 计算 query 中 gap 后的起始位置（word 索引）
                 let query_word_start = (left_len as usize + SEGLEN - 1) / SEGLEN;
-                let right_positions = mismatch_pattern_1(
+                count_mismatch_positions_1(
                     &query[query_word_start..],
                     ref_seq,
                     right_ref_offset,
                     right_len,
                     nt3,
-                );
-                right_positions.len() as u32
+                )
             } else {
                 0
             };
@@ -212,16 +206,9 @@ pub fn try_all_gaps(
                 continue;
             }
 
-            // 计算 gap 前的 mismatch
+            // 计算 gap 前的 mismatch（P11-5: 使用计数版本）
             let left_mm = if left_len > 0 {
-                let left_positions = mismatch_pattern_0(
-                    query,
-                    ref_seq,
-                    ref_offset,
-                    left_len,
-                    nt3,
-                );
-                left_positions.len() as u32
+                count_mismatch_positions_0(query, ref_seq, ref_offset, left_len, nt3)
             } else {
                 0
             };
@@ -230,20 +217,17 @@ pub fn try_all_gaps(
                 continue;
             }
 
-            // 计算 gap 后的 mismatch
-            // 参考序列需要跳过缺失的碱基
+            // 计算 gap 后的 mismatch（P11-5: 使用计数版本）
             let right_ref_offset = ref_offset + left_len * 2 + gap_len * 2;
             let right_mm = if right_len > 0 {
-                // 计算 query 中 gap 后的起始位置（word 索引）
                 let query_word_start = (left_len as usize + SEGLEN - 1) / SEGLEN;
-                let right_positions = mismatch_pattern_1(
+                count_mismatch_positions_1(
                     &query[query_word_start..],
                     ref_seq,
                     right_ref_offset,
                     right_len,
                     nt3,
-                );
-                right_positions.len() as u32
+                )
             } else {
                 0
             };
@@ -288,7 +272,7 @@ pub fn quick_gap_check(
         query,
         ref_offset,
         ref_seq,
-        &vec![u64::MAX; query.len()],
+        &ALL_ONES_MASK[..query.len()],
         half_len,
         0,
         false,
@@ -301,7 +285,7 @@ pub fn quick_gap_check(
             &query[(half_len as usize / 32)..],
             ref_offset + half_len * 2 + gap_len * 2,
             ref_seq,
-            &vec![u64::MAX; query.len()],
+            &ALL_ONES_MASK[..query.len()],
             half_len,
             0,
             false,
@@ -317,7 +301,7 @@ pub fn quick_gap_check(
                 &query[(half_len as usize / 32)..],
                 ref_offset + half_len * 2 - gap_len * 2,
                 ref_seq,
-                &vec![u64::MAX; query.len()],
+                &ALL_ONES_MASK[..query.len()],
                 half_len - gap_len,
                 0,
                 false,

@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 
-use crate::align::extend::{add_hits, clear_hits, dedup_hits, is_unique_hit, select_best_hits, snp_align_segment, ExtHit};
+use crate::align::extend::{add_hits, clear_hits, dedup_hits, is_unique_hit, select_best_hits, snp_align_segment};
 use crate::align::seed::{extract_seeds, reorder_seeds_for_chain};
 use crate::param::{AlignConfig, GHit, MAXSNPS};
 use crate::reads::encode::EncodedRead;
@@ -238,7 +238,7 @@ impl SingleAlign {
                 };
                 let n_count = crate::align::extend::count_n_in_mask(mask, read_len);
 
-                let mut seg_hits: Vec<ExtHit> = Vec::new();
+                let mut seg_hits: Vec<GHit> = Vec::new();
                 let cur_counts = if read_chain == 0 {
                     &mut seg_n_hit
                 } else {
@@ -266,12 +266,11 @@ impl SingleAlign {
                     &mut seg_hits,
                 );
 
-                // 去重并转换为 GHit
+                // 去重（P11-6: seg_hits 直接为 Vec<GHit>，无需 ExtHit 中间转换）
                 dedup_hits(&mut seg_hits);
-                let chain_hits: Vec<_> = seg_hits.into_iter().map(|h| h.to_ghit()).collect();
 
                 add_hits(
-                    chain_hits,
+                    seg_hits,
                     &mut self.hits,
                     config.max_num_hits as usize,
                     &mut self.dedup_no_gap,
