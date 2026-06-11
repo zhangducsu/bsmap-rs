@@ -757,7 +757,7 @@ mod tests {
 
         // 验证 SAM 格式
         let fields: Vec<&str> = sam.split('\t').collect();
-        assert_eq!(fields[0], "read1/1"); // QNAME
+        assert_eq!(fields[0], "read1"); // QNAME（与 C++ BSMAP 一致，去除 /1 后缀）
         assert!(fields[1].parse::<u16>().unwrap() & 0x40 != 0); // FLAG & 0x40 (first)
         assert_eq!(fields[2], "chr1"); // RNAME
         assert_eq!(fields[3], "101"); // POS (1-based)
@@ -786,7 +786,7 @@ mod tests {
 
         // 验证 SAM 格式
         let fields: Vec<&str> = sam.split('\t').collect();
-        assert_eq!(fields[0], "read1/1"); // QNAME
+        assert_eq!(fields[0], "read1"); // QNAME（与 C++ BSMAP 一致，去除 /1 后缀）
         let flag = fields[1].parse::<u16>().unwrap();
         assert!(flag & 0x4 != 0); // FLAG & 0x4 (unmapped)
         assert!(flag & 0x40 != 0); // FLAG & 0x40 (first)
@@ -814,7 +814,7 @@ mod tests {
 
         // 验证 read_a 的 SAM
         let fields_a: Vec<&str> = sam_a.split('\t').collect();
-        assert_eq!(fields_a[0], "read1/1");
+        assert_eq!(fields_a[0], "read1");
         let flag_a = fields_a[1].parse::<u16>().unwrap();
         assert!(flag_a & 0x1 != 0);  // paired
         assert!(flag_a & 0x2 != 0);  // proper pair
@@ -824,7 +824,7 @@ mod tests {
 
         // 验证 read_b 的 SAM
         let fields_b: Vec<&str> = sam_b.split('\t').collect();
-        assert_eq!(fields_b[0], "read1/2");
+        assert_eq!(fields_b[0], "read1");
         let flag_b = fields_b[1].parse::<u16>().unwrap();
         assert!(flag_b & 0x1 != 0);  // paired
         assert!(flag_b & 0x2 != 0);  // proper pair

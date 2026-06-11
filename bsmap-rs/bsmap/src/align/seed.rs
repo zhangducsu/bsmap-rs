@@ -140,6 +140,7 @@ pub fn find_best_start_offset(
     map_readlen: u32,
     seed_size: u32,
     index_interval: u32,
+    is_rrbs: bool,
 ) -> u32 {
     // C++ 搜索范围：0 到 (map_readlen - index_interval + 1) % seed_size - 1
     let num_offsets = ((map_readlen - index_interval + 1) % seed_size).max(1).min(index_interval);
@@ -155,9 +156,16 @@ pub fn find_best_start_offset(
 
         while pos + seed_size <= map_readlen && seed_idx < chain_seeds.len() {
             let seed_hash = chain_seeds[seed_idx];
-            // Match C++: CountSeeds uses ref.index2[s].n[0] which in C++ is total of both chains
-            let (fwd, rev) = index.lookup_separated(seed_hash);
-            total_candidates += (fwd.len() + rev.len()) as u32;
+            if is_rrbs {
+                if let Some(ref rrbs_idx) = index.rrbs_index {
+                    if (seed_hash as usize) < rrbs_idx.len() {
+                        total_candidates += rrbs_idx[seed_hash as usize].n1;
+                    }
+                }
+            } else {
+                let (fwd, rev) = index.lookup_separated(seed_hash);
+                total_candidates += (fwd.len() + rev.len()) as u32;
+            }
 
             pos += index_interval;
             seed_idx += index_interval as usize;
@@ -184,7 +192,12 @@ pub fn reorder_seeds_for_chain(
     profile: &[[u32; 16]],
     map_readlen: u32,
     is_rrbs: bool,
+    read_chain: u8,
 ) -> Vec<SeedSegment> {
+    // C++ RRBS: cseed_offset = map_readlen % seed_size
+    // 用于 read_chain=1 时偏移种子位置，补偿 RC 编码的相位差
+    let cseed_offset = if is_rrbs { map_readlen % seed_size } else { 0 };
+
     // 1. 找到最佳起始偏移（对应 C++ 的 xseed_start_offset[chain]）
     let best_start_offset = find_best_start_offset(
         chain_seeds,
@@ -192,6 +205,7 @@ pub fn reorder_seeds_for_chain(
         map_readlen,
         seed_size,
         index_interval,
+        is_rrbs,
     );
 
     // 2. 计算 segment 数量
@@ -200,14 +214,13 @@ pub fn reorder_seeds_for_chain(
     // 3. 为每个 segment 创建 SeedSegment
     let mut segments: Vec<SeedSegment> = Vec::with_capacity(num_segments);
 
-
-
     for seg_idx in 0..num_segments {
         let mut seg_seeds: Vec<u32> = Vec::with_capacity(index_interval as usize);
         let mut seg_masks: Vec<u32> = Vec::with_capacity(index_interval as usize);
         let mut seg_positions: Vec<u32> = Vec::with_capacity(index_interval as usize);
 
-        // C++: xseeds[chain][seg][ii] = xseed_array[chain][profile[seg][ii] + start - ii]
+        // C++ RRBS: xseeds[chain][seg][0] = xseed_array[chain][profile[seg][0] + cseed_offset * read_chain]
+        // C++ WGBS: xseeds[chain][seg][ii] = xseed_array[chain][profile[seg][ii] + start - ii]
         for ii in 0..index_interval as usize {
             let profile_val = if seg_idx < profile.len() && ii < profile[seg_idx].len() {
                 profile[seg_idx][ii]
@@ -215,7 +228,10 @@ pub fn reorder_seeds_for_chain(
                 continue;
             };
 
-            let seed_pos = (profile_val + best_start_offset).saturating_sub(ii as u32);
+            let mut seed_pos = (profile_val + best_start_offset).saturating_sub(ii as u32);
+            if is_rrbs && read_chain == 1 {
+                seed_pos = seed_pos.saturating_add(cseed_offset);
+            }
 
             if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
                 seg_seeds.push(chain_seeds[seed_pos as usize]);
@@ -224,8 +240,6 @@ pub fn reorder_seeds_for_chain(
             }
         }
 
-        // Match C++: xseed_start_array[chain][i] = xseed_start_offset[chain]
-        // Each segment's start is the small offset, not the first seed position
         let mut segment = SeedSegment::new(seg_idx, best_start_offset, seg_seeds, seg_masks, seg_positions);
 
         // 统计该 segment 的候选数
@@ -235,7 +249,23 @@ pub fn reorder_seeds_for_chain(
     }
 
     // 4. 调整每个 segment 的起始位置（AdjustSeedStartArray）
-    adjust_seed_starts_for_chain(&mut segments, index, seed_size, index_interval, map_readlen, chain_seeds, profile);
+    adjust_seed_starts_for_chain(&mut segments, index, seed_size, index_interval, map_readlen, chain_seeds, profile, is_rrbs);
+
+    // C++ cmodeindex 反转：chain 1 将 segment 索引反转，
+    // 使两端第一批种子都从读段起始位置附近开始采样
+    if read_chain == 1 {
+        let n = segments.len();
+        let orig_data: Vec<_> = segments.iter().map(|s| {
+            (s.seeds.clone(), s.reg_masks.clone(), s.seed_positions.clone(), s.start_offset)
+        }).collect();
+        for s in segments.iter_mut() {
+            let rev_idx = n - 1 - s.index;
+            s.seeds.clone_from(&orig_data[rev_idx].0);
+            s.reg_masks.clone_from(&orig_data[rev_idx].1);
+            s.seed_positions.clone_from(&orig_data[rev_idx].2);
+            s.start_offset = orig_data[rev_idx].3;
+        }
+    }
 
     // 5. 按候选数升序排序
     segments.sort_by_key(|s| s.candidates);
@@ -284,6 +314,7 @@ fn adjust_seed_starts_for_chain(
     map_readlen: u32,
     chain_seeds: &[u32],
     profile: &[[u32; 16]],
+    is_rrbs: bool,
 ) {
     if segments.is_empty() {
         return;
@@ -322,7 +353,7 @@ fn adjust_seed_starts_for_chain(
 
         // 在 [start_bound, end_bound] 范围内找使该 segment 候选数最小的 start
         for start in start_bound..=end_bound {
-            let candidates = count_seeds_at_offset(ptr, start, chain_seeds, index, seed_size, index_interval, map_readlen, profile);
+            let candidates = count_seeds_at_offset(ptr, start, chain_seeds, index, seed_size, index_interval, map_readlen, profile, is_rrbs);
             if candidates < min_candidates {
                 min_candidates = candidates;
                 best_start = start;
@@ -362,7 +393,7 @@ fn adjust_seed_starts_for_chain(
         }
 
         // Update candidate count
-        segment.candidates = count_seeds_at_offset(i, new_start, chain_seeds, index, seed_size, index_interval, map_readlen, profile);
+        segment.candidates = count_seeds_at_offset(i, new_start, chain_seeds, index, seed_size, index_interval, map_readlen, profile, is_rrbs);
     }
 }
 
@@ -378,6 +409,7 @@ fn count_seeds_at_offset(
     index_interval: u32,
     map_readlen: u32,
     profile: &[[u32; 16]],
+    is_rrbs: bool,
 ) -> u32 {
     let mut total: u32 = 0;
 
@@ -392,9 +424,16 @@ fn count_seeds_at_offset(
 
         if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
             let seed_hash = chain_seeds[seed_pos as usize];
-            // Match C++: CountSeeds uses ref.index2[s].n[0] which in C++ is total of both chains
-            let (fwd, rev) = index.lookup_separated(seed_hash);
-            total += (fwd.len() + rev.len()) as u32;
+            if is_rrbs {
+                if let Some(ref rrbs_idx) = index.rrbs_index {
+                    if (seed_hash as usize) < rrbs_idx.len() {
+                        total += rrbs_idx[seed_hash as usize].n1;
+                    }
+                }
+            } else {
+                let (fwd, rev) = index.lookup_separated(seed_hash);
+                total += (fwd.len() + rev.len()) as u32;
+            }
         }
     }
 
@@ -539,9 +578,10 @@ mod tests {
             positions: vec![],
             start_offsets: vec![],
             rrbs_index: None,
+            seed_size: 16,
         };
 
-        let best_offset = find_best_start_offset(&seeds, &index, 48, 8, 4);
+        let best_offset = find_best_start_offset(&seeds, &index, 48, 8, 4, false);
         assert!(best_offset < 4, "最佳偏移应该在有效范围内");
     }
 }

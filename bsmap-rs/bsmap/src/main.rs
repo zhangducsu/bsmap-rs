@@ -200,6 +200,14 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
     // 构建配置
     let mut config = AlignConfig::from(args);
 
+    // 设置 rayon 全局线程池（必须在首次调用 par_iter 前）
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.num_threads)
+        .build_global()
+    {
+        warn!("rayon 线程池已初始化，使用已有配置: {}", e);
+    }
+
     // 加载参考序列
     let mut timer = Timer::new();
     info!("加载参考序列...");

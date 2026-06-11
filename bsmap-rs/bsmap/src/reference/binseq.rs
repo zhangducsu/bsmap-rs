@@ -390,7 +390,7 @@ mod tests {
         let coll = BinSeqCollection::from_references(&refs);
         assert_eq!(coll.total_num, 4); // 2 chr × 2 strands
         assert_eq!(coll.sum_length, 36);
-        // ref_anchor should have total_num + 1 entries
-        assert_eq!(coll.ref_anchor.len(), 5);
+        // P12: ref_anchor is per-chromosome (not per-strand), so length = num_chr + 1
+        assert_eq!(coll.ref_anchor.len(), 3);
     }
 }

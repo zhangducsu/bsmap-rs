@@ -252,7 +252,7 @@ pub fn xm64(tt: u64) -> u32 {
 /// C++: ((_m[0]<<(_a*2))|((_m[1]>>1)>>(63-_a*2)))
 /// where _a is the base position within the word (0-31), so _a*2 is bit_offset (0-62)
 #[inline]
-pub fn make_seed(words: &[u64], bit_pos: u32, seed_bits_lz: u32) -> u32 {
+pub fn make_seed(words: &[u64], bit_pos: u64, seed_bits_lz: u32) -> u32 {
     let word_idx = (bit_pos / 64) as usize;
     let bit_offset = (bit_pos % 64) as u32;
 
@@ -291,7 +291,7 @@ pub fn make_seed(words: &[u64], bit_pos: u32, seed_bits_lz: u32) -> u32 {
 pub fn make_seed_with_mask(
     words: &[u64],
     mask_words: &[u64],
-    bit_pos: u32,
+    bit_pos: u64,
     seed_bits_lz: u32,
     seed_bits: u64,
 ) -> (u32, bool) {

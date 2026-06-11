@@ -176,6 +176,7 @@ impl SingleAlign {
                     &config.profile,
                     read_len,
                     config.rrbs_flag,
+                    0,
                 ))
             };
         let chain1_segments: Option<Vec<_>> =
@@ -190,6 +191,7 @@ impl SingleAlign {
                     &config.profile,
                     read_len,
                     config.rrbs_flag,
+                    1,
                 ))
             };
 

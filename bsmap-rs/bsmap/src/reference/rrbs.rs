@@ -112,37 +112,43 @@ pub fn find_sites(seq: &[u8], sites: &[DigestionSite]) -> Vec<(u32, u32)> {
     results
 }
 
-/// Build RRBS seed index positions per chromosome and seed segment.
+/// Build RRBS seed index positions per chromosome (two chains: forward and reverse).
 ///
-/// Returns `ccgg_index[max_seed_seg][chr_id]` = Vec of positions.
-/// Mirrors C++ `RefSeq::find_CCGG()` CCGG_index creation.
+/// Returns `[bsw, bsc]` where bsw = forward chain (chain 0) positions,
+/// bsc = reverse chain (chain 1) positions.
+///
+/// 精确匹配 C++ `RefSeq::find_CCGG()`: 每对酶切位点固定生成 max_seedseg_num 个种子，
+/// 而非按片段长度限制种子数。
 pub fn build_rrbs_index(
     seq: &[u8],
-    chr_id: u32,
     chr_size: u32,
     rc_offset: u32,
     seed_size: u32,
-    max_seed_seg: usize,
     sites: &[DigestionSite],
     min_insert: u32,
     max_insert: u32,
-) -> Vec<Vec<Vec<u32>>> {
+) -> Vec<Vec<u32>> {
+    use crate::param::FIXELEMENT;
+
     let all_sites = find_sites(seq, sites);
     if all_sites.is_empty() {
-        return vec![Vec::new(); max_seed_seg];
+        return vec![Vec::new(), Vec::new()];
     }
 
+    // max_seedseg_num = (FIXELEMENT-1) * SEGLEN / seed_size = 160 / seed_size
+    // 精确匹配 C++ param.max_seedseg_num
+    let max_seedseg_num = ((FIXELEMENT - 1) * SEGLEN) as u32 / seed_size;
     let max_pos = chr_size.saturating_sub(seed_size);
+    let tmp_offset = rc_offset.saturating_sub(seed_size);
 
-    // Per-seed-segment, per-chain: BSW (chain 0) and BSC (chain 1)
-    let mut bsw: Vec<Vec<u32>> = vec![Vec::new(); max_seed_seg];
-    let mut bsc: Vec<Vec<u32>> = vec![Vec::new(); max_seed_seg];
+    let mut bsw: Vec<u32> = Vec::new();
+    let mut bsc: Vec<u32> = Vec::new();
 
     // Forward strand (BSW): iterate j..j+1 pairs
+    // 匹配 C++: for(i=0, seedloc=sites[j].first; i<max_seedseg_num && seedloc<=tmp_max; ...)
     for j in 0..all_sites.len().saturating_sub(1) {
         let (pos_j, _) = all_sites[j];
 
-        // Find next site that satisfies insert size constraints
         let mut seglen: i64 = 0;
         let mut found = false;
         for i in j + 1..all_sites.len() {
@@ -156,19 +162,18 @@ pub fn build_rrbs_index(
             continue;
         }
 
-        for seg in 0..max_seed_seg {
-            let mut seedloc = pos_j;
-            while seedloc <= max_pos {
-                bsw[seg].push(seedloc);
-                seedloc += seed_size;
-                if seedloc > max_pos || bsw[seg].len() >= 1000 {
-                    break;
-                }
+        let mut seedloc = pos_j;
+        for _i in 0..max_seedseg_num {
+            if seedloc > max_pos {
+                break;
             }
+            bsw.push(seedloc);
+            seedloc += seed_size;
         }
     }
 
     // Reverse strand (BSC): iterate j..j-1 pairs
+    // 匹配 C++: for(i=0, seedloc=site_end-seed_size; i<max_seedseg_num; ...)
     for j in 1..all_sites.len() {
         let mut seglen: i64 = 0;
         let mut found = false;
@@ -185,29 +190,17 @@ pub fn build_rrbs_index(
         }
 
         let site_end = all_sites[j].0 + all_sites[j].1;
-        for seg in 0..max_seed_seg {
-            let mut seedloc = site_end.saturating_sub(seed_size) as i64;
-            while seedloc >= 0 {
-                if rc_offset < seedloc as u32 {
-                    seedloc -= seed_size as i64;
-                    continue;
-                }
-                bsc[seg].push(rc_offset - seedloc as u32);
-                seedloc -= seed_size as i64;
-                if seedloc < 0 {
-                    break;
-                }
+        let mut seedloc = site_end.saturating_sub(seed_size) as i64;
+        for _i in 0..max_seedseg_num {
+            if seedloc < 0 {
+                break;
             }
+            bsc.push(tmp_offset.saturating_sub(seedloc as u32));
+            seedloc -= seed_size as i64;
         }
     }
 
-    // Merge BSW and BSC interleaved per chromosome
-    let mut result: Vec<Vec<Vec<u32>>> = vec![Vec::new(); max_seed_seg];
-    for seg in 0..max_seed_seg {
-        result[seg] = vec![bsw[seg].clone(), bsc[seg].clone()];
-    }
-
-    result
+    vec![bsw, bsc]
 }
 
 #[cfg(test)]

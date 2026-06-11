@@ -427,6 +427,7 @@ pub fn load_index(path: &Path) -> Result<(KmerIndex, IndexMeta)> {
                 })
                 .collect()
         }),
+        seed_size: meta.seed_size,
     };
 
     log::info!(
@@ -478,7 +479,7 @@ pub fn load_index_with_mode(
         let data: IndexData = bincode_opts()
             .deserialize_from(&mut reader)
             .context("Failed to deserialize index data")?;
-        let index = reconstruct_kmer_index(data);
+        let index = reconstruct_kmer_index(data, meta.seed_size);
         let coll = BinSeqCollection {
             total_num: 0,
             sum_length: 0,
@@ -517,7 +518,7 @@ pub fn load_index_with_mode(
     let data: IndexData = bincode_opts()
         .deserialize_from(&mut reader)
         .context("Failed to deserialize index data")?;
-    let index = reconstruct_kmer_index(data);
+    let index = reconstruct_kmer_index(data, meta.seed_size);
     drop(reader);
 
     let file_meta = std::fs::metadata(path)?;
@@ -611,7 +612,7 @@ pub fn load_index_with_mode(
 }
 
 /// Reconstruct a KmerIndex from IndexData.
-fn reconstruct_kmer_index(data: IndexData) -> KmerIndex {
+fn reconstruct_kmer_index(data: IndexData, seed_size: u32) -> KmerIndex {
     KmerIndex {
         total_kmers: data.total_kmers,
         max_kmer_num: data.max_kmer_num,
@@ -639,6 +640,7 @@ fn reconstruct_kmer_index(data: IndexData) -> KmerIndex {
                 })
                 .collect()
         }),
+        seed_size,
     }
 }
 

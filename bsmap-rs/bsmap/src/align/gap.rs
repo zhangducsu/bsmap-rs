@@ -83,7 +83,7 @@ pub fn gap_align(
     }
 
     // 计算参考序列偏移（位偏移）
-    let ref_offset = hit_loc * 2; // 每个碱基 2 位
+    let ref_offset = hit_loc as u64 * 2; // 每个碱基 2 位
 
     // 尝试所有 gap 组合
     try_all_gaps(
@@ -122,7 +122,7 @@ pub fn gap_align(
 pub fn try_all_gaps(
     query: &[u64],
     ref_seq: &[u64],
-    ref_offset: u32,
+    ref_offset: u64,
     _seed_pos: u32,
     snp_thres: u32,
     max_gap: u32,
@@ -165,7 +165,7 @@ pub fn try_all_gaps(
             }
 
             // 计算 gap 后的 mismatch（P11-5: 使用计数版本）
-            let right_ref_offset = ref_offset + left_len * 2;
+            let right_ref_offset = ref_offset + left_len as u64 * 2;
             let right_mm = if right_len > 0 {
                 let query_word_start = (left_len as usize + SEGLEN - 1) / SEGLEN;
                 count_mismatch_positions_1(
@@ -218,7 +218,7 @@ pub fn try_all_gaps(
             }
 
             // 计算 gap 后的 mismatch（P11-5: 使用计数版本）
-            let right_ref_offset = ref_offset + left_len * 2 + gap_len * 2;
+            let right_ref_offset = ref_offset + left_len as u64 * 2 + gap_len as u64 * 2;
             let right_mm = if right_len > 0 {
                 let query_word_start = (left_len as usize + SEGLEN - 1) / SEGLEN;
                 count_mismatch_positions_1(
@@ -260,7 +260,7 @@ pub fn try_all_gaps(
 pub fn quick_gap_check(
     query: &[u64],
     ref_seq: &[u64],
-    ref_offset: u32,
+    ref_offset: u64,
     map_readlen: u32,
     max_gap: u32,
 ) -> bool {
@@ -283,7 +283,7 @@ pub fn quick_gap_check(
         // 尝试正向偏移（insertion）
         let right_mm_insert = count_mismatch(
             &query[(half_len as usize / 32)..],
-            ref_offset + half_len * 2 + gap_len * 2,
+            ref_offset + half_len as u64 * 2 + gap_len as u64 * 2,
             ref_seq,
             &ALL_ONES_MASK[..query.len()],
             half_len,
@@ -299,7 +299,7 @@ pub fn quick_gap_check(
         if half_len > gap_len {
             let right_mm_delete = count_mismatch(
                 &query[(half_len as usize / 32)..],
-                ref_offset + half_len * 2 - gap_len * 2,
+                ref_offset + half_len as u64 * 2 - gap_len as u64 * 2,
                 ref_seq,
                 &ALL_ONES_MASK[..query.len()],
                 half_len - gap_len,

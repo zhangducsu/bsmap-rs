@@ -20,6 +20,10 @@ use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
 use crate::reference::index::KmerIndex;
 
+/// RRBS mode: marker bit on cross-chain entries (entries converted from the opposite chain).
+/// Must match CROSS_FLAG in reference::index.
+const CROSS_FLAG: u32 = 0x1000000;
+
 /// 种子扩展比对（逐链独立）。
 ///
 /// 对应 C++ `SnpAlign()` 函数。对单条链的所有 segment 进行比对。
@@ -81,7 +85,6 @@ pub fn snp_align_segment(
     all_hits: &mut Vec<GHit>,
 ) -> bool {
     let read_len = encoded.info.seq.len() as u32;
-    // P11-18: 缓存 as_slice() 避免循环内 dyn dispatch
     let fwd_slice = coll.refcat.as_slice();
     let rev_slice = coll.crefcat.as_slice();
 
@@ -96,83 +99,166 @@ pub fn snp_align_segment(
             segment.start_offset + seed_idx as u32 * 4
         };
 
-        let (fwd_positions, rev_positions) = index.lookup_separated(seed_hash);
+        // ── RRBS mode: positions from rrbs_index ──
+        if let Some(ref rrbs_idx) = index.rrbs_index {
+            if (seed_hash as usize) < rrbs_idx.len() && rrbs_idx[seed_hash as usize].n1 > 0 {
+                let hits = &rrbs_idx[seed_hash as usize].loc1;
+                for hit in hits {
+                    let ref_chain = (hit.chr & 1) as u8;
+                    let chr_idx = ((hit.chr & !CROSS_FLAG) / 2) as usize;
 
-        for ref_chain in 0..2u8 {
-            let positions = if ref_chain == 0 { fwd_positions } else { rev_positions };
-            let ref_seq = if ref_chain == 0 { fwd_slice } else { rev_slice };
+                    let anchor = if chr_idx < coll.ref_anchor.len() { coll.ref_anchor[chr_idx] } else { continue; };
+                    let padded_len = if chr_idx + 1 < coll.ref_anchor.len() {
+                        coll.ref_anchor[chr_idx + 1] - coll.ref_anchor[chr_idx]
+                    } else {
+                        continue;
+                    };
 
-            if positions.is_empty() {
-                continue;
-            }
+                    // RRBS: always use forward-encoded reference (matching C++ ref.bfa).
+                    // xc64 C→T tolerance only works with forward encoding (C=01).
+                    let ref_seq = fwd_slice;
 
-            let strand = (ref_chain << 1) | read_chain;
+                    // Convert BSC → forward coordinate for ref_chain=1 entries.
+                    // BSC = padded_len - seed_size - site_fwd; solving for site_fwd:
+                    let hit_loc_fwd = if ref_chain == 1 {
+                        padded_len.saturating_sub(index.seed_size).saturating_sub(hit.loc)
+                    } else {
+                        hit.loc
+                    };
 
-            for &flat_pos in positions {
-                let alignment_start = flat_pos.wrapping_sub(seed_pos_in_read);
-                let ref_offset = alignment_start * 2;
-                let (chr, mut loc) = coll.int2hit(alignment_start);
+                    let alignment_start = anchor.wrapping_add(hit_loc_fwd).wrapping_sub(seed_pos_in_read);
+                    let ref_offset = alignment_start as u64 * 2;
+                    let chr = chr_idx as u32;
+                    let loc = alignment_start.wrapping_sub(anchor);
 
-                // C++ int2hit 坐标转换：反向链位置转为正向坐标
-                // 对应 C++: if(ref_chain_index) gh.loc = rc_offset - map_readlen - gh.loc
-                // 使用 get_chromosome_length（真实长度），而非 total_len_for_chr（含 BINSEQPAD padding）
-                if ref_chain == 1 {
-                    let chr_len = crate::align::output::get_chromosome_length(chr, coll);
-                    loc = chr_len.saturating_sub(read_len).saturating_sub(loc);
+                    if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
+                        continue;
+                    }
+
+                    let strand = (ref_chain << 1) | read_chain;
+                    let mm_count = count_mismatch(
+                        query, ref_offset, ref_seq, mask,
+                        *snp_thres, n_count, nt3,
+                    );
+
+                    if mm_count <= *snp_thres {
+                        let snp_level = mm_count as usize;
+                        level_counts[snp_level] += 1;
+                        all_hits.push(GHit {
+                            chr,
+                            loc,
+                            snps: mm_count as u8,
+                            strand,
+                            gap_size: 0,
+                            gap_pos: 0,
+                        });
+                        if mm_count == 0 && level_counts[0] >= max_hits {
+                            return true;
+                        }
+                        if mm_count > 0 && level_counts[snp_level] >= max_hits {
+                            *snp_thres = mm_count - 1;
+                        }
+                    }
+
+                    if gap_size > 0 && mm_count > *snp_thres && mm_count <= *snp_thres + 2 {
+                        if let Some(gap_result) = gap_align(
+                            query, ref_seq, alignment_start, seed_pos_in_read,
+                            8, *snp_thres, gap_size, nt3, read_len, 3,
+                        ) {
+                            let gap_snps = gap_result.snp_count as usize;
+                            level_counts[gap_snps] += 1;
+                            all_hits.push(GHit {
+                                chr,
+                                loc,
+                                snps: gap_result.snp_count as u8,
+                                strand,
+                                gap_size: gap_result.gap_size as i16,
+                                gap_pos: gap_result.gap_pos as u16,
+                            });
+                            if gap_snps == 0 && level_counts[0] >= max_hits {
+                                return true;
+                            }
+                            if gap_snps > 0 && level_counts[gap_snps] >= max_hits {
+                                *snp_thres = gap_snps as u32 - 1;
+                            }
+                        }
+                    }
                 }
+            }
+        } else {
+            // ── WGBS mode: existing lookup_separated logic ──
+            let (fwd_positions, rev_positions) = index.lookup_separated(seed_hash);
 
-                if (ref_offset / 64) as usize + query.len() > ref_seq.len() {
+            for ref_chain in 0..2u8 {
+                let positions = if ref_chain == 0 { fwd_positions } else { rev_positions };
+                let ref_seq = if ref_chain == 0 { fwd_slice } else { rev_slice };
+
+                if positions.is_empty() {
                     continue;
                 }
 
-                let mm_count = count_mismatch(
-                    query, ref_offset, ref_seq, mask,
-                    *snp_thres, n_count, nt3,
-                );
+                let strand = (ref_chain << 1) | read_chain;
 
-                if mm_count <= *snp_thres {
-                    let snp_level = mm_count as usize;
-                    level_counts[snp_level] += 1;
-                    all_hits.push(GHit {
-                        chr: chr / 2,
-                        loc,
-                        snps: mm_count as u8,
-                        strand,
-                        gap_size: 0,
-                        gap_pos: 0,
-                    });
+                for &flat_pos in positions {
+                    let alignment_start = flat_pos.wrapping_sub(seed_pos_in_read);
+                    let ref_offset = alignment_start as u64 * 2;
+                    let (chr, mut loc) = coll.int2hit(alignment_start);
 
-                    // C++ AddHit: if w==0 and max_hits reached, return 1 (stop immediately)
-                    // Without this, Rust collects all hits before checking stop, producing extra hits
-                    if mm_count == 0 && level_counts[0] >= max_hits {
-                        return true;
+                    if ref_chain == 1 {
+                        let chr_len = crate::align::output::get_chromosome_length(chr, coll);
+                        loc = chr_len.saturating_sub(read_len).saturating_sub(loc);
                     }
-                    if mm_count > 0 && level_counts[snp_level] >= max_hits {
-                        *snp_thres = mm_count - 1;
-                    }
-                }
 
-                if gap_size > 0 && mm_count > *snp_thres && mm_count <= *snp_thres + 2 {
-                    if let Some(gap_result) = gap_align(
-                        query, ref_seq, alignment_start, seed_pos_in_read,
-                        8, *snp_thres, gap_size, nt3, read_len, 3,
-                    ) {
-                        let gap_snps = gap_result.snp_count as usize;
-                        level_counts[gap_snps] += 1;
+                    if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
+                        continue;
+                    }
+
+                    let mm_count = count_mismatch(
+                        query, ref_offset, ref_seq, mask,
+                        *snp_thres, n_count, nt3,
+                    );
+
+                    if mm_count <= *snp_thres {
+                        let snp_level = mm_count as usize;
+                        level_counts[snp_level] += 1;
                         all_hits.push(GHit {
-                            chr: chr / 2,
+                            chr,
                             loc,
-                            snps: gap_result.snp_count as u8,
+                            snps: mm_count as u8,
                             strand,
-                            gap_size: gap_result.gap_size as i16,
-                            gap_pos: gap_result.gap_pos as u16,
+                            gap_size: 0,
+                            gap_pos: 0,
                         });
-                        // C++: GapAlign returns AddHit result, which stops if w==0 and max_hits reached
-                        if gap_snps == 0 && level_counts[0] >= max_hits {
+
+                        if mm_count == 0 && level_counts[0] >= max_hits {
                             return true;
                         }
-                        if gap_snps > 0 && level_counts[gap_snps] >= max_hits {
-                            *snp_thres = gap_snps as u32 - 1;
+                        if mm_count > 0 && level_counts[snp_level] >= max_hits {
+                            *snp_thres = mm_count - 1;
+                        }
+                    }
+
+                    if gap_size > 0 && mm_count > *snp_thres && mm_count <= *snp_thres + 2 {
+                        if let Some(gap_result) = gap_align(
+                            query, ref_seq, alignment_start, seed_pos_in_read,
+                            8, *snp_thres, gap_size, nt3, read_len, 3,
+                        ) {
+                            let gap_snps = gap_result.snp_count as usize;
+                            level_counts[gap_snps] += 1;
+                            all_hits.push(GHit {
+                                chr,
+                                loc,
+                                snps: gap_result.snp_count as u8,
+                                strand,
+                                gap_size: gap_result.gap_size as i16,
+                                gap_pos: gap_result.gap_pos as u16,
+                            });
+                            if gap_snps == 0 && level_counts[0] >= max_hits {
+                                return true;
+                            }
+                            if gap_snps > 0 && level_counts[gap_snps] >= max_hits {
+                                *snp_thres = gap_snps as u32 - 1;
+                            }
                         }
                     }
                 }
@@ -233,8 +319,6 @@ pub fn add_hits(new_hits: Vec<GHit>, all_hits: &mut [Vec<GHit>], max_hits: usize
             continue;
         }
 
-        // C++ 去重：同一 (chr>>1, loc) 位置只保留首次出现的命中
-        // 对应 C++ if(!hitset[_ghit.chr>>1].insert(_ghit.loc).second) return 0
         let key = (hit.chr >> 1, hit.loc);
         if hit.gap_size != 0 {
             if !dedup_gap.insert(key) {
@@ -249,7 +333,6 @@ pub fn add_hits(new_hits: Vec<GHit>, all_hits: &mut [Vec<GHit>], max_hits: usize
         all_hits[snp_level].push(hit);
     }
 
-    // C++ 行为：仅当最佳 mismatch 层 (w=0) 的命中数达到上限时才停止
     if let Some(level0) = all_hits.first() {
         if level0.len() >= max_hits {
             return true;

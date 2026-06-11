@@ -8,7 +8,7 @@
 //! `FillIndex()`, and `FinishIndex()`.
 
 use crate::alphabet::make_seed;
-use crate::param::{Hit, KmerLoc, KmerLoc2, REF_MARGIN, SEGLEN};
+use crate::param::{Hit, KmerLoc, KmerLoc2, SEGLEN};
 use crate::reference::binseq::{BinSeqCollection, Block};
 use crate::reference::fasta::Reference;
 use crate::reference::rrbs::{build_rrbs_index, DigestionSite};
@@ -21,8 +21,8 @@ const PREFETCH_CRT_UNIT: usize = 6;
 /// 安全的种子提取：检查边界，避免越界访问。
 /// 返回 None 如果位置超出 words 数组范围。
 #[inline]
-fn try_make_seed(words: &[u64], bit_pos: u32, seed_bits_lz: u32) -> Option<u32> {
-    let word_idx = (bit_pos / (SEGLEN as u32 * 2)) as usize;
+fn try_make_seed(words: &[u64], bit_pos: u64, seed_bits_lz: u32) -> Option<u32> {
+    let word_idx = (bit_pos / (SEGLEN as u64 * 2)) as usize;
     let bit_offset = (bit_pos % 64) as u32;
 
     if word_idx >= words.len() {
@@ -59,6 +59,9 @@ pub struct KmerIndex {
     // ── RRBS mode ──────────────────────────────────────────────────────
     /// RRBS index entries, None if not in RRBS mode.
     pub rrbs_index: Option<Vec<KmerLoc>>,
+
+    /// Seed size (k-mer length), required for RRBS position conversion.
+    pub seed_size: u32,
 }
 
 impl KmerIndex {
@@ -211,6 +214,7 @@ impl KmerIndex {
             positions,
             start_offsets,
             rrbs_index: None,
+            seed_size,
         }
     }
 
@@ -243,18 +247,14 @@ impl KmerIndex {
                 index2: Vec::new(),
                 positions: Vec::new(),
                 start_offsets: Vec::new(),
+                seed_size,
                 rrbs_index: None,
             };
         }
 
-        // 计算最大种子段数
-        let max_seed_seg = ((max_insert / seed_size) + 2) as usize;
-
         // 对每条染色体构建 RRBS 索引，同时记录每个位置的染色体 ID
-        let mut ccgg_index: Vec<Vec<Vec<(u32, u32)>>> = vec![Vec::new(); max_seed_seg];
-        for seg in 0..max_seed_seg {
-            ccgg_index[seg] = Vec::new();
-        }
+        // ccgg_index[chain] = Vec of (block_id, pos)
+        let mut ccgg_index: Vec<Vec<(u32, u32)>> = vec![Vec::new(), Vec::new()];
 
         for (chr_idx, r) in refs.iter().enumerate() {
             let chr_id = chr_idx as u32;
@@ -266,33 +266,23 @@ impl KmerIndex {
 
             let chr_ccgg = build_rrbs_index(
                 &r.seq,
-                chr_id,
                 r.len,
                 rc_offset,
                 seed_size,
-                max_seed_seg,
                 &sites,
                 min_insert,
                 max_insert,
             );
 
             // 合并到全局 ccgg_index，同时记录染色体 ID
-            for seg in 0..max_seed_seg {
-                if seg < chr_ccgg.len() {
-                    for chain in 0..2u32 {
-                        if chain as usize >= chr_ccgg[seg].len() {
-                            continue;
-                        }
-                        let block_id = chr_id * 2 + chain;
-                        let positions: Vec<(u32, u32)> = chr_ccgg[seg][chain as usize]
-                            .iter()
-                            .map(|&pos| (block_id, pos))
-                            .collect();
-                        if chain as usize >= ccgg_index[seg].len() {
-                            ccgg_index[seg].push(Vec::new());
-                        }
-                        ccgg_index[seg][chain as usize].extend(positions);
-                    }
+            for chain in 0..2u32 {
+                if (chain as usize) < chr_ccgg.len() {
+                    let block_id = chr_id * 2 + chain;
+                    let positions: Vec<(u32, u32)> = chr_ccgg[chain as usize]
+                        .iter()
+                        .map(|&pos| (block_id, pos))
+                        .collect();
+                    ccgg_index[chain as usize].extend(positions);
                 }
             }
         }
@@ -308,27 +298,71 @@ impl KmerIndex {
 
         let seed_bits_lz = (SEGLEN as u32 - seed_size) * 2;
 
-        // 遍历所有种子段和链，填充 KmerLoc
-        for seg in 0..max_seed_seg {
-            if seg >= ccgg_index.len() {
-                break;
+        // ── 前向链条目 (refcat): 匹配 read_chain=0 ──
+        // C++ FillIndex chr=0 entries: hash from bfa[0].s (forward strand),
+        // loc = seedloc (forward genomic position)
+        for chain in 0..2u32 {
+            if (chain as usize) >= ccgg_index.len() {
+                continue;
             }
-            for chain in 0..2u32 {
-                if chain as usize >= ccgg_index[seg].len() {
+            let entries = &ccgg_index[chain as usize];
+            for &(block_id, pos) in entries {
+                let chr_idx = (block_id / 2) as usize;
+                if chr_idx + 1 >= coll.ref_anchor.len() {
                     continue;
                 }
-                let entries = &ccgg_index[seg][chain as usize];
-                for &(block_id, pos) in entries {
-                    let words = if chain == 0 { coll.refcat.as_slice() } else { coll.crefcat.as_slice() };
-                    let margin_offset = (REF_MARGIN * SEGLEN) as u32;
-                    if let Some(hash) = try_make_seed(words, (pos + margin_offset) * 2, seed_bits_lz) {
-                        if (hash as usize) < rrbs_index.len() {
-                            rrbs_index[hash as usize].n1 += 1;
-                            rrbs_index[hash as usize].loc1.push(Hit {
-                                chr: block_id,
-                                loc: pos,
-                            });
-                        }
+                let anchor_pos = coll.ref_anchor[chr_idx];
+                let words = coll.refcat.as_slice();
+                let rc_offset = coll.ref_anchor[chr_idx + 1] - coll.ref_anchor[chr_idx];
+                // BSW (chain=0): pos = seedloc (前向基因组)
+                // BSC (chain=1): pos = rc_offset - seed_size - seedloc → 转为前向
+                let forward_pos = if chain == 0 {
+                    pos
+                } else {
+                    rc_offset.saturating_sub(seed_size).saturating_sub(pos)
+                };
+                if let Some(hash) = try_make_seed(words, (anchor_pos as u64 + forward_pos as u64) * 2, seed_bits_lz) {
+                    if (hash as usize) < rrbs_index.len() {
+                        rrbs_index[hash as usize].n1 += 1;
+                        rrbs_index[hash as usize].loc1.push(Hit {
+                            chr: chr_idx as u32 * 2, // ref_chain=0 for refcat-hashed entries
+                            loc: forward_pos,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── 反向互补链条目 (crefcat): 匹配 read_chain=1 ──
+        // C++ FillIndex chr=1 entries: hash from bfa[1].s (reverse complement),
+        // loc = tmp_offset - seedloc = rc_offset - seed_size - seedloc
+        for chain in 0..2u32 {
+            if (chain as usize) >= ccgg_index.len() {
+                continue;
+            }
+            let entries = &ccgg_index[chain as usize];
+            for &(block_id, pos) in entries {
+                let chr_idx = (block_id / 2) as usize;
+                if chr_idx + 1 >= coll.ref_anchor.len() {
+                    continue;
+                }
+                let anchor_pos = coll.ref_anchor[chr_idx];
+                let rc_offset = coll.ref_anchor[chr_idx + 1] - coll.ref_anchor[chr_idx];
+                let words_rev = coll.crefcat.as_slice();
+                // 计算前向基因组坐标，再转为反向互补链位置
+                let forward_pos = if chain == 0 {
+                    pos
+                } else {
+                    rc_offset.saturating_sub(seed_size).saturating_sub(pos)
+                };
+                let rev_pos = rc_offset.saturating_sub(seed_size).saturating_sub(forward_pos);
+                if let Some(hash) = try_make_seed(words_rev, (anchor_pos as u64 + rev_pos as u64) * 2, seed_bits_lz) {
+                    if (hash as usize) < rrbs_index.len() {
+                        rrbs_index[hash as usize].n1 += 1;
+                        rrbs_index[hash as usize].loc1.push(Hit {
+                            chr: block_id | 1,
+                            loc: rev_pos,
+                        });
                     }
                 }
             }
@@ -341,6 +375,7 @@ impl KmerIndex {
             positions: Vec::new(),
             start_offsets: Vec::new(),
             rrbs_index: Some(rrbs_index),
+            seed_size,
         }
     }
 
@@ -408,7 +443,7 @@ fn count_frequencies_separated(
     refcat: &[u64],
     crefcat: &[u64],
     blocks: &[Block],
-    _coll: &BinSeqCollection,
+    coll: &BinSeqCollection,
     index_interval: u32,
     seed_size: u32,
     seed_bits_lz: u32,
@@ -428,6 +463,13 @@ fn count_frequencies_separated(
             continue; // block too short for seed
         };
 
+        let chr_idx = (block.id / 2) as usize;
+        let anchor_pos = if chr_idx < coll.ref_anchor.len() {
+            coll.ref_anchor[chr_idx]
+        } else {
+            continue;
+        };
+
         // Prefetch buffer
         let mut dbs = [0u32; PREFETCH_CAL_UNIT];
 
@@ -435,10 +477,9 @@ fn count_frequencies_separated(
         let start_pos = (block.begin / index_interval) * index_interval;
         let mut ptr: u32 = 0;
         let mut pos = start_pos;
-        let margin_offset = (REF_MARGIN * SEGLEN) as u32;
         for j in 0..PREFETCH_CAL_UNIT {
             if pos <= end_seedable {
-                dbs[j] = make_seed(words, (pos + margin_offset) * 2, seed_bits_lz);
+                dbs[j] = make_seed(words, (anchor_pos as u64 + pos as u64) * 2, seed_bits_lz);
                 pos += index_interval;
             }
             ptr += 1;
@@ -453,7 +494,7 @@ fn count_frequencies_separated(
             // Prefetch next
             let next_pos = pos + prefetch;
             if next_pos <= end_seedable {
-                let next_hash = make_seed(words, (next_pos + margin_offset) * 2, seed_bits_lz);
+                let next_hash = make_seed(words, (anchor_pos as u64 + next_pos as u64) * 2, seed_bits_lz);
                 dbs[((ptr + PREFETCH_CAL_UNIT as u32) % PREFETCH_CAL_UNIT as u32)
                     as usize] = next_hash;
             }
@@ -497,15 +538,21 @@ fn fill_positions_chain(
             continue;
         };
 
+        let chr_idx = (block.id / 2) as usize;
+        let anchor_pos = if chr_idx < coll.ref_anchor.len() {
+            coll.ref_anchor[chr_idx]
+        } else {
+            continue;
+        };
+
         let mut dbs = [0u32; PREFETCH_CRT_UNIT];
 
         let start_pos = (block.begin / index_interval) * index_interval;
         let mut ptr: u32 = 0;
         let mut pos = start_pos;
-        let margin_offset = (REF_MARGIN * SEGLEN) as u32;
         for j in 0..PREFETCH_CRT_UNIT {
             if pos <= end_seedable {
-                dbs[j] = make_seed(words, (pos + margin_offset) * 2, seed_bits_lz);
+                dbs[j] = make_seed(words, (anchor_pos as u64 + pos as u64) * 2, seed_bits_lz);
                 pos += index_interval;
             }
             ptr += 1;
@@ -526,7 +573,7 @@ fn fill_positions_chain(
 
             let next_pos = pos + prefetch;
             if next_pos <= end_seedable {
-                let next_hash = make_seed(words, (next_pos + margin_offset) * 2, seed_bits_lz);
+                let next_hash = make_seed(words, (anchor_pos as u64 + next_pos as u64) * 2, seed_bits_lz);
                 dbs[((ptr + PREFETCH_CRT_UNIT as u32) % PREFETCH_CRT_UNIT as u32)
                     as usize] = next_hash;
             }

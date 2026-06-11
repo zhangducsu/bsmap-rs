@@ -353,9 +353,16 @@ impl From<&AlignArgs> for AlignConfig {
         // RRBS 模式
         config.rrbs_flag = !args.digestion_sites.is_empty();
         config.digest_sites = args.digestion_sites.clone();
+        // 匹配 C++ 行为：RRBS 模式强制 index_interval=1, chains=1
+        if config.rrbs_flag {
+            config.index_interval = 1;
+            config.chains = true;
+        }
 
-        // 链配置
-        config.chains = args.chains == 1;
+        // 链配置（RRBS 模式已在上面强制 chains=true）
+        if !config.rrbs_flag {
+            config.chains = args.chains == 1;
+        }
 
         // 碱基转换配置：解析 align_transition（如 "TC"）
         let transition_bytes = args.align_transition.as_bytes();
