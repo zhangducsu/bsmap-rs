@@ -18,6 +18,13 @@ const PREFETCH_CAL_UNIT: usize = 8;
 /// Prefetch lookahead for index filling.
 const PREFETCH_CRT_UNIT: usize = 6;
 
+/// Low bits in an RRBS hit store the C++ block id (`chr` in the original code).
+pub const RRBS_CHR_MASK: u32 = 0x0000ffff;
+/// RRBS seed mode starts at bit 16, matching C++ `(j << 16)`.
+pub const RRBS_MODE_SHIFT: u32 = 16;
+/// C++ marker for cross-chain RRBS entries.
+pub const RRBS_BSC_FLAG: u32 = 0x01000000;
+
 /// 安全的种子提取：检查边界，避免越界访问。
 /// 返回 None 如果位置超出 words 数组范围。
 #[inline]
@@ -254,7 +261,11 @@ impl KmerIndex {
 
         // 对每条染色体构建 RRBS 索引，同时记录每个位置的染色体 ID
         // ccgg_index[chain] = Vec of (block_id, pos)
-        let mut ccgg_index: Vec<Vec<(u32, u32)>> = vec![Vec::new(), Vec::new()];
+        let max_seedseg_num =
+            ((crate::param::FIXELEMENT - 1) * SEGLEN) as u32 / seed_size;
+        let total_blocks = refs.len() * 2;
+        let mut ccgg_index: Vec<Vec<Vec<(u32, u32)>>> =
+            vec![vec![Vec::new(); total_blocks]; max_seedseg_num as usize];
 
         for (chr_idx, r) in refs.iter().enumerate() {
             let chr_id = chr_idx as u32;
@@ -275,14 +286,21 @@ impl KmerIndex {
             );
 
             // 合并到全局 ccgg_index，同时记录染色体 ID
-            for chain in 0..2u32 {
-                if (chain as usize) < chr_ccgg.len() {
+            for (mode, chains) in chr_ccgg.iter().enumerate() {
+                for chain in 0..2u32 {
                     let block_id = chr_id * 2 + chain;
-                    let positions: Vec<(u32, u32)> = chr_ccgg[chain as usize]
-                        .iter()
-                        .map(|&pos| (block_id, pos))
-                        .collect();
-                    ccgg_index[chain as usize].extend(positions);
+                    let block_slot = block_id as usize;
+                    if mode >= ccgg_index.len()
+                        || block_slot >= total_blocks
+                        || (chain as usize) >= chains.len()
+                    {
+                        continue;
+                    }
+                    ccgg_index[mode][block_slot].extend(
+                        chains[chain as usize]
+                            .iter()
+                            .map(|&pos| (block_id, pos)),
+                    );
                 }
             }
         }
@@ -298,71 +316,57 @@ impl KmerIndex {
 
         let seed_bits_lz = (SEGLEN as u32 - seed_size) * 2;
 
-        // ── 前向链条目 (refcat): 匹配 read_chain=0 ──
-        // C++ FillIndex chr=0 entries: hash from bfa[0].s (forward strand),
-        // loc = seedloc (forward genomic position)
-        for chain in 0..2u32 {
-            if (chain as usize) >= ccgg_index.len() {
-                continue;
-            }
-            let entries = &ccgg_index[chain as usize];
-            for &(block_id, pos) in entries {
+        // C++ RRBS FillIndex: same-chain entries plus cross-chain entries.
+        for mode in 0..max_seedseg_num as usize {
+            for block_id in 0..total_blocks as u32 {
                 let chr_idx = (block_id / 2) as usize;
                 if chr_idx + 1 >= coll.ref_anchor.len() {
                     continue;
                 }
                 let anchor_pos = coll.ref_anchor[chr_idx];
-                let words = coll.refcat.as_slice();
                 let rc_offset = coll.ref_anchor[chr_idx + 1] - coll.ref_anchor[chr_idx];
-                // BSW (chain=0): pos = seedloc (前向基因组)
-                // BSC (chain=1): pos = rc_offset - seed_size - seedloc → 转为前向
-                let forward_pos = if chain == 0 {
-                    pos
+                let words = if block_id & 1 == 0 {
+                    coll.refcat.as_slice()
                 } else {
-                    rc_offset.saturating_sub(seed_size).saturating_sub(pos)
+                    coll.crefcat.as_slice()
                 };
-                if let Some(hash) = try_make_seed(words, (anchor_pos as u64 + forward_pos as u64) * 2, seed_bits_lz) {
-                    if (hash as usize) < rrbs_index.len() {
-                        rrbs_index[hash as usize].n1 += 1;
-                        rrbs_index[hash as usize].loc1.push(Hit {
-                            chr: chr_idx as u32 * 2, // ref_chain=0 for refcat-hashed entries
-                            loc: forward_pos,
-                        });
+                let hit_chr = block_id | ((mode as u32) << RRBS_MODE_SHIFT);
+
+                for &(_, pos) in &ccgg_index[mode][block_id as usize] {
+                    if let Some(hash) =
+                        try_make_seed(words, (anchor_pos as u64 + pos as u64) * 2, seed_bits_lz)
+                    {
+                        if let Some(bucket) = rrbs_index.get_mut(hash as usize) {
+                            bucket.n1 += 1;
+                            bucket.loc1.push(Hit {
+                                chr: hit_chr,
+                                loc: pos,
+                            });
+                        }
                     }
                 }
-            }
-        }
 
-        // ── 反向互补链条目 (crefcat): 匹配 read_chain=1 ──
-        // C++ FillIndex chr=1 entries: hash from bfa[1].s (reverse complement),
-        // loc = tmp_offset - seedloc = rc_offset - seed_size - seedloc
-        for chain in 0..2u32 {
-            if (chain as usize) >= ccgg_index.len() {
-                continue;
-            }
-            let entries = &ccgg_index[chain as usize];
-            for &(block_id, pos) in entries {
-                let chr_idx = (block_id / 2) as usize;
-                if chr_idx + 1 >= coll.ref_anchor.len() {
+                let other_block = (block_id ^ 1) as usize;
+                if other_block >= total_blocks {
                     continue;
                 }
-                let anchor_pos = coll.ref_anchor[chr_idx];
-                let rc_offset = coll.ref_anchor[chr_idx + 1] - coll.ref_anchor[chr_idx];
-                let words_rev = coll.crefcat.as_slice();
-                // 计算前向基因组坐标，再转为反向互补链位置
-                let forward_pos = if chain == 0 {
-                    pos
-                } else {
-                    rc_offset.saturating_sub(seed_size).saturating_sub(pos)
-                };
-                let rev_pos = rc_offset.saturating_sub(seed_size).saturating_sub(forward_pos);
-                if let Some(hash) = try_make_seed(words_rev, (anchor_pos as u64 + rev_pos as u64) * 2, seed_bits_lz) {
-                    if (hash as usize) < rrbs_index.len() {
-                        rrbs_index[hash as usize].n1 += 1;
-                        rrbs_index[hash as usize].loc1.push(Hit {
-                            chr: block_id | 1,
-                            loc: rev_pos,
-                        });
+                let tmp_offset = rc_offset.saturating_sub(seed_size);
+                let cross_hit_chr = hit_chr | RRBS_BSC_FLAG;
+                for &(_, other_pos) in &ccgg_index[mode][other_block] {
+                    if tmp_offset < other_pos {
+                        continue;
+                    }
+                    let loc = tmp_offset - other_pos;
+                    if let Some(hash) =
+                        try_make_seed(words, (anchor_pos as u64 + loc as u64) * 2, seed_bits_lz)
+                    {
+                        if let Some(bucket) = rrbs_index.get_mut(hash as usize) {
+                            bucket.n1 += 1;
+                            bucket.loc1.push(Hit {
+                                chr: cross_hit_chr,
+                                loc,
+                            });
+                        }
                     }
                 }
             }

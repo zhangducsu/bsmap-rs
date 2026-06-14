@@ -48,6 +48,9 @@ const INDEX_VERSION: u32 = 1;
 /// Version 2: includes refcat/crefcat data segments, supports mmap.
 const INDEX_VERSION_V2: u32 = 2;
 
+/// Version 3: version 2 layout with mode-aware RRBS hit encoding.
+const INDEX_VERSION_RRBS_MODE_AWARE: u32 = 3;
+
 /// WGBS alignment mode.
 const MODE_WGBS: u32 = 0;
 
@@ -218,7 +221,12 @@ pub fn save_index_v2(
     // ── Header (version 2) ──
     let mut header = [0u8; HEADER_SIZE];
     header[0..8].copy_from_slice(INDEX_MAGIC);
-    header[8..12].copy_from_slice(&INDEX_VERSION_V2.to_le_bytes());
+    let version = if is_rrbs {
+        INDEX_VERSION_RRBS_MODE_AWARE
+    } else {
+        INDEX_VERSION_V2
+    };
+    header[8..12].copy_from_slice(&version.to_le_bytes());
     header[12..16].copy_from_slice(&seed_size.to_le_bytes());
     let mode = if is_rrbs { MODE_RRBS } else { MODE_WGBS };
     header[16..20].copy_from_slice(&mode.to_le_bytes());
@@ -287,6 +295,7 @@ pub fn save_index_v2(
 /// Metadata read from an index file header.
 #[derive(Debug, Clone)]
 pub struct IndexMeta {
+    pub version: u32,
     pub seed_size: u32,
     pub is_rrbs: bool,
     pub total_kmers: u32,
@@ -320,12 +329,16 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
 
     // Verify version
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
-    if version != INDEX_VERSION && version != INDEX_VERSION_V2 {
+    if version != INDEX_VERSION
+        && version != INDEX_VERSION_V2
+        && version != INDEX_VERSION_RRBS_MODE_AWARE
+    {
         bail!(
-            "Unsupported index version {} (expected {} or {}): {}",
+            "Unsupported index version {} (expected {}, {}, or {}): {}",
             version,
             INDEX_VERSION,
             INDEX_VERSION_V2,
+            INDEX_VERSION_RRBS_MODE_AWARE,
             path.display()
         );
     }
@@ -362,6 +375,7 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
     }
 
     Ok(IndexMeta {
+        version,
         seed_size,
         is_rrbs: mode == MODE_RRBS,
         total_kmers,
@@ -498,7 +512,7 @@ pub fn load_index_with_mode(
         return Ok((coll, index, meta));
     }
 
-    if version != INDEX_VERSION_V2 {
+    if version != INDEX_VERSION_V2 && version != INDEX_VERSION_RRBS_MODE_AWARE {
         bail!(
             "Unsupported index version {}: {}",
             version,
@@ -660,6 +674,13 @@ pub fn is_index_compatible(
     }
 
     let meta = read_index_meta(path)?;
+    if is_rrbs && meta.version != INDEX_VERSION_RRBS_MODE_AWARE {
+        log::info!(
+            "缂撳瓨 RRBS 绱㈠紩鐗堟湰 {} 涓嶅吋瀹癸紝闇€瑕侀噸寤虹储寮?",
+            meta.version,
+        );
+        return Ok(false);
+    }
     if meta.seed_size != seed_size || meta.is_rrbs != is_rrbs {
         log::info!(
             "缓存索引不兼容: 文件 seed_size={}, mode={}，需要 seed_size={}, mode={}",

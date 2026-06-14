@@ -1,8 +1,7 @@
-//! RRBS (Reduced Representation Bisulfite Sequencing) digestion site handling.
+//! RRBS digestion site handling.
 //!
-//! Parses enzyme digestion sites (e.g., `C-CGG` for MspI), expands IUPAC
-//! ambiguity codes, and finds all cut positions in reference sequences.
-//! Mirrors C++ `Param::SetDigestionSite()` and `RefSeq::find_CCGG()`.
+//! Parses enzyme digestion sites, expands IUPAC ambiguity codes, and builds
+//! C++-compatible RRBS seed position buckets.
 
 use crate::param::SEGLEN;
 
@@ -14,6 +13,9 @@ pub struct DigestionSite {
     /// Cut position (index of '-' in original input).
     pub cut_pos: u32,
 }
+
+/// RRBS digestion positions grouped as `mode -> chain -> positions`.
+pub type RrbsModeIndex = Vec<Vec<Vec<u32>>>;
 
 /// IUPAC ambiguity code expansion table.
 const IUPAC_CODES: &[(u8, &[u8])] = &[
@@ -37,8 +39,8 @@ const IUPAC_CODES: &[(u8, &[u8])] = &[
 impl DigestionSite {
     /// Parse a digestion site specification like "C-CGG".
     ///
-    /// The '-' marks the cut position. IUPAC ambiguity codes in the
-    /// sequence are expanded to all possible concrete sequences.
+    /// The '-' marks the cut position. IUPAC ambiguity codes in the sequence
+    /// are expanded to all possible concrete sequences.
     pub fn parse(spec: &str) -> Option<Self> {
         let dash_pos = spec.find('-')?;
         let mut cleaned = spec.to_string();
@@ -65,7 +67,7 @@ fn expand_iupac(pattern: &str) -> Vec<String> {
             .iter()
             .find(|(code, _)| *code == b.to_ascii_uppercase())
             .map(|(_, exp)| *exp)
-            .unwrap_or(b"N"); // Unknown chars → N (ACGT)
+            .unwrap_or(b"N");
 
         let mut new_results = Vec::with_capacity(results.len() * expansions.len());
         for existing in &results {
@@ -83,9 +85,7 @@ fn expand_iupac(pattern: &str) -> Vec<String> {
 
 /// Find all digestion sites in a reference sequence.
 ///
-/// Returns vector of (position, rev_offset) for each site found,
-/// sorted by position. `position` is the cut site location,
-/// `rev_offset` = site_len - 2*min(cut_pos, site_len-cut_pos).
+/// Returns `(cut_position, reverse_offset)` sorted by cut position.
 pub fn find_sites(seq: &[u8], sites: &[DigestionSite]) -> Vec<(u32, u32)> {
     let mut results: Vec<(u32, u32)> = Vec::new();
 
@@ -93,10 +93,10 @@ pub fn find_sites(seq: &[u8], sites: &[DigestionSite]) -> Vec<(u32, u32)> {
         for pattern in &site.sequences {
             let min_offset = site.cut_pos.min(pattern.len() as u32 - site.cut_pos);
             let rev_offset = pattern.len() as u32 - 2 * min_offset;
-
-            // Naive string search — could use KMP/Boyer-Moore for large refs
             let pattern_bytes = pattern.as_bytes();
-            let mut search_start = 0;
+
+            // C++ RefSeq::find_CCGG starts searching at offset 1.
+            let mut search_start = 1.min(seq.len());
             while let Some(pos) = seq[search_start..]
                 .windows(pattern_bytes.len())
                 .position(|w| w.eq_ignore_ascii_case(pattern_bytes))
@@ -112,13 +112,11 @@ pub fn find_sites(seq: &[u8], sites: &[DigestionSite]) -> Vec<(u32, u32)> {
     results
 }
 
-/// Build RRBS seed index positions per chromosome (two chains: forward and reverse).
+/// Build C++-compatible RRBS seed positions for one chromosome.
 ///
-/// Returns `[bsw, bsc]` where bsw = forward chain (chain 0) positions,
-/// bsc = reverse chain (chain 1) positions.
-///
-/// 精确匹配 C++ `RefSeq::find_CCGG()`: 每对酶切位点固定生成 max_seedseg_num 个种子，
-/// 而非按片段长度限制种子数。
+/// Returns `mode -> chain -> positions`, where chain 0 is BSW and chain 1 is
+/// BSC. Each fragment contributes at most one seed position to each mode
+/// bucket, matching C++ `CCGG_index[mode][chain]`.
 pub fn build_rrbs_index(
     seq: &[u8],
     chr_size: u32,
@@ -127,25 +125,20 @@ pub fn build_rrbs_index(
     sites: &[DigestionSite],
     min_insert: u32,
     max_insert: u32,
-) -> Vec<Vec<u32>> {
+) -> RrbsModeIndex {
     use crate::param::FIXELEMENT;
+
+    let max_seedseg_num = ((FIXELEMENT - 1) * SEGLEN) as u32 / seed_size;
+    let mut by_mode = vec![vec![Vec::new(), Vec::new()]; max_seedseg_num as usize];
 
     let all_sites = find_sites(seq, sites);
     if all_sites.is_empty() {
-        return vec![Vec::new(), Vec::new()];
+        return by_mode;
     }
 
-    // max_seedseg_num = (FIXELEMENT-1) * SEGLEN / seed_size = 160 / seed_size
-    // 精确匹配 C++ param.max_seedseg_num
-    let max_seedseg_num = ((FIXELEMENT - 1) * SEGLEN) as u32 / seed_size;
     let max_pos = chr_size.saturating_sub(seed_size);
     let tmp_offset = rc_offset.saturating_sub(seed_size);
 
-    let mut bsw: Vec<u32> = Vec::new();
-    let mut bsc: Vec<u32> = Vec::new();
-
-    // Forward strand (BSW): iterate j..j+1 pairs
-    // 匹配 C++: for(i=0, seedloc=sites[j].first; i<max_seedseg_num && seedloc<=tmp_max; ...)
     for j in 0..all_sites.len().saturating_sub(1) {
         let (pos_j, _) = all_sites[j];
 
@@ -163,44 +156,41 @@ pub fn build_rrbs_index(
         }
 
         let mut seedloc = pos_j;
-        for _i in 0..max_seedseg_num {
+        for mode in 0..max_seedseg_num {
             if seedloc > max_pos {
                 break;
             }
-            bsw.push(seedloc);
+            by_mode[mode as usize][0].push(seedloc);
             seedloc += seed_size;
         }
     }
 
-    // Reverse strand (BSC): iterate j..j-1 pairs
-    // 匹配 C++: for(i=0, seedloc=site_end-seed_size; i<max_seedseg_num; ...)
     for j in 1..all_sites.len() {
         let mut seglen: i64 = 0;
         let mut found = false;
         for i in (0..j).rev() {
-            seglen =
-                (all_sites[j].0 + all_sites[j].1) as i64 - all_sites[i].0 as i64;
+            seglen = (all_sites[j].0 + all_sites[j].1) as i64 - all_sites[i].0 as i64;
             if seglen >= min_insert as i64 {
                 found = true;
                 break;
             }
         }
-        if !found || seglen > max_insert as i64 {
+        if !found || seglen < min_insert as i64 || seglen > max_insert as i64 {
             continue;
         }
 
         let site_end = all_sites[j].0 + all_sites[j].1;
         let mut seedloc = site_end.saturating_sub(seed_size) as i64;
-        for _i in 0..max_seedseg_num {
+        for mode in 0..max_seedseg_num {
             if seedloc < 0 {
                 break;
             }
-            bsc.push(tmp_offset.saturating_sub(seedloc as u32));
+            by_mode[mode as usize][1].push(tmp_offset.saturating_sub(seedloc as u32));
             seedloc -= seed_size as i64;
         }
     }
 
-    vec![bsw, bsc]
+    by_mode
 }
 
 #[cfg(test)]
@@ -216,10 +206,9 @@ mod tests {
 
     #[test]
     fn test_parse_with_iupac() {
-        // Y = C/T
         let site = DigestionSite::parse("C-YG").unwrap();
         assert_eq!(site.cut_pos, 1);
-        assert_eq!(site.sequences.len(), 2); // CCG and CTG
+        assert_eq!(site.sequences.len(), 2);
     }
 
     #[test]
@@ -231,7 +220,6 @@ mod tests {
     #[test]
     fn test_expand_iupac_ambiguous() {
         let result = expand_iupac("YG");
-        // Y→C/T, G fixed → 2 results
         assert_eq!(result.len(), 2);
         assert!(result.contains(&"CG".to_string()));
         assert!(result.contains(&"TG".to_string()));
@@ -242,8 +230,19 @@ mod tests {
         let seq = b"ACGTCCGGACGTCCGGCCGG";
         let site = DigestionSite::parse("C-CGG").unwrap();
         let results = find_sites(seq, &[site]);
-        // "CCGG" appears at positions 4 and 12, cut at C|CGG → +1
         assert_eq!(results.len(), 3);
-        assert_eq!(results[0].0, 5); // first CCGG at pos 4 + cut_pos 1
+        assert_eq!(results[0].0, 5);
+    }
+
+    #[test]
+    fn test_build_rrbs_index_is_grouped_by_mode() {
+        let seq = b"ACGTCCGGAAAAAAAAAAAAAAAAAAAAAAACCGGTTTTTTTTTTTTTTTTTTTTTTTTCCGG";
+        let site = DigestionSite::parse("C-CGG").unwrap();
+        let index = build_rrbs_index(seq, seq.len() as u32, 128, 12, &[site], 20, 1000);
+
+        assert!(index.len() > 1);
+        assert!(!index[0][0].is_empty());
+        assert!(!index[1][0].is_empty());
+        assert_ne!(index[0][0], index[1][0]);
     }
 }

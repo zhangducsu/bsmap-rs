@@ -18,11 +18,8 @@ use crate::align::seed::SeedSegment;
 use crate::param::GHit;
 use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
-use crate::reference::index::KmerIndex;
+use crate::reference::index::{KmerIndex, RRBS_CHR_MASK};
 
-/// RRBS mode: marker bit on cross-chain entries (entries converted from the opposite chain).
-/// Must match CROSS_FLAG in reference::index.
-const CROSS_FLAG: u32 = 0x1000000;
 
 /// 种子扩展比对（逐链独立）。
 ///
@@ -102,40 +99,60 @@ pub fn snp_align_segment(
         // ── RRBS mode: positions from rrbs_index ──
         if let Some(ref rrbs_idx) = index.rrbs_index {
             if (seed_hash as usize) < rrbs_idx.len() && rrbs_idx[seed_hash as usize].n1 > 0 {
+                let modeindex = segment.index as u32;
+                let max_mode = read_len / index.seed_size;
+                if max_mode == 0 || modeindex >= max_mode {
+                    continue;
+                }
+                let cmodeindex = if read_chain == 0 {
+                    modeindex
+                } else {
+                    max_mode - 1 - modeindex
+                };
+                let read_chain_mask = (read_chain as u32) << 24;
                 let hits = &rrbs_idx[seed_hash as usize].loc1;
-                for hit in hits {
-                    let ref_chain = (hit.chr & 1) as u8;
-                    let chr_idx = ((hit.chr & !CROSS_FLAG) / 2) as usize;
 
-                    let anchor = if chr_idx < coll.ref_anchor.len() { coll.ref_anchor[chr_idx] } else { continue; };
+                for hit in hits {
+                    if ((hit.chr ^ read_chain_mask) >> 16) != cmodeindex {
+                        continue;
+                    }
+
+                    let block_id = hit.chr & RRBS_CHR_MASK;
+                    let ref_chain = (block_id & 1) as u8;
+                    let chr_idx = (block_id / 2) as usize;
+                    let anchor = if chr_idx < coll.ref_anchor.len() {
+                        coll.ref_anchor[chr_idx]
+                    } else {
+                        continue;
+                    };
                     let padded_len = if chr_idx + 1 < coll.ref_anchor.len() {
                         coll.ref_anchor[chr_idx + 1] - coll.ref_anchor[chr_idx]
                     } else {
                         continue;
                     };
 
-                    // RRBS: always use forward-encoded reference (matching C++ ref.bfa).
-                    // xc64 C→T tolerance only works with forward encoding (C=01).
-                    let ref_seq = fwd_slice;
+                    if hit.loc < seed_pos_in_read {
+                        continue;
+                    }
+                    let local_start = hit.loc - seed_pos_in_read;
+                    if local_start.saturating_add(read_len) > padded_len {
+                        continue;
+                    }
 
-                    // Convert BSC → forward coordinate for ref_chain=1 entries.
-                    // BSC = padded_len - seed_size - site_fwd; solving for site_fwd:
-                    let hit_loc_fwd = if ref_chain == 1 {
-                        padded_len.saturating_sub(index.seed_size).saturating_sub(hit.loc)
-                    } else {
-                        hit.loc
-                    };
-
-                    let alignment_start = anchor.wrapping_add(hit_loc_fwd).wrapping_sub(seed_pos_in_read);
+                    let alignment_start = anchor + local_start;
                     let ref_offset = alignment_start as u64 * 2;
-                    let chr = chr_idx as u32;
-                    let loc = alignment_start.wrapping_sub(anchor);
-
+                    let ref_seq = if ref_chain == 0 { fwd_slice } else { rev_slice };
                     if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
                         continue;
                     }
 
                     let strand = (ref_chain << 1) | read_chain;
+                    let mut loc = local_start;
+                    if ref_chain == 1 {
+                        loc = padded_len.saturating_sub(read_len).saturating_sub(local_start);
+                    }
+                    let chr = chr_idx as u32;
+
                     let mm_count = count_mismatch(
                         query, ref_offset, ref_seq, mask,
                         *snp_thres, n_count, nt3,
@@ -319,7 +336,7 @@ pub fn add_hits(new_hits: Vec<GHit>, all_hits: &mut [Vec<GHit>], max_hits: usize
             continue;
         }
 
-        let key = (hit.chr >> 1, hit.loc);
+        let key = (hit.chr, hit.loc);
         if hit.gap_size != 0 {
             if !dedup_gap.insert(key) {
                 continue;

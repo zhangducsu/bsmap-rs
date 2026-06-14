@@ -26,6 +26,8 @@ use crate::alphabet::xt3;
 use crate::reads::encode::EncodedRead;
 use crate::reference::index::KmerIndex;
 
+const NO_SEED_CANDIDATES: u32 = 9_999_999;
+
 /// Seed segment 信息。
 ///
 /// 一个读段被划分为多个 seed segments，每个 segment 包含多个种子位置。
@@ -199,17 +201,51 @@ pub fn reorder_seeds_for_chain(
     let cseed_offset = if is_rrbs { map_readlen % seed_size } else { 0 };
 
     // 1. 找到最佳起始偏移（对应 C++ 的 xseed_start_offset[chain]）
-    let best_start_offset = find_best_start_offset(
-        chain_seeds,
-        index,
-        map_readlen,
-        seed_size,
-        index_interval,
-        is_rrbs,
-    );
+    let best_start_offset = if is_rrbs {
+        0
+    } else {
+        find_best_start_offset(
+            chain_seeds,
+            index,
+            map_readlen,
+            seed_size,
+            index_interval,
+            is_rrbs,
+        )
+    };
 
     // 2. 计算 segment 数量
     let num_segments = calculate_num_segments(map_readlen, seed_size, index_interval, profile);
+
+    if is_rrbs {
+        let mut segments: Vec<SeedSegment> = Vec::with_capacity(num_segments);
+        for seg_idx in 0..num_segments {
+            let profile_val = if seg_idx < profile.len() {
+                profile[seg_idx][0]
+            } else {
+                continue;
+            };
+            let seed_pos = profile_val + cseed_offset * read_chain as u32;
+            let mut segment = if seed_pos < chain_seeds.len() as u32
+                && seed_pos + seed_size <= map_readlen
+            {
+                SeedSegment::new(
+                    seg_idx,
+                    0,
+                    vec![chain_seeds[seed_pos as usize]],
+                    vec![1],
+                    vec![seed_pos],
+                )
+            } else {
+                SeedSegment::new(seg_idx, 0, Vec::new(), Vec::new(), Vec::new())
+            };
+            segment.candidates =
+                count_seeds_for_chain(&segment.seeds, &segment.reg_masks, index, true);
+            segments.push(segment);
+        }
+        segments.sort_by_key(|s| (s.candidates, s.index));
+        return segments;
+    }
 
     // 3. 为每个 segment 创建 SeedSegment
     let mut segments: Vec<SeedSegment> = Vec::with_capacity(num_segments);
@@ -440,7 +476,7 @@ fn count_seeds_at_offset(
     // Match C++: if(total==0) total=9999999
     // Without this, 0 candidates beats positive candidates, causing wrong pick
     if total == 0 {
-        u32::MAX
+        NO_SEED_CANDIDATES
     } else {
         total
     }
@@ -472,7 +508,11 @@ pub fn count_seeds_for_chain(seeds: &[u32], reg_masks: &[u32], index: &KmerIndex
         }
     }
 
-    total
+    if total == 0 {
+        NO_SEED_CANDIDATES
+    } else {
+        total
+    }
 }
 
 /// 获取指定位置的种子哈希。
