@@ -131,33 +131,26 @@ pub fn snp_align_segment(
                         continue;
                     };
 
-                    // RRBS 的 BSC hit.loc 是 reverse-complement block 坐标。
-                    // P12 验证表明扩展阶段必须先转回 forward coordinate，
-                    // 再 against refcat 做 mismatch；strand 仍由 ref_chain/read_chain 保留。
-                    let hit_loc_fwd = if ref_chain == 1 {
-                        padded_len
-                            .saturating_sub(index.seed_size)
-                            .saturating_sub(hit.loc)
-                    } else {
-                        hit.loc
-                    };
-
-                    if hit_loc_fwd < seed_pos_in_read {
+                    if hit.loc < seed_pos_in_read {
                         continue;
                     }
-                    let local_start = hit_loc_fwd - seed_pos_in_read;
+                    let local_start = hit.loc - seed_pos_in_read;
                     if local_start.saturating_add(read_len) > padded_len {
                         continue;
                     }
 
                     let alignment_start = anchor + local_start;
                     let ref_offset = alignment_start as u64 * 2;
-                    let ref_seq = fwd_slice;
+                    let ref_seq = if ref_chain == 0 { fwd_slice } else { rev_slice };
                     if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
                         continue;
                     }
 
                     let strand = (ref_chain << 1) | read_chain;
+                    let mut loc = local_start;
+                    if ref_chain == 1 {
+                        loc = padded_len.saturating_sub(read_len).saturating_sub(local_start);
+                    }
                     let chr = chr_idx as u32;
 
                     let mm_count = count_mismatch(
@@ -170,7 +163,7 @@ pub fn snp_align_segment(
                         level_counts[snp_level] += 1;
                         all_hits.push(GHit {
                             chr,
-                            loc: local_start,
+                            loc,
                             snps: mm_count as u8,
                             strand,
                             gap_size: 0,
@@ -193,7 +186,7 @@ pub fn snp_align_segment(
                             level_counts[gap_snps] += 1;
                             all_hits.push(GHit {
                                 chr,
-                                loc: local_start,
+                                loc,
                                 snps: gap_result.snp_count as u8,
                                 strand,
                                 gap_size: gap_result.gap_size as i16,
