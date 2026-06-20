@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 
 use crate::align::extend::{add_hits, clear_hits, dedup_hits, is_unique_hit, select_best_hits, snp_align_segment};
-use crate::align::seed::{extract_seeds, reorder_seeds_for_chain};
+use crate::align::seed::{extract_seeds, reorder_seeds_for_chain_with_cross_chain};
 use crate::param::{AlignConfig, GHit, MAXSNPS};
 use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
@@ -164,11 +164,12 @@ impl SingleAlign {
 
         // 预计算两条链的 segments（C++ 逐 segment 处理架构）
         // 仅对启用的链（xflag_chain）进行重排序
+        let cross_chain_enabled = config.paired_end || config.chains;
         let chain0_segments: Option<Vec<_>> =
             if !xflag_chain0 || seeds.get(0).map_or(true, |s| s.is_empty()) {
                 None
             } else {
-                Some(reorder_seeds_for_chain(
+                Some(reorder_seeds_for_chain_with_cross_chain(
                     &seeds[0],
                     index,
                     config.seed_size,
@@ -177,13 +178,14 @@ impl SingleAlign {
                     read_len,
                     config.rrbs_flag,
                     0,
+                    cross_chain_enabled,
                 ))
             };
         let chain1_segments: Option<Vec<_>> =
             if !xflag_chain1 || seeds.get(1).map_or(true, |s| s.is_empty()) {
                 None
             } else {
-                Some(reorder_seeds_for_chain(
+                Some(reorder_seeds_for_chain_with_cross_chain(
                     &seeds[1],
                     index,
                     config.seed_size,
@@ -192,6 +194,7 @@ impl SingleAlign {
                     read_len,
                     config.rrbs_flag,
                     1,
+                    cross_chain_enabled,
                 ))
             };
 

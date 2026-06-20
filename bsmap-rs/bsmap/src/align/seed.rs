@@ -24,7 +24,7 @@
 
 use crate::alphabet::xt3;
 use crate::reads::encode::EncodedRead;
-use crate::reference::index::KmerIndex;
+use crate::reference::index::{KmerIndex, RRBS_BSC_FLAG};
 
 const NO_SEED_CANDIDATES: u32 = 9_999_999;
 
@@ -186,6 +186,9 @@ pub fn find_best_start_offset(
 ///
 /// 对应 C++ `ReorderSeed()` + `AdjustSeedStartArray()`。
 /// 逐链独立执行：选择最佳偏移、创建 segments、调整起始位置、排序。
+///
+/// 此兼容入口保持历史行为并计入全部 RRBS hit；能取得运行参数的调用方应使用
+/// [`reorder_seeds_for_chain_with_cross_chain`] 显式传入 `paired_end || chains`。
 pub fn reorder_seeds_for_chain(
     chain_seeds: &[u32],
     index: &KmerIndex,
@@ -195,6 +198,34 @@ pub fn reorder_seeds_for_chain(
     map_readlen: u32,
     is_rrbs: bool,
     read_chain: u8,
+) -> Vec<SeedSegment> {
+    reorder_seeds_for_chain_with_cross_chain(
+        chain_seeds,
+        index,
+        seed_size,
+        index_interval,
+        profile,
+        map_readlen,
+        is_rrbs,
+        read_chain,
+        true,
+    )
+}
+
+/// 为单条 read chain 重排 seed segment，并显式控制 RRBS cross-chain 候选计数。
+///
+/// C++ 仅在 `pairend || chains` 时把带 `RRBS_BSC_FLAG` 的 hit 加入 RRBS 索引。
+/// Rust 索引保存两类 hit 的超集，因此在 seed 计数阶段按同一条件过滤。
+pub fn reorder_seeds_for_chain_with_cross_chain(
+    chain_seeds: &[u32],
+    index: &KmerIndex,
+    seed_size: u32,
+    index_interval: u32,
+    profile: &[[u32; 16]],
+    map_readlen: u32,
+    is_rrbs: bool,
+    read_chain: u8,
+    cross_chain_enabled: bool,
 ) -> Vec<SeedSegment> {
     // C++ RRBS: cseed_offset = map_readlen % seed_size
     // 用于 read_chain=1 时偏移种子位置，补偿 RC 编码的相位差
@@ -239,8 +270,13 @@ pub fn reorder_seeds_for_chain(
             } else {
                 SeedSegment::new(seg_idx, 0, Vec::new(), Vec::new(), Vec::new())
             };
-            segment.candidates =
-                count_seeds_for_chain(&segment.seeds, &segment.reg_masks, index, true);
+            segment.candidates = count_seeds_for_chain_with_cross_chain(
+                &segment.seeds,
+                &segment.reg_masks,
+                index,
+                true,
+                cross_chain_enabled,
+            );
             segments.push(segment);
         }
         segments.sort_by_key(|s| (s.candidates, s.index));
@@ -483,7 +519,26 @@ fn count_seeds_at_offset(
 }
 
 /// 统计某个 segment 的总候选数（逐链独立）。
-pub fn count_seeds_for_chain(seeds: &[u32], reg_masks: &[u32], index: &KmerIndex, is_rrbs: bool) -> u32 {
+///
+/// 此兼容入口保持历史行为并计入全部 RRBS hit。
+pub fn count_seeds_for_chain(
+    seeds: &[u32],
+    reg_masks: &[u32],
+    index: &KmerIndex,
+    is_rrbs: bool,
+) -> u32 {
+    count_seeds_for_chain_with_cross_chain(seeds, reg_masks, index, is_rrbs, true)
+}
+
+/// 统计单条 read chain 的 seed 候选数，并按 C++ `pairend || chains` 语义过滤
+/// RRBS cross-chain hit。WGBS 不使用该标记，行为不受 `cross_chain_enabled` 影响。
+pub fn count_seeds_for_chain_with_cross_chain(
+    seeds: &[u32],
+    reg_masks: &[u32],
+    index: &KmerIndex,
+    is_rrbs: bool,
+    cross_chain_enabled: bool,
+) -> u32 {
     let mut total: u32 = 0;
 
     if is_rrbs {
@@ -493,7 +548,16 @@ pub fn count_seeds_for_chain(seeds: &[u32], reg_masks: &[u32], index: &KmerIndex
                     continue;
                 }
                 if (seed as usize) < rrbs_idx.len() {
-                    total += rrbs_idx[seed as usize].n1;
+                    let bucket = &rrbs_idx[seed as usize];
+                    total += if cross_chain_enabled {
+                        bucket.n1
+                    } else {
+                        bucket
+                            .loc1
+                            .iter()
+                            .filter(|hit| hit.chr & RRBS_BSC_FLAG == 0)
+                            .count() as u32
+                    };
                 }
             }
         }
@@ -543,7 +607,7 @@ pub fn count_n_bases(encoded: &EncodedRead) -> u32 {
 mod tests {
     use super::*;
     use crate::alphabet::pack_forward;
-    use crate::param::{ReadInf, MAXSNPS, SEGLEN};
+    use crate::param::{Hit, KmerLoc, KmerLoc2, ReadInf, MAXSNPS, SEGLEN};
 
     fn make_test_read(seq: &[u8]) -> EncodedRead {
         let read = ReadInf {
@@ -605,6 +669,158 @@ mod tests {
         assert_eq!(seeds.len(), 2);
         assert!(!seeds[0].is_empty(), "正向链应该有种子");
         assert!(!seeds[1].is_empty(), "反向链应该有种子");
+    }
+
+    fn make_rrbs_count_index(buckets: Vec<KmerLoc>) -> KmerIndex {
+        KmerIndex {
+            total_kmers: buckets.len() as u32,
+            max_kmer_num: u32::MAX,
+            index2: Vec::new(),
+            positions: Vec::new(),
+            start_offsets: Vec::new(),
+            rrbs_index: Some(buckets),
+            seed_size: 2,
+        }
+    }
+
+    #[test]
+    fn test_rrbs_count_seeds_filters_cross_chain_hits_when_disabled() {
+        let bucket = KmerLoc {
+            n1: 4,
+            loc1: vec![
+                Hit { chr: 0, loc: 10 },
+                Hit { chr: 2, loc: 20 },
+                Hit {
+                    chr: RRBS_BSC_FLAG,
+                    loc: 30,
+                },
+                Hit {
+                    chr: RRBS_BSC_FLAG | 2,
+                    loc: 40,
+                },
+            ],
+        };
+        let index = make_rrbs_count_index(vec![KmerLoc {
+            n1: 0,
+            loc1: Vec::new(),
+        }, bucket]);
+
+        assert_eq!(
+            count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, true, false),
+            2,
+            "SE 默认模式只统计 normal RRBS hit"
+        );
+        assert_eq!(
+            count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, true, true),
+            4,
+            "PE 或 -n 1 模式统计 normal 与 BSC hit"
+        );
+    }
+
+    #[test]
+    fn test_rrbs_cross_chain_filter_changes_segment_order() {
+        let empty = KmerLoc {
+            n1: 0,
+            loc1: Vec::new(),
+        };
+        let mostly_cross_chain = KmerLoc {
+            n1: 5,
+            loc1: vec![
+                Hit { chr: 0, loc: 10 },
+                Hit {
+                    chr: RRBS_BSC_FLAG,
+                    loc: 20,
+                },
+                Hit {
+                    chr: RRBS_BSC_FLAG,
+                    loc: 30,
+                },
+                Hit {
+                    chr: RRBS_BSC_FLAG,
+                    loc: 40,
+                },
+                Hit {
+                    chr: RRBS_BSC_FLAG,
+                    loc: 50,
+                },
+            ],
+        };
+        let normal_only = KmerLoc {
+            n1: 2,
+            loc1: vec![
+                Hit {
+                    chr: 1 << 16,
+                    loc: 60,
+                },
+                Hit {
+                    chr: 1 << 16,
+                    loc: 70,
+                },
+            ],
+        };
+        let index = make_rrbs_count_index(vec![empty, mostly_cross_chain, normal_only]);
+        let chain_seeds = vec![1, 0, 2];
+        let mut profile = [[4u32; 16]; MAXSNPS as usize + 1];
+        profile[0][0] = 0;
+        profile[1][0] = 2;
+
+        let se_segments = reorder_seeds_for_chain_with_cross_chain(
+            &chain_seeds,
+            &index,
+            2,
+            1,
+            &profile,
+            4,
+            true,
+            0,
+            false,
+        );
+        assert_eq!(
+            se_segments
+                .iter()
+                .map(|segment| (segment.index, segment.candidates))
+                .collect::<Vec<_>>(),
+            vec![(0, 1), (1, 2)]
+        );
+
+        let cross_chain_segments = reorder_seeds_for_chain_with_cross_chain(
+            &chain_seeds,
+            &index,
+            2,
+            1,
+            &profile,
+            4,
+            true,
+            0,
+            true,
+        );
+        assert_eq!(
+            cross_chain_segments
+                .iter()
+                .map(|segment| (segment.index, segment.candidates))
+                .collect::<Vec<_>>(),
+            vec![(1, 2), (0, 5)]
+        );
+    }
+
+    #[test]
+    fn test_cross_chain_setting_does_not_change_wgbs_count() {
+        let index = KmerIndex {
+            total_kmers: 2,
+            max_kmer_num: u32::MAX,
+            index2: vec![KmerLoc2 { n: [0, 0] }, KmerLoc2 { n: [2, 1] }],
+            positions: vec![10, 20, 30],
+            start_offsets: vec![0, 0],
+            rrbs_index: None,
+            seed_size: 2,
+        };
+
+        let disabled =
+            count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, false, false);
+        let enabled =
+            count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, false, true);
+        assert_eq!(disabled, 3);
+        assert_eq!(enabled, disabled);
     }
 
     #[test]
