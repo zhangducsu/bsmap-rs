@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "run": {
+    "id": "20260621T120000Z-1234",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
+    "repo_dirty": false
+  },
+  "benchmarks": {
+    "cpp_pe": {
+      "implementation": "cpp",
+      "layout": "PE",
+      "command": "/tmp/p13_codex_github/bsmap-original/bsmap-2.90/bsmap ...",
+      "exit_code": 134,
+      "time": {
+        "wall": "0:01.23",
+        "user_seconds": 1.0,
+        "system_seconds": 0.2,
+        "cpu_percent": 97.0,
+        "max_rss_kb": 123456
+      }
+    }
+  },
+  "sha256": {
+    "binary": {
+      "rust": {
+        "sha256": "<64 hex characters>",
+        "path": "/tmp/p13_codex_github/bsmap-rs/target/release/bsmap"
+      }
+    }
+  },
+  "sam_stats": {
+    "pe": {
+      "exit_code": 0,
+      "result": {
+        "cpp": {},
+        "rust": {},
+        "compare": {}
+      }
+    }
+  },
+  "failed_cases": [
+    "cpp_pe"
+  ]
+}
