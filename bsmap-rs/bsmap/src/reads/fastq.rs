@@ -134,8 +134,13 @@ impl FastqReader {
                 continue;
             }
 
-            // 提取名称（去掉首尾空白）
-            let name = record.id().to_vec();
+            // SAM QNAME 仅使用首个 ASCII 空白前的 token，保留配对后缀。
+            let name = record
+                .id()
+                .split(|byte| byte.is_ascii_whitespace())
+                .next()
+                .unwrap_or_default()
+                .to_vec();
 
             // 提取序列并转为大写
             let mut seq: Vec<u8> = record.seq().to_vec();
@@ -216,6 +221,53 @@ mod tests {
         assert_eq!(batch[0].seq, b"ACGTACGT");
         assert!(batch[0].qual.is_empty(), "FASTA 格式应无质量值");
         assert!(reader.is_fasta(), "应检测为 FASTA 格式");
+    }
+
+    #[test]
+    fn test_illumina_header_uses_first_token() {
+        let data = b"@M00176:17:000000000-A3JHG:1:1101:15389:1380 1:N:0:1\nACGT\n+\nIIII\n";
+        let mut reader = FastqReader::from_read(Cursor::new(&data[..])).unwrap();
+        let mut batch = Vec::new();
+        let mut start = 1u32;
+
+        reader
+            .read_batch(&mut batch, 1, &mut start, u32::MAX)
+            .unwrap();
+
+        assert_eq!(
+            batch[0].name,
+            b"M00176:17:000000000-A3JHG:1:1101:15389:1380"
+        );
+    }
+
+    #[test]
+    fn test_pair_suffixes_are_preserved() {
+        let data = b"@paired/1 first mate\nACGT\n+\nIIII\n@paired/2\tsecond mate\nTGCA\n+\nIIII\n";
+        let mut reader = FastqReader::from_read(Cursor::new(&data[..])).unwrap();
+        let mut batch = Vec::new();
+        let mut start = 1u32;
+
+        reader
+            .read_batch(&mut batch, 2, &mut start, u32::MAX)
+            .unwrap();
+
+        assert_eq!(batch[0].name, b"paired/1");
+        assert_eq!(batch[1].name, b"paired/2");
+    }
+
+    #[test]
+    fn test_fasta_header_uses_first_token() {
+        let data = b">contig_read description with spaces\nACGT\n";
+        let mut reader = FastqReader::from_read(Cursor::new(&data[..])).unwrap();
+        let mut batch = Vec::new();
+        let mut start = 1u32;
+
+        reader
+            .read_batch(&mut batch, 1, &mut start, u32::MAX)
+            .unwrap();
+
+        assert_eq!(batch[0].name, b"contig_read");
+        assert!(batch[0].qual.is_empty());
     }
 
     #[test]

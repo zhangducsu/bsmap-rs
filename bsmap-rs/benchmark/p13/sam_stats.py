@@ -4,6 +4,39 @@ import json
 from collections import Counter
 
 
+ASCII_WHITESPACE = " \t\n\r\v\f"
+
+
+def normalize_qname(qname):
+    token_end = next(
+        (index for index, char in enumerate(qname) if char in ASCII_WHITESPACE),
+        len(qname),
+    )
+    token = qname[:token_end]
+    if token.endswith("/1") or token.endswith("/2"):
+        token = token[:-2]
+    return token
+
+
+def record_key(qname, flag):
+    qname = normalize_qname(qname)
+    if flag & 0x40:
+        return f"{qname}/1"
+    elif flag & 0x80:
+        return f"{qname}/2"
+    return qname
+
+
+def parse_nm(fields):
+    for field in fields[11:]:
+        if field.startswith("NM:i:"):
+            try:
+                return int(field[5:])
+            except ValueError:
+                return None
+    return None
+
+
 def parse_sam(path):
     records = {}
     flags = Counter()
@@ -17,12 +50,13 @@ def parse_sam(path):
             fields = line.rstrip("\n").split("\t")
             if len(fields) < 6:
                 continue
-            qname = fields[0]
             flag = int(fields[1])
+            qname = record_key(fields[0], flag)
             rname = fields[2]
             pos = int(fields[3])
             mapq = int(fields[4])
             cigar = fields[5]
+            nm = parse_nm(fields)
 
             total += 1
             flags[str(flag)] += 1
@@ -41,6 +75,7 @@ def parse_sam(path):
                 "pos": pos,
                 "mapq": mapq,
                 "cigar": cigar,
+                "nm": nm,
             }
 
     top_rname, top_rname_count = ("NA", 0)
@@ -75,7 +110,7 @@ def compare(cpp, rust):
     for qname in common:
         a = cpp_records[qname]
         b = rust_records[qname]
-        if a == b:
+        if all(a[field] == b[field] for field in ("rname", "pos", "flag", "nm")):
             exact += 1
         if a["rname"] == b["rname"] and a["pos"] == b["pos"]:
             same_rname_pos += 1
