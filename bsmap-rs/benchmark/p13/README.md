@@ -20,6 +20,13 @@ bash bsmap-rs/benchmark/p13/run_docker_mm10.sh
 bash bsmap-rs/benchmark/p13/run_docker_mm10.sh /path/to/checkout /path/to/runs
 ```
 
+若二进制不在仓库默认位置，可通过环境变量覆盖：
+
+```bash
+CPP_BINARY=/workspace/03_project/bsmap-2.90/bsmap \
+  bash bsmap-rs/benchmark/p13/run_docker_mm10.sh /path/to/checkout /path/to/runs
+```
+
 runner 不负责 clone、build 或服务器连接，只在当前 Docker 环境验证已构建 binary。固定输入与 binary 为：
 
 | 项目 | 路径 |
