@@ -180,13 +180,11 @@ pub fn build_rrbs_index(
         }
 
         let site_end = all_sites[j].0 + all_sites[j].1;
-        let mut seedloc = site_end.saturating_sub(seed_size) as i64;
+        // C++ uses unsigned bit32_t here, so the reverse seed walk wraps.
+        let mut seedloc = site_end.wrapping_sub(seed_size);
         for mode in 0..max_seedseg_num {
-            if seedloc < 0 {
-                break;
-            }
-            by_mode[mode as usize][1].push(tmp_offset.saturating_sub(seedloc as u32));
-            seedloc -= seed_size as i64;
+            by_mode[mode as usize][1].push(tmp_offset.wrapping_sub(seedloc));
+            seedloc = seedloc.wrapping_sub(seed_size);
         }
     }
 
@@ -244,5 +242,14 @@ mod tests {
         assert!(!index[0][0].is_empty());
         assert!(!index[1][0].is_empty());
         assert_ne!(index[0][0], index[1][0]);
+    }
+
+    #[test]
+    fn test_build_rrbs_index_wraps_reverse_seed_walk_like_cpp() {
+        let seq = b"ACGTCCGGAAAAAAAAAAAAAAAAAAAAAAACCGGTTTTTTTTTTTTTTTTTTTTTTTTCCGG";
+        let site = DigestionSite::parse("C-CGG").unwrap();
+        let index = build_rrbs_index(seq, seq.len() as u32, 128, 12, &[site], 20, 1000);
+
+        assert!(index.iter().all(|mode| !mode[1].is_empty()));
     }
 }
