@@ -2,13 +2,13 @@
 //!
 //! Builds a hash-table index over all k-mers (seeds) in the reference
 //! genome. For WGBS mode, uses `KmerLoc2` with flat position storage.
-//! For RRBS mode, uses `KmerLoc` with per-site Hit storage.
+//! For RRBS mode, uses one offset table and a flat `Hit` array.
 //!
 //! Mirrors C++ `RefSeq::InitialIndex()`, `CalKmerFreq()`, `AllocIndex()`,
 //! `FillIndex()`, and `FinishIndex()`.
 
 use crate::alphabet::make_seed;
-use crate::param::{Hit, KmerLoc, KmerLoc2, SEGLEN};
+use crate::param::{Hit, KmerLoc2, SEGLEN};
 use crate::reference::binseq::{BinSeqCollection, Block};
 use crate::reference::fasta::Reference;
 use crate::reference::rrbs::{build_rrbs_index, DigestionSite};
@@ -64,8 +64,11 @@ pub struct KmerIndex {
     pub(crate) start_offsets: Vec<u32>,
 
     // ── RRBS mode ──────────────────────────────────────────────────────
-    /// RRBS index entries, None if not in RRBS mode.
-    pub rrbs_index: Option<Vec<KmerLoc>>,
+    /// RRBS bucket boundaries. Bucket `i` is
+    /// `rrbs_hits[rrbs_offsets[i]..rrbs_offsets[i + 1]]`.
+    pub rrbs_offsets: Vec<u32>,
+    /// Flat RRBS hit storage in the same order as C++ `FillIndex()`.
+    pub rrbs_hits: Vec<Hit>,
 
     /// Seed size (k-mer length), required for RRBS position conversion.
     pub seed_size: u32,
@@ -220,7 +223,8 @@ impl KmerIndex {
             index2,
             positions,
             start_offsets,
-            rrbs_index: None,
+            rrbs_offsets: Vec::new(),
+            rrbs_hits: Vec::new(),
             seed_size,
         }
     }
@@ -255,7 +259,8 @@ impl KmerIndex {
                 positions: Vec::new(),
                 start_offsets: Vec::new(),
                 seed_size,
-                rrbs_index: None,
+                rrbs_offsets: Vec::new(),
+                rrbs_hits: Vec::new(),
             };
         }
 
@@ -305,72 +310,40 @@ impl KmerIndex {
             }
         }
 
-        // 使用 ccgg_index 构建 KmerLoc 索引
-        let mut rrbs_index: Vec<KmerLoc> = vec![
-            KmerLoc {
-                n1: 0,
-                loc1: Vec::new(),
-            };
-            total_kmers as usize
-        ];
-
         let seed_bits_lz = (SEGLEN as u32 - seed_size) * 2;
 
-        // C++ RRBS FillIndex: same-chain entries plus cross-chain entries.
-        for mode in 0..max_seedseg_num as usize {
-            for block_id in 0..total_blocks as u32 {
-                let chr_idx = (block_id / 2) as usize;
-                if chr_idx + 1 >= coll.ref_anchor.len() {
-                    continue;
-                }
-                let anchor_pos = coll.ref_anchor[chr_idx];
-                let rc_offset = coll.ref_anchor[chr_idx + 1] - coll.ref_anchor[chr_idx];
-                let words = if block_id & 1 == 0 {
-                    coll.refcat.as_slice()
-                } else {
-                    coll.crefcat.as_slice()
-                };
-                let hit_chr = block_id | ((mode as u32) << RRBS_MODE_SHIFT);
+        // Count first, then allocate exactly once. This preserves C++ hit order
+        // while avoiding one heap allocation and spare capacity per k-mer.
+        let mut counts = vec![0u32; total_kmers as usize];
+        visit_rrbs_hits(
+            coll,
+            &ccgg_index,
+            total_blocks,
+            seed_size,
+            seed_bits_lz,
+            |hash, _| counts[hash] = counts[hash].checked_add(1).expect("RRBS hit count overflow"),
+        );
 
-                for &(_, pos) in &ccgg_index[mode][block_id as usize] {
-                    if let Some(hash) =
-                        try_make_seed(words, (anchor_pos as u64 + pos as u64) * 2, seed_bits_lz)
-                    {
-                        if let Some(bucket) = rrbs_index.get_mut(hash as usize) {
-                            bucket.n1 += 1;
-                            bucket.loc1.push(Hit {
-                                chr: hit_chr,
-                                loc: pos,
-                            });
-                        }
-                    }
-                }
-
-                let other_block = (block_id ^ 1) as usize;
-                if other_block >= total_blocks {
-                    continue;
-                }
-                let tmp_offset = rc_offset.saturating_sub(seed_size);
-                let cross_hit_chr = hit_chr | RRBS_BSC_FLAG;
-                for &(_, other_pos) in &ccgg_index[mode][other_block] {
-                    if tmp_offset < other_pos {
-                        continue;
-                    }
-                    let loc = tmp_offset - other_pos;
-                    if let Some(hash) =
-                        try_make_seed(words, (anchor_pos as u64 + loc as u64) * 2, seed_bits_lz)
-                    {
-                        if let Some(bucket) = rrbs_index.get_mut(hash as usize) {
-                            bucket.n1 += 1;
-                            bucket.loc1.push(Hit {
-                                chr: cross_hit_chr,
-                                loc,
-                            });
-                        }
-                    }
-                }
-            }
+        let mut rrbs_offsets = vec![0u32; total_kmers as usize + 1];
+        for (i, &count) in counts.iter().enumerate() {
+            rrbs_offsets[i + 1] = rrbs_offsets[i]
+                .checked_add(count)
+                .expect("RRBS flat index exceeds u32 offsets");
         }
+        let mut rrbs_hits = vec![Hit::default(); rrbs_offsets[total_kmers as usize] as usize];
+        let mut write_offsets = rrbs_offsets[..total_kmers as usize].to_vec();
+        visit_rrbs_hits(
+            coll,
+            &ccgg_index,
+            total_blocks,
+            seed_size,
+            seed_bits_lz,
+            |hash, hit| {
+                let offset = write_offsets[hash] as usize;
+                rrbs_hits[offset] = hit;
+                write_offsets[hash] += 1;
+            },
+        );
 
         Self {
             total_kmers,
@@ -378,7 +351,8 @@ impl KmerIndex {
             index2: Vec::new(),
             positions: Vec::new(),
             start_offsets: Vec::new(),
-            rrbs_index: Some(rrbs_index),
+            rrbs_offsets,
+            rrbs_hits,
             seed_size,
         }
     }
@@ -434,6 +408,73 @@ impl KmerIndex {
         let fwd_slice = &self.positions[start..start + fwd_count];
         let rev_slice = &self.positions[start + fwd_count..start + fwd_count + rev_count];
         (fwd_slice, rev_slice)
+    }
+
+    /// Look up one RRBS k-mer bucket in flat storage.
+    #[inline]
+    pub fn lookup_rrbs(&self, seed_hash: u32) -> &[Hit] {
+        let idx = seed_hash as usize;
+        if idx + 1 >= self.rrbs_offsets.len() {
+            return &[];
+        }
+        let start = self.rrbs_offsets[idx] as usize;
+        let end = self.rrbs_offsets[idx + 1] as usize;
+        self.rrbs_hits.get(start..end).unwrap_or(&[])
+    }
+}
+
+fn visit_rrbs_hits<F>(
+    coll: &BinSeqCollection,
+    ccgg_index: &[Vec<Vec<(u32, u32)>>],
+    total_blocks: usize,
+    seed_size: u32,
+    seed_bits_lz: u32,
+    mut visit: F,
+) where
+    F: FnMut(usize, Hit),
+{
+    for (mode, mode_blocks) in ccgg_index.iter().enumerate() {
+        for block_id in 0..total_blocks as u32 {
+            let chr_idx = (block_id / 2) as usize;
+            if chr_idx + 1 >= coll.ref_anchor.len() {
+                continue;
+            }
+            let anchor = coll.ref_anchor[chr_idx];
+            let rc_offset = coll.ref_anchor[chr_idx + 1] - anchor;
+            let words = if block_id & 1 == 0 {
+                coll.refcat.as_slice()
+            } else {
+                coll.crefcat.as_slice()
+            };
+            let hit_chr = block_id | ((mode as u32) << RRBS_MODE_SHIFT);
+
+            for &(_, loc) in &mode_blocks[block_id as usize] {
+                if let Some(hash) =
+                    try_make_seed(words, (anchor as u64 + loc as u64) * 2, seed_bits_lz)
+                {
+                    visit(hash as usize, Hit { chr: hit_chr, loc });
+                }
+            }
+
+            let other_block = (block_id ^ 1) as usize;
+            let tmp_offset = rc_offset.saturating_sub(seed_size);
+            let cross_hit_chr = hit_chr | RRBS_BSC_FLAG;
+            for &(_, other_pos) in &mode_blocks[other_block] {
+                if let Some(loc) = tmp_offset.checked_sub(other_pos) {
+                    if let Some(hash) =
+                        try_make_seed(words, (anchor as u64 + loc as u64) * 2, seed_bits_lz)
+                    {
+                        visit(
+                            hash as usize,
+                            Hit {
+                                chr: cross_hit_chr,
+                                loc,
+                            },
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

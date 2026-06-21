@@ -159,11 +159,7 @@ pub fn find_best_start_offset(
         while pos + seed_size <= map_readlen && seed_idx < chain_seeds.len() {
             let seed_hash = chain_seeds[seed_idx];
             if is_rrbs {
-                if let Some(ref rrbs_idx) = index.rrbs_index {
-                    if (seed_hash as usize) < rrbs_idx.len() {
-                        total_candidates += rrbs_idx[seed_hash as usize].n1;
-                    }
-                }
+                total_candidates += index.lookup_rrbs(seed_hash).len() as u32;
             } else {
                 let (fwd, rev) = index.lookup_separated(seed_hash);
                 total_candidates += (fwd.len() + rev.len()) as u32;
@@ -497,11 +493,7 @@ fn count_seeds_at_offset(
         if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
             let seed_hash = chain_seeds[seed_pos as usize];
             if is_rrbs {
-                if let Some(ref rrbs_idx) = index.rrbs_index {
-                    if (seed_hash as usize) < rrbs_idx.len() {
-                        total += rrbs_idx[seed_hash as usize].n1;
-                    }
-                }
+                total += index.lookup_rrbs(seed_hash).len() as u32;
             } else {
                 let (fwd, rev) = index.lookup_separated(seed_hash);
                 total += (fwd.len() + rev.len()) as u32;
@@ -542,24 +534,18 @@ pub fn count_seeds_for_chain_with_cross_chain(
     let mut total: u32 = 0;
 
     if is_rrbs {
-        if let Some(ref rrbs_idx) = index.rrbs_index {
-            for (i, &seed) in seeds.iter().enumerate() {
-                if i < reg_masks.len() && reg_masks[i] == 0 {
-                    continue;
-                }
-                if (seed as usize) < rrbs_idx.len() {
-                    let bucket = &rrbs_idx[seed as usize];
-                    total += if cross_chain_enabled {
-                        bucket.n1
-                    } else {
-                        bucket
-                            .loc1
-                            .iter()
-                            .filter(|hit| hit.chr & RRBS_BSC_FLAG == 0)
-                            .count() as u32
-                    };
-                }
+        for (i, &seed) in seeds.iter().enumerate() {
+            if i < reg_masks.len() && reg_masks[i] == 0 {
+                continue;
             }
+            let hits = index.lookup_rrbs(seed);
+            total += if cross_chain_enabled {
+                hits.len() as u32
+            } else {
+                hits.iter()
+                    .filter(|hit| hit.chr & RRBS_BSC_FLAG == 0)
+                    .count() as u32
+            };
         }
     } else {
         // Match C++: CountSeeds uses ref.index2[s].n[0] which in C++ is total of both chains
@@ -607,7 +593,7 @@ pub fn count_n_bases(encoded: &EncodedRead) -> u32 {
 mod tests {
     use super::*;
     use crate::alphabet::pack_forward;
-    use crate::param::{Hit, KmerLoc, KmerLoc2, ReadInf, MAXSNPS, SEGLEN};
+    use crate::param::{Hit, KmerLoc2, ReadInf, MAXSNPS, SEGLEN};
 
     fn make_test_read(seq: &[u8]) -> EncodedRead {
         let read = ReadInf {
@@ -671,23 +657,29 @@ mod tests {
         assert!(!seeds[1].is_empty(), "反向链应该有种子");
     }
 
-    fn make_rrbs_count_index(buckets: Vec<KmerLoc>) -> KmerIndex {
+    fn make_rrbs_count_index(buckets: Vec<Vec<Hit>>) -> KmerIndex {
+        let mut rrbs_offsets = Vec::with_capacity(buckets.len() + 1);
+        let mut rrbs_hits = Vec::new();
+        rrbs_offsets.push(0);
+        for bucket in buckets {
+            rrbs_hits.extend(bucket);
+            rrbs_offsets.push(rrbs_hits.len() as u32);
+        }
         KmerIndex {
-            total_kmers: buckets.len() as u32,
+            total_kmers: rrbs_offsets.len().saturating_sub(1) as u32,
             max_kmer_num: u32::MAX,
             index2: Vec::new(),
             positions: Vec::new(),
             start_offsets: Vec::new(),
-            rrbs_index: Some(buckets),
+            rrbs_offsets,
+            rrbs_hits,
             seed_size: 2,
         }
     }
 
     #[test]
     fn test_rrbs_count_seeds_filters_cross_chain_hits_when_disabled() {
-        let bucket = KmerLoc {
-            n1: 4,
-            loc1: vec![
+        let bucket = vec![
                 Hit { chr: 0, loc: 10 },
                 Hit { chr: 2, loc: 20 },
                 Hit {
@@ -698,12 +690,8 @@ mod tests {
                     chr: RRBS_BSC_FLAG | 2,
                     loc: 40,
                 },
-            ],
-        };
-        let index = make_rrbs_count_index(vec![KmerLoc {
-            n1: 0,
-            loc1: Vec::new(),
-        }, bucket]);
+            ];
+        let index = make_rrbs_count_index(vec![Vec::new(), bucket]);
 
         assert_eq!(
             count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, true, false),
@@ -719,13 +707,8 @@ mod tests {
 
     #[test]
     fn test_rrbs_cross_chain_filter_changes_segment_order() {
-        let empty = KmerLoc {
-            n1: 0,
-            loc1: Vec::new(),
-        };
-        let mostly_cross_chain = KmerLoc {
-            n1: 5,
-            loc1: vec![
+        let empty = Vec::new();
+        let mostly_cross_chain = vec![
                 Hit { chr: 0, loc: 10 },
                 Hit {
                     chr: RRBS_BSC_FLAG,
@@ -743,11 +726,8 @@ mod tests {
                     chr: RRBS_BSC_FLAG,
                     loc: 50,
                 },
-            ],
-        };
-        let normal_only = KmerLoc {
-            n1: 2,
-            loc1: vec![
+            ];
+        let normal_only = vec![
                 Hit {
                     chr: 1 << 16,
                     loc: 60,
@@ -756,8 +736,7 @@ mod tests {
                     chr: 1 << 16,
                     loc: 70,
                 },
-            ],
-        };
+            ];
         let index = make_rrbs_count_index(vec![empty, mostly_cross_chain, normal_only]);
         let chain_seeds = vec![1, 0, 2];
         let mut profile = [[4u32; 16]; MAXSNPS as usize + 1];
@@ -811,7 +790,8 @@ mod tests {
             index2: vec![KmerLoc2 { n: [0, 0] }, KmerLoc2 { n: [2, 1] }],
             positions: vec![10, 20, 30],
             start_offsets: vec![0, 0],
-            rrbs_index: None,
+            rrbs_offsets: Vec::new(),
+            rrbs_hits: Vec::new(),
             seed_size: 2,
         };
 
@@ -833,7 +813,8 @@ mod tests {
             index2: vec![],
             positions: vec![],
             start_offsets: vec![],
-            rrbs_index: None,
+            rrbs_offsets: Vec::new(),
+            rrbs_hits: Vec::new(),
             seed_size: 16,
         };
 

@@ -224,9 +224,10 @@ pub(crate) fn snp_align_segment(
             segment.start_offset + seed_idx as u32 * 4
         };
 
-        // ── RRBS mode: positions from rrbs_index ──
-        if let Some(ref rrbs_idx) = index.rrbs_index {
-            if (seed_hash as usize) < rrbs_idx.len() && rrbs_idx[seed_hash as usize].n1 > 0 {
+        // ── RRBS mode: positions from flat hit storage ──
+        if !index.rrbs_offsets.is_empty() {
+            let hits = index.lookup_rrbs(seed_hash);
+            if !hits.is_empty() {
                 let modeindex = segment.index as u32;
                 let max_mode = read_len / index.seed_size;
                 if max_mode == 0 || modeindex >= max_mode {
@@ -238,7 +239,6 @@ pub(crate) fn snp_align_segment(
                     max_mode - 1 - modeindex
                 };
                 let read_chain_mask = (read_chain as u32) << 24;
-                let hits = &rrbs_idx[seed_hash as usize].loc1;
 
                 for bucket_idx in
                     circular_bucket_indices(hits.len(), encoded.info.index, randseed)

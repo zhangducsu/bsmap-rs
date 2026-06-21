@@ -5,6 +5,8 @@
 
 use std::sync::atomic::AtomicU32;
 
+use serde::{Deserialize, Serialize};
+
 use crate::cli::AlignArgs;
 
 // ── Core Constants ──────────────────────────────────────────────────────────
@@ -56,7 +58,7 @@ pub type RefLoc = u32;
 // ── Hit Structures ──────────────────────────────────────────────────────────
 
 /// A basic hit: chromosome + position (C++ `Hit`)
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hit {
     pub chr: RefId,
     pub loc: RefLoc,
@@ -75,13 +77,6 @@ pub struct GHit {
     pub gap_size: i16,      // >0: insertion on read, <0: deletion on read
     pub gap_pos: u16,       // gap position from read start
     pub snps: u8,           // mismatch count
-}
-
-/// Seed index entry for RRBS mode (C++ `KmerLoc`)
-#[derive(Debug, Clone)]
-pub struct KmerLoc {
-    pub n1: u32,
-    pub loc1: Vec<Hit>,
 }
 
 /// Seed index entry for WGBS mode (C++ `KmerLoc2`)
