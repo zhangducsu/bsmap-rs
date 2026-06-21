@@ -261,6 +261,7 @@ impl SingleAlign {
                     config.gap,
                     config.nt3,
                     config.randseed,
+                    cross_chain_enabled,
                     query,
                     mask,
                     n_count,

@@ -18,11 +18,12 @@ use crate::align::seed::SeedSegment;
 use crate::param::{GHit, MAXSNPS};
 use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
-use crate::reference::index::{KmerIndex, RRBS_CHR_MASK};
+use crate::reference::index::{KmerIndex, RRBS_BSC_FLAG, RRBS_CHR_MASK};
 use crate::utils::myrand;
 
 const HIT_LEVELS: usize = MAXSNPS as usize + 1;
 
+#[cfg(test)]
 fn circular_bucket_indices(
     bucket_len: usize,
     read_index: u32,
@@ -34,6 +35,11 @@ fn circular_bucket_indices(
         myrand(read_index, randseed, 0) as usize % bucket_len
     };
     (0..bucket_len).map(move |offset| (start + offset) % bucket_len)
+}
+
+#[inline]
+fn rrbs_bucket_hit_is_eligible(hit: &crate::param::Hit, cross_chain_enabled: bool) -> bool {
+    cross_chain_enabled || hit.chr & RRBS_BSC_FLAG == 0
 }
 
 /// C++ `AddHit()` 等价状态，由两条 read-chain 和全部 segment 共享。
@@ -173,6 +179,7 @@ pub fn snp_align_for_chain(
                 gap_size,
                 nt3,
                 0,
+                true,
                 query,
                 mask,
                 n_count,
@@ -204,6 +211,7 @@ pub(crate) fn snp_align_segment(
     gap_size: u32,
     nt3: bool,
     randseed: u32,
+    cross_chain_enabled: bool,
     query: &[u64],
     mask: &[u64],
     n_count: u32,
@@ -240,10 +248,23 @@ pub(crate) fn snp_align_segment(
                 };
                 let read_chain_mask = (read_chain as u32) << 24;
 
-                for bucket_idx in
-                    circular_bucket_indices(hits.len(), encoded.info.index, randseed)
-                {
-                    let hit = &hits[bucket_idx];
+                let logical_bucket_len = hits
+                    .iter()
+                    .filter(|hit| rrbs_bucket_hit_is_eligible(hit, cross_chain_enabled))
+                    .count();
+                if logical_bucket_len == 0 {
+                    continue;
+                }
+                let start = myrand(encoded.info.index, randseed, 0) as usize
+                    % logical_bucket_len;
+                let logical_bucket = hits
+                    .iter()
+                    .filter(|hit| rrbs_bucket_hit_is_eligible(hit, cross_chain_enabled))
+                    .cycle()
+                    .skip(start)
+                    .take(logical_bucket_len);
+
+                for hit in logical_bucket {
                     if ((hit.chr ^ read_chain_mask) >> 16) != cmodeindex {
                         continue;
                     }
@@ -561,6 +582,32 @@ mod tests {
         let mut sorted = order;
         sorted.sort_unstable();
         assert_eq!(sorted, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn rrbs_se_logical_bucket_excludes_bsc_hits() {
+        let hits = [
+            crate::param::Hit { chr: 0, loc: 10 },
+            crate::param::Hit {
+                chr: RRBS_BSC_FLAG,
+                loc: 20,
+            },
+            crate::param::Hit { chr: 2, loc: 30 },
+        ];
+
+        let se: Vec<u32> = hits
+            .iter()
+            .filter(|hit| rrbs_bucket_hit_is_eligible(hit, false))
+            .map(|hit| hit.loc)
+            .collect();
+        let pe: Vec<u32> = hits
+            .iter()
+            .filter(|hit| rrbs_bucket_hit_is_eligible(hit, true))
+            .map(|hit| hit.loc)
+            .collect();
+
+        assert_eq!(se, vec![10, 30]);
+        assert_eq!(pe, vec![10, 20, 30]);
     }
 
     #[test]
