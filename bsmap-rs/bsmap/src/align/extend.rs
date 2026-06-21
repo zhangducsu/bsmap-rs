@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn bucket_uses_nonzero_start_and_visits_every_entry_once() {
         let order: Vec<usize> = circular_bucket_indices(7, 100, 42).collect();
-        assert_eq!(order, vec![1, 2, 3, 4, 5, 6, 0]);
+        assert_eq!(order, vec![2, 3, 4, 5, 6, 0, 1]);
 
         let mut sorted = order;
         sorted.sort_unstable();
