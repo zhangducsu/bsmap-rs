@@ -38,7 +38,7 @@ pub struct MismatchResult {
 /// - `ref_seq`: 参考序列数组
 /// - `mask`: 有效碱基掩码（标记 N 位置）
 /// - `snp_thres`: mismatch 阈值，超过则提前返回
-/// - `n_count`: 读段中 N 碱基数（从 mismatch 数中减去）
+/// - `n_count`: 读段中 N 碱基数（C++ 默认 `N_mis=0`，不计入 mismatch）
 /// - `nt3`: 3-核苷酸模式（C+T 共享编码）
 ///
 /// # 返回值
@@ -58,14 +58,14 @@ pub fn count_mismatch(
     ref_seq: &[u64],
     mask: &[u64],
     snp_thres: u32,
-    n_count: u32,
+    _n_count: u32,
     nt3: bool,
 ) -> u32 {
     // 计算 word 偏移和位偏移
     let word_offset = (offset / 64) as usize;
     let bit_offset = (offset % 64) as u32;
 
-    let mut total_mismatches: u32 = n_count;
+    let mut total_mismatches: u32 = 0;
 
     // 处理跨 word 边界的情况
     if bit_offset == 0 {
@@ -477,18 +477,18 @@ pub fn count_mismatch_simd(
     ref_seq: &[u64],
     mask: &[u64],
     snp_thres: u32,
-    n_count: u32,
+    _n_count: u32,
     nt3: bool,
 ) -> u32 {
     // 检查 AVX2 支持
     if is_x86_feature_detected!("avx2") {
         // SAFETY: 我们已经检查了 AVX2 支持
         unsafe {
-            count_mismatch_avx2(query, offset, ref_seq, mask, snp_thres, n_count, nt3)
+            count_mismatch_avx2(query, offset, ref_seq, mask, snp_thres, 0, nt3)
         }
     } else {
         // 回退到标量版本
-        count_mismatch(query, offset, ref_seq, mask, snp_thres, n_count, nt3)
+        count_mismatch(query, offset, ref_seq, mask, snp_thres, 0, nt3)
     }
 }
 
@@ -502,7 +502,7 @@ unsafe fn count_mismatch_avx2(
     ref_seq: &[u64],
     mask: &[u64],
     snp_thres: u32,
-    n_count: u32,
+    _n_count: u32,
     nt3: bool,
 ) -> u32 {
     use std::arch::x86_64::*;
@@ -510,7 +510,7 @@ unsafe fn count_mismatch_avx2(
     let word_offset = (offset / 64) as usize;
     let bit_offset = (offset % 64) as u32;
 
-    let mut total_mismatches: u32 = n_count;
+    let mut total_mismatches: u32 = 0;
 
     // AVX2 每次处理 4 个 u64（256 bits）
     let simd_len = query.len() / 4 * 4;
@@ -567,7 +567,7 @@ unsafe fn count_mismatch_avx2(
         }
     } else {
         // 非对齐情况，回退到标量
-        return count_mismatch(query, offset, ref_seq, mask, snp_thres, n_count, nt3);
+        return count_mismatch(query, offset, ref_seq, mask, snp_thres, 0, nt3);
     }
 
     total_mismatches
@@ -642,6 +642,20 @@ mod tests {
 
         let mismatches = count_mismatch(&query, 0, &ref_seq, &mask, 10, 0, false);
         assert_eq!(mismatches, 1, "应该检测到 1 个 mismatch");
+    }
+
+    #[test]
+    fn test_count_mismatch_ignores_masked_n_by_default() {
+        let query = pack_forward(b"ACAT", 10);
+        let ref_seq = make_ref_seq(b"ACGT");
+        let mut mask = vec![u64::MAX; query.len()];
+        mask[0] &= !(0b11u64 << 58);
+
+        let scalar = count_mismatch(&query, 0, &ref_seq, &mask, 10, 1, false);
+        let simd = count_mismatch_simd(&query, 0, &ref_seq, &mask, 10, 1, false);
+
+        assert_eq!(scalar, 0);
+        assert_eq!(simd, 0);
     }
 
     #[test]
