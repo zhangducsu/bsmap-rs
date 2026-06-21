@@ -65,96 +65,89 @@ pub struct BinSeqCollection {
     pub chr_accessions: Vec<String>,
 }
 
+pub struct BinSeqCollectionBuilder {
+    refcat: Vec<u64>,
+    crefcat: Vec<u64>,
+    ref_anchor: Vec<u32>,
+    chr_lengths: Vec<u32>,
+    blocks: Vec<Block>,
+    chr_names: Vec<String>,
+    sum_length: u64,
+}
+
+impl BinSeqCollectionBuilder {
+    pub fn new() -> Self {
+        Self {
+            refcat: vec![0; REF_MARGIN],
+            crefcat: vec![0; REF_MARGIN],
+            ref_anchor: vec![(REF_MARGIN * SEGLEN) as u32],
+            chr_lengths: Vec::new(),
+            blocks: Vec::new(),
+            chr_names: Vec::new(),
+            sum_length: 0,
+        }
+    }
+
+    pub fn push(&mut self, reference: &Reference) {
+        let chr_id = self.chr_names.len() as u32;
+        let words = (reference.len as usize + SEGLEN - 1) / SEGLEN + BINSEQPAD;
+        let total_bases = (words * SEGLEN) as u32;
+
+        let mut forward = encode_forward(&reference.seq).words;
+        forward.resize(words, 0);
+        self.refcat.extend_from_slice(&forward);
+        drop(forward);
+
+        let mut reverse = encode_revcomp(&reference.seq).words;
+        reverse.resize(words, 0);
+        self.crefcat.extend_from_slice(&reverse);
+
+        find_blocks(&mut self.blocks, chr_id * 2, &reference.seq, total_bases);
+        self.ref_anchor.push((self.refcat.len() * SEGLEN) as u32);
+        self.chr_lengths.push(reference.len);
+        self.chr_names.push(reference.name.clone());
+        self.sum_length += reference.len as u64;
+    }
+
+    pub fn finish(mut self) -> BinSeqCollection {
+        self.blocks
+            .sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.begin.cmp(&b.begin)));
+        self.refcat.resize(self.refcat.len() + REF_MARGIN, 0);
+        self.crefcat.resize(self.crefcat.len() + REF_MARGIN, 0);
+        let chr_accessions = self
+            .chr_names
+            .iter()
+            .map(|name| name.split_whitespace().next().unwrap_or(name).to_string())
+            .collect();
+        BinSeqCollection {
+            total_num: self.chr_names.len() as u32 * 2,
+            sum_length: self.sum_length,
+            refcat: Box::new(VecStorage::new(self.refcat)),
+            crefcat: Box::new(VecStorage::new(self.crefcat)),
+            ref_anchor: self.ref_anchor,
+            chr_lengths: self.chr_lengths,
+            blocks: self.blocks,
+            seqs: Vec::new(),
+            chr_names: self.chr_names,
+            chr_accessions,
+        }
+    }
+}
+
+impl Default for BinSeqCollectionBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BinSeqCollection {
     /// Build concatenated binary sequences from FASTA references.
     pub fn from_references(refs: &[Reference]) -> Self {
-        let total_num = refs.len() as u32 * 2; // forward + RC for each
-        let mut seqs: Vec<BinarySeq> = Vec::with_capacity(total_num as usize);
-        let mut blocks: Vec<Block> = Vec::new();
-
-        for (chr_idx, r) in refs.iter().enumerate() {
-            let chr_id = chr_idx as u32;
-            let total_bases = ((r.len + SEGLEN as u32 - 1) / SEGLEN as u32 + BINSEQPAD as u32)
-                * SEGLEN as u32;
-
-            // Forward strand
-            let mut fwd = encode_forward(&r.seq);
-            fwd.n = (r.len + SEGLEN as u32 - 1) / SEGLEN as u32 + BINSEQPAD as u32;
-            pad_to_len(&mut fwd.words, fwd.n as usize);
-
-            // Reverse-complement strand
-            let mut rev = encode_revcomp(&r.seq);
-            rev.n = fwd.n;
-            pad_to_len(&mut rev.words, rev.n as usize);
-
-            // Find unmasked regions on forward strand
-            find_blocks(&mut blocks, chr_id * 2, &r.seq, total_bases);
-            find_blocks_rc(&mut blocks, chr_id * 2 + 1, &r.seq, total_bases);
-
-            seqs.push(fwd);
-            seqs.push(rev);
+        let mut builder = BinSeqCollectionBuilder::new();
+        for reference in refs {
+            builder.push(reference);
         }
-
-        // Sort blocks by (id, begin)
-        blocks.sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.begin.cmp(&b.begin)));
-
-        // Compute anchor positions and concatenate
-        // C++ ref_anchor only accumulates forward-strand blocks (even indices),
-        // not reverse-complement blocks. Each chromosome has 2 blocks:
-        //   block[2*chr] = forward, block[2*chr+1] = reverse-complement
-        let num_chromosomes = refs.len();
-        let mut ref_anchor = Vec::with_capacity(num_chromosomes + 1);
-        ref_anchor.push((REF_MARGIN * SEGLEN as usize) as u32);
-
-        let mut total_fwd_words: usize = 0;
-        for i in 0..num_chromosomes {
-            total_fwd_words += seqs[i * 2].n as usize;
-            ref_anchor.push(((total_fwd_words + REF_MARGIN) * SEGLEN as usize) as u32);
-        }
-
-        let refcat_len = total_fwd_words + REF_MARGIN * 2;
-        let mut refcat = vec![0u64; refcat_len];
-        let mut crefcat = vec![0u64; refcat_len];
-
-        let mut fwd_ptr = REF_MARGIN;
-        let mut rev_ptr = REF_MARGIN;
-
-        for i in 0..total_num as usize {
-            let s = &seqs[i];
-            if i % 2 == 0 {
-                refcat[fwd_ptr..fwd_ptr + s.n as usize].copy_from_slice(&s.words[..s.n as usize]);
-                fwd_ptr += s.n as usize;
-            } else {
-                crefcat[rev_ptr..rev_ptr + s.n as usize]
-                    .copy_from_slice(&s.words[..s.n as usize]);
-                rev_ptr += s.n as usize;
-            }
-        }
-
-        let sum_length: u64 = refs.iter().map(|r| r.len as u64).sum();
-        let chr_lengths: Vec<u32> = refs.iter().map(|r| r.len).collect();
-
-        // Collect chromosome names
-        let chr_names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
-
-        // P11-8: 预计算染色体 accession（取空格前第一个词），消除输出阶段 String 分配
-        let chr_accessions: Vec<String> = chr_names
-            .iter()
-            .map(|n| n.split_whitespace().next().unwrap_or(n).to_string())
-            .collect();
-
-        Self {
-            total_num,
-            sum_length,
-            refcat: Box::new(VecStorage::new(refcat)),
-            crefcat: Box::new(VecStorage::new(crefcat)),
-            ref_anchor,
-            chr_lengths,
-            blocks,
-            seqs: Vec::new(),
-            chr_names,
-            chr_accessions,
-        }
+        builder.finish()
     }
 
     /// Map a (chr, loc) hit to a flattened integer offset.
@@ -266,13 +259,6 @@ pub fn encode_revcomp(seq: &[u8]) -> BinarySeq {
     }
 }
 
-/// Pad word vector to exactly `target_len` (for BINSEQPAD).
-fn pad_to_len(words: &mut Vec<u64>, target_len: usize) {
-    while words.len() < target_len {
-        words.push(0);
-    }
-}
-
 // ── Unmasked Region Detection ─────────────────────────────────────────────────
 
 const USEFUL_NT: &[u8] = b"ACGTacgt";
@@ -335,14 +321,6 @@ fn find_blocks(blocks: &mut Vec<Block>, id: u32, seq: &[u8], total_bases: u32) {
 
         begin = end;
     }
-}
-
-/// Detect blocks on reverse-complement strand.
-/// These come from the forward strand's RC counterpart,
-/// generated by `find_blocks()` above.
-fn find_blocks_rc(_blocks: &mut Vec<Block>, _id: u32, _seq: &[u8], _total_bases: u32) {
-    // RC blocks are already created by find_blocks() as the cb_begin/cb_end
-    // mirrored versions. Nothing extra to do here.
 }
 
 #[cfg(test)]

@@ -27,7 +27,8 @@ use bsmap::param::{AlignConfig, AlignStats, BATCH_SIZE, ReadInf};
 use bsmap::reads::{encode_read, process_batch, EncodedRead, FastqReader};
 use bsmap::reference::{
     default_index_path, is_index_compatible, load_index_with_mode, save_index_v2,
-    BinSeqCollection, KmerIndex, LoadMode, Reference,
+    BinSeqCollection, BinSeqCollectionBuilder, KmerIndex, LoadMode, Reference,
+    ReferenceReader, RrbsIndexBuilder,
 };
 use bsmap::utils::Timer;
 
@@ -208,33 +209,30 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
         warn!("rayon 线程池已初始化，使用已有配置: {}", e);
     }
 
-    // 加载参考序列
+    // 流式编码参考序列，避免同时保留整份 ASCII FASTA 与双链二进制数据。
     let mut timer = Timer::new();
     info!("加载参考序列...");
     let ref_path = args.reference.as_ref().unwrap();
-    let refs = load_references(ref_path)?;
-    let ref_names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
+    let coll = load_binseq_collection(ref_path)?;
+    let ref_names = coll.chr_names.clone();
+    let ref_lengths = coll.chr_lengths.clone();
     info!(
         "加载 {} 条参考序列，共 {} bp，耗时 {:.2}s",
-        refs.len(),
-        refs.iter().map(|r| r.len as u64).sum::<u64>(),
+        ref_names.len(),
+        coll.sum_length,
         timer.step()
     );
 
     // 构建或加载索引
-    let (index, coll) = load_or_build_index(&refs, &mut config, ref_path, &ref_names)?;
+    let (index, coll) = load_or_build_index(coll, &mut config, ref_path, &ref_names)?;
 
     // 打开输出文件
     let mut output = open_output(args)?;
 
     // 写入 SAM header
     if config.sam_header && config.out_sam > 0 {
-        write_sam_header(&mut output, &ref_names, &refs)?;
+        write_sam_header(&mut output, &ref_names, &ref_lengths)?;
     }
-
-    // P11-3: 索引构建后立即释放原始 FASTA 序列 (~3 GB)
-    // 比对阶段仅使用 refcat/crefcat（2-bit 编码），refs 已无用途
-    drop(refs);
 
     // 运行比对
     let stats = Arc::new(AlignStats::default());
@@ -285,6 +283,15 @@ fn load_references(path: &Path) -> Result<Vec<Reference>> {
     }
 }
 
+fn load_binseq_collection(path: &Path) -> Result<BinSeqCollection> {
+    let mut reader = ReferenceReader::open(path)?;
+    let mut builder = BinSeqCollectionBuilder::new();
+    while let Some(reference) = reader.next_reference()? {
+        builder.push(&reference);
+    }
+    Ok(builder.finish())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 索引加载/构建
 // ─────────────────────────────────────────────────────────────────────────────
@@ -302,17 +309,12 @@ fn load_references(path: &Path) -> Result<Vec<Reference>> {
 /// # 返回值
 /// (KmerIndex, BinSeqCollection) 元组
 fn load_or_build_index(
-    refs: &[Reference],
+    mut coll: BinSeqCollection,
     config: &mut AlignConfig,
     ref_path: &Path,
     ref_names: &[String],
 ) -> Result<(KmerIndex, BinSeqCollection)> {
     let mut timer = Timer::new();
-
-    // 构建二进制序列集合
-    info!("构建二进制序列集合...");
-    let coll = BinSeqCollection::from_references(refs);
-    info!("二进制序列集合构建完成，耗时 {:.2}s", timer.step());
 
     // 检查是否有缓存索引
     let index_path = default_index_path(ref_path);
@@ -324,10 +326,9 @@ fn load_or_build_index(
             Ok((loaded_coll, index, _meta)) => {
                 info!("索引已从缓存加载: {}", index_path.display());
                 // 用 mmap 加载的 refcat/crefcat 替换内存版本，保留其他元数据
-                let mut mmap_coll = coll;
-                mmap_coll.refcat = loaded_coll.refcat;
-                mmap_coll.crefcat = loaded_coll.crefcat;
-                return Ok((index, mmap_coll));
+                coll.refcat = loaded_coll.refcat;
+                coll.crefcat = loaded_coll.crefcat;
+                return Ok((index, coll));
             }
             Err(e) => {
                 info!("无法加载索引: {}, 将重新构建: {}", index_path.display(), e);
@@ -339,16 +340,20 @@ fn load_or_build_index(
     info!("构建索引 (seed_size={}, interval={})...", config.seed_size, config.index_interval);
 
     let index = if config.rrbs_flag {
-        // RRBS 模式
-        KmerIndex::build_rrbs(
-            &coll,
-            refs,
+        let mut builder = RrbsIndexBuilder::new(
+            coll.chr_names.len(),
             config.seed_size,
-            config.index_interval,
             &config.digest_sites,
             config.min_insert,
             config.max_insert,
-        )
+        );
+        let mut reader = ReferenceReader::open(ref_path)?;
+        let mut chromosome_index = 0usize;
+        while let Some(reference) = reader.next_reference()? {
+            builder.push_reference(chromosome_index, &reference);
+            chromosome_index += 1;
+        }
+        builder.finish(&coll)
     } else {
         // WGBS 模式
         KmerIndex::build_wgbs(
@@ -449,7 +454,7 @@ fn open_output(args: &AlignArgs) -> Result<OutputWriter> {
 fn write_sam_header(
     output: &mut OutputWriter,
     ref_names: &[String],
-    refs: &[Reference],
+    ref_lengths: &[u32],
 ) -> Result<()> {
     let mut header = String::new();
 
@@ -457,9 +462,9 @@ fn write_sam_header(
     header.push_str("@HD\tVN:1.0\tSO:unsorted\n");
 
     // @SQ 行（只取名称的第一个空白字符前的部分）
-    for (name, r) in ref_names.iter().zip(refs.iter()) {
+    for (name, &length) in ref_names.iter().zip(ref_lengths) {
         let sn = name.split_whitespace().next().unwrap_or(name);
-        header.push_str(&format!("@SQ\tSN:{}\tLN:{}\n", sn, r.len));
+        header.push_str(&format!("@SQ\tSN:{}\tLN:{}\n", sn, length));
     }
 
     // @PG 行

@@ -22,6 +22,37 @@ pub struct Reference {
     pub len: u32,
 }
 
+/// Streaming FASTA reader that owns at most one decoded chromosome at a time.
+pub struct ReferenceReader {
+    reader: Box<dyn FastxReader>,
+}
+
+impl ReferenceReader {
+    pub fn open(path: &Path) -> Result<Self> {
+        let reader = parse_fastx_file(path)
+            .with_context(|| format!("Cannot open reference: {}", path.display()))?;
+        Ok(Self { reader })
+    }
+
+    pub fn next_reference(&mut self) -> Result<Option<Reference>> {
+        loop {
+            let Some(record) = self.reader.next() else {
+                return Ok(None);
+            };
+            let record = record.context("Error reading FASTA record")?;
+            let name = std::str::from_utf8(record.id())
+                .unwrap_or("<non-utf8-id>")
+                .to_string();
+            let mut seq = record.seq().to_vec();
+            seq.make_ascii_uppercase();
+            let len = seq.len() as u32;
+            if len > 0 {
+                return Ok(Some(Reference { name, seq, len }));
+            }
+        }
+    }
+}
+
 /// Load all sequences from a FASTA file (plain or gzipped).
 ///
 /// Uses `needletail` for zero-copy, streaming parsing with automatic

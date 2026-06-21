@@ -74,6 +74,82 @@ pub struct KmerIndex {
     pub seed_size: u32,
 }
 
+/// Incremental RRBS digestion-site collector for streaming FASTA input.
+pub struct RrbsIndexBuilder {
+    seed_size: u32,
+    total_kmers: u32,
+    total_blocks: usize,
+    sites: Vec<DigestionSite>,
+    min_insert: u32,
+    max_insert: u32,
+    ccgg_index: Vec<Vec<Vec<(u32, u32)>>>,
+}
+
+impl RrbsIndexBuilder {
+    pub fn new(
+        chromosome_count: usize,
+        seed_size: u32,
+        digest_sites: &[String],
+        min_insert: u32,
+        max_insert: u32,
+    ) -> Self {
+        let total_blocks = chromosome_count * 2;
+        let max_modes = ((crate::param::FIXELEMENT - 1) * SEGLEN) as u32 / seed_size;
+        Self {
+            seed_size,
+            total_kmers: 3u32.pow(seed_size),
+            total_blocks,
+            sites: digest_sites
+                .iter()
+                .filter_map(|site| DigestionSite::parse(site))
+                .collect(),
+            min_insert,
+            max_insert,
+            ccgg_index: vec![vec![Vec::new(); total_blocks]; max_modes as usize],
+        }
+    }
+
+    pub fn push_reference(&mut self, chromosome_index: usize, reference: &Reference) {
+        if self.sites.is_empty() || chromosome_index * 2 + 1 >= self.total_blocks {
+            return;
+        }
+        let rc_offset = ((reference.len + SEGLEN as u32 - 1) / SEGLEN as u32
+            + crate::param::BINSEQPAD as u32)
+            * SEGLEN as u32;
+        let digested = build_rrbs_index(
+            &reference.seq,
+            reference.len,
+            rc_offset,
+            self.seed_size,
+            &self.sites,
+            self.min_insert,
+            self.max_insert,
+        );
+        for (mode, chains) in digested.iter().enumerate() {
+            for chain in 0..2usize {
+                let target_block = chromosome_index * 2 + chain;
+                if mode < self.ccgg_index.len() && target_block < self.total_blocks {
+                    self.ccgg_index[mode][target_block].extend(
+                        chains[chain]
+                            .iter()
+                            .map(|&position| (target_block as u32, position)),
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn finish(self, coll: &BinSeqCollection) -> KmerIndex {
+        build_flat_rrbs_index(
+            coll,
+            &self.ccgg_index,
+            self.total_blocks,
+            self.seed_size,
+            self.total_kmers,
+        )
+    }
+}
+
 impl KmerIndex {
     /// Build the k-mer index for WGBS mode.
     ///
@@ -243,118 +319,17 @@ impl KmerIndex {
         min_insert: u32,
         max_insert: u32,
     ) -> Self {
-        let total_kmers = 3u32.pow(seed_size);
-
-        // 解析消化位点
-        let sites: Vec<DigestionSite> = digest_sites
-            .iter()
-            .filter_map(|s| DigestionSite::parse(s))
-            .collect();
-
-        if sites.is_empty() {
-            return Self {
-                total_kmers,
-                max_kmer_num: u32::MAX,
-                index2: Vec::new(),
-                positions: Vec::new(),
-                start_offsets: Vec::new(),
-                seed_size,
-                rrbs_offsets: Vec::new(),
-                rrbs_hits: Vec::new(),
-            };
-        }
-
-        // 对每条染色体构建 RRBS 索引，同时记录每个位置的染色体 ID
-        // ccgg_index[chain] = Vec of (block_id, pos)
-        let max_seedseg_num =
-            ((crate::param::FIXELEMENT - 1) * SEGLEN) as u32 / seed_size;
-        let total_blocks = refs.len() * 2;
-        let mut ccgg_index: Vec<Vec<Vec<(u32, u32)>>> =
-            vec![vec![Vec::new(); total_blocks]; max_seedseg_num as usize];
-
-        for (chr_idx, r) in refs.iter().enumerate() {
-            let chr_id = chr_idx as u32;
-            // 计算反义链偏移量
-            let total_bases = ((r.len + SEGLEN as u32 - 1) / SEGLEN as u32
-                + crate::param::BINSEQPAD as u32)
-                * SEGLEN as u32;
-            let rc_offset = total_bases;
-
-            let chr_ccgg = build_rrbs_index(
-                &r.seq,
-                r.len,
-                rc_offset,
-                seed_size,
-                &sites,
-                min_insert,
-                max_insert,
-            );
-
-            // 合并到全局 ccgg_index，同时记录染色体 ID
-            for (mode, chains) in chr_ccgg.iter().enumerate() {
-                for chain in 0..2u32 {
-                    let block_id = chr_id * 2 + chain;
-                    let block_slot = block_id as usize;
-                    if mode >= ccgg_index.len()
-                        || block_slot >= total_blocks
-                        || (chain as usize) >= chains.len()
-                    {
-                        continue;
-                    }
-                    ccgg_index[mode][block_slot].extend(
-                        chains[chain as usize]
-                            .iter()
-                            .map(|&pos| (block_id, pos)),
-                    );
-                }
-            }
-        }
-
-        let seed_bits_lz = (SEGLEN as u32 - seed_size) * 2;
-
-        // Count first, then allocate exactly once. This preserves C++ hit order
-        // while avoiding one heap allocation and spare capacity per k-mer.
-        let mut counts = vec![0u32; total_kmers as usize];
-        visit_rrbs_hits(
-            coll,
-            &ccgg_index,
-            total_blocks,
+        let mut builder = RrbsIndexBuilder::new(
+            refs.len(),
             seed_size,
-            seed_bits_lz,
-            |hash, _| counts[hash] = counts[hash].checked_add(1).expect("RRBS hit count overflow"),
+            digest_sites,
+            min_insert,
+            max_insert,
         );
-
-        let mut rrbs_offsets = vec![0u32; total_kmers as usize + 1];
-        for (i, &count) in counts.iter().enumerate() {
-            rrbs_offsets[i + 1] = rrbs_offsets[i]
-                .checked_add(count)
-                .expect("RRBS flat index exceeds u32 offsets");
+        for (chromosome_index, reference) in refs.iter().enumerate() {
+            builder.push_reference(chromosome_index, reference);
         }
-        let mut rrbs_hits = vec![Hit::default(); rrbs_offsets[total_kmers as usize] as usize];
-        let mut write_offsets = rrbs_offsets[..total_kmers as usize].to_vec();
-        visit_rrbs_hits(
-            coll,
-            &ccgg_index,
-            total_blocks,
-            seed_size,
-            seed_bits_lz,
-            |hash, hit| {
-                let offset = write_offsets[hash] as usize;
-                rrbs_hits[offset] = hit;
-                write_offsets[hash] += 1;
-            },
-        );
-
-        Self {
-            total_kmers,
-            max_kmer_num: u32::MAX,
-            index2: Vec::new(),
-            positions: Vec::new(),
-            start_offsets: Vec::new(),
-            rrbs_offsets,
-            rrbs_hits,
-            seed_size,
-        }
+        builder.finish(coll)
     }
 
     /// Look up k-mer seed in WGBS index.
@@ -475,6 +450,70 @@ fn visit_rrbs_hits<F>(
                 }
             }
         }
+    }
+}
+
+fn build_flat_rrbs_index(
+    coll: &BinSeqCollection,
+    ccgg_index: &[Vec<Vec<(u32, u32)>>],
+    total_blocks: usize,
+    seed_size: u32,
+    total_kmers: u32,
+) -> KmerIndex {
+    if ccgg_index.is_empty() {
+        return KmerIndex {
+            total_kmers,
+            max_kmer_num: u32::MAX,
+            index2: Vec::new(),
+            positions: Vec::new(),
+            start_offsets: Vec::new(),
+            rrbs_offsets: Vec::new(),
+            rrbs_hits: Vec::new(),
+            seed_size,
+        };
+    }
+
+    let seed_bits_lz = (SEGLEN as u32 - seed_size) * 2;
+    let mut counts = vec![0u32; total_kmers as usize];
+    visit_rrbs_hits(
+        coll,
+        ccgg_index,
+        total_blocks,
+        seed_size,
+        seed_bits_lz,
+        |hash, _| counts[hash] = counts[hash].checked_add(1).expect("RRBS hit count overflow"),
+    );
+
+    let mut rrbs_offsets = vec![0u32; total_kmers as usize + 1];
+    for (i, &count) in counts.iter().enumerate() {
+        rrbs_offsets[i + 1] = rrbs_offsets[i]
+            .checked_add(count)
+            .expect("RRBS flat index exceeds u32 offsets");
+    }
+    let mut rrbs_hits = vec![Hit::default(); rrbs_offsets[total_kmers as usize] as usize];
+    let mut write_offsets = rrbs_offsets[..total_kmers as usize].to_vec();
+    visit_rrbs_hits(
+        coll,
+        ccgg_index,
+        total_blocks,
+        seed_size,
+        seed_bits_lz,
+        |hash, hit| {
+            let offset = write_offsets[hash] as usize;
+            rrbs_hits[offset] = hit;
+            write_offsets[hash] += 1;
+        },
+    );
+
+    KmerIndex {
+        total_kmers,
+        max_kmer_num: u32::MAX,
+        index2: Vec::new(),
+        positions: Vec::new(),
+        start_offsets: Vec::new(),
+        rrbs_offsets,
+        rrbs_hits,
+        seed_size,
     }
 }
 
@@ -655,6 +694,35 @@ mod tests {
         // 3^seed_size must fit in u32 for typical seed sizes
         assert_eq!(3u32.pow(12), 531_441); // typical min seed
         assert_eq!(3u32.pow(16), 43_046_721); // typical max seed (WGBS default)
+    }
+
+    #[test]
+    fn test_streaming_rrbs_builder_matches_batch_builder() {
+        let refs = vec![
+            Reference {
+                name: "chr1".into(),
+                seq: b"ACGTCCGGAAAAAAAAAAAAAAAAAAAAAAACCGGTTTTTTTTTTTTTTTTTTTTTTTTCCGG"
+                    .to_vec(),
+                len: 68,
+            },
+            Reference {
+                name: "chr2".into(),
+                seq: b"TTTTCCGGCCCCCCCCCCCCCCCCCCCCCCCCCCGGAAAAAAAAAAAAAAAAAAAAAAAA"
+                    .to_vec(),
+                len: 62,
+            },
+        ];
+        let coll = BinSeqCollection::from_references(&refs);
+        let sites = vec!["C-CGG".to_string()];
+        let batch = KmerIndex::build_rrbs(&coll, &refs, 3, 4, &sites, 4, 1000);
+        let mut builder = RrbsIndexBuilder::new(refs.len(), 3, &sites, 4, 1000);
+        for (index, reference) in refs.iter().enumerate() {
+            builder.push_reference(index, reference);
+        }
+        let streamed = builder.finish(&coll);
+
+        assert_eq!(streamed.rrbs_offsets, batch.rrbs_offsets);
+        assert_eq!(streamed.rrbs_hits, batch.rrbs_hits);
     }
 
     #[test]
