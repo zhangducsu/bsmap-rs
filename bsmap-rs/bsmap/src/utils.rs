@@ -81,7 +81,7 @@ pub fn myrand(read_index: u32, randseed: u32, thread_seed: u32) -> u32 {
         v ^= v >> 21;
         v ^= v << 37;
         v ^= v >> 4;
-        v = v.wrapping_mul(4_767_518_773_237_032_717);
+        v = v.wrapping_mul(4_768_777_513_237_032_717);
         v ^= v << 20;
         v ^= v >> 41;
         v ^= v << 5;
@@ -158,6 +158,11 @@ mod tests {
         let r1 = myrand(1, 12345, 0);
         let r2 = myrand(2, 12345, 0);
         assert_ne!(r1, r2); // different inputs → different outputs
+    }
+
+    #[test]
+    fn test_myrand_matches_cpp_vector() {
+        assert_eq!(myrand(4_610, 1, 0), 3_299_322_595);
     }
 
     #[test]
