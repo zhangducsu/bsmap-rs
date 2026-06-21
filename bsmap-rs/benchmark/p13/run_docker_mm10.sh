@@ -7,15 +7,15 @@ readonly REPO_ROOT="${1:-/tmp/p13_codex_github}"
 readonly RUNS_ROOT="${2:-$REPO_ROOT/bsmap-rs/benchmark/p13/runs/docker_mm10}"
 readonly SCRIPT_DIR="$REPO_ROOT/bsmap-rs/benchmark/p13"
 
-readonly REFERENCE="/workspace/00_data/reference/mm10.fa"
-readonly READ_1="/workspace/00_data/rrbs/Ctrl_10K_R1.fq"
-readonly READ_2="/workspace/00_data/rrbs/Ctrl_10K_R2.fq"
+readonly REFERENCE="${REFERENCE:-/workspace/00_data/reference/mm10.fa}"
+readonly READ_1="${READ_1:-/workspace/00_data/rrbs/Ctrl_10K_R1.fq}"
+readonly READ_2="${READ_2:-/workspace/00_data/rrbs/Ctrl_10K_R2.fq}"
 readonly RUST_BINARY="${RUST_BINARY:-$REPO_ROOT/bsmap-rs/target/release/bsmap}"
 readonly CPP_BINARY="${CPP_BINARY:-$REPO_ROOT/bsmap-original/bsmap-2.90/bsmap}"
 readonly SAM_STATS="$SCRIPT_DIR/sam_stats.py"
 readonly SUMMARIZER="$SCRIPT_DIR/summarize_mm10_run.py"
 
-readonly -a COMMON_PARAMETERS=(-s 12 -v 0.08 -I 4 -D C-CGG -p 8)
+readonly -a COMMON_PARAMETERS=(-s 12 -v 0.08 -I 4 -D C-CGG -p 8 -S 1)
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -86,7 +86,7 @@ write_metadata read_1 "$READ_1"
 write_metadata read_2 "$READ_2"
 write_metadata rust_binary "$RUST_BINARY"
 write_metadata cpp_binary "$CPP_BINARY"
-write_metadata common_parameters "-s 12 -v 0.08 -I 4 -D C-CGG -p 8"
+write_metadata common_parameters "-s 12 -v 0.08 -I 4 -D C-CGG -p 8 -S 1"
 
 write_hash input reference "$REFERENCE"
 write_hash input read_1 "$READ_1"

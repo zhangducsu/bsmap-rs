@@ -545,8 +545,10 @@ fn run_single_align(
             break;
         }
 
+        let batch_start_index = reader.global_index() - n as u32;
+
         // 处理读段（P11-4: mem::take 代替 clone，消除每批深拷贝）
-        let reads = process_batch(std::mem::take(&mut batch_raw), 0, config);
+        let reads = process_batch(std::mem::take(&mut batch_raw), 0, batch_start_index, config);
 
         // 编码读段
         let encoded: Vec<EncodedRead> = reads.iter().map(|r| encode_read(r)).collect();
@@ -649,10 +651,12 @@ fn run_paired_align(
 
         // 确保两个文件读段数量一致
         let n = n_a.min(n_b);
+        let batch_start_index_a = reader_a.global_index() - n_a as u32;
+        let batch_start_index_b = reader_b.global_index() - n_b as u32;
 
         // 处理读段（P11-4: mem::take 代替 clone，消除每批深拷贝）
-        let reads_a = process_batch(std::mem::take(&mut batch_a), 1, config);
-        let reads_b = process_batch(std::mem::take(&mut batch_b), 2, config);
+        let reads_a = process_batch(std::mem::take(&mut batch_a), 1, batch_start_index_a, config);
+        let reads_b = process_batch(std::mem::take(&mut batch_b), 2, batch_start_index_b, config);
 
         // 编码读段
         let encoded_a: Vec<EncodedRead> = reads_a.iter().map(|r| encode_read(r)).collect();
@@ -739,6 +743,11 @@ fn output_alignment(
     config: &AlignConfig,
 ) -> Result<()> {
     let total_hits = result.hits.len();
+    let selected_hit = if config.report_repeat_hits == 1 && total_hits > 1 {
+        bsmap::utils::myrand(read.index, config.randseed, 0) as usize % total_hits
+    } else {
+        0
+    };
 
     for (i, hit) in result.hits.iter().enumerate() {
         // 根据 report_repeat_hits 决定输出策略
@@ -746,9 +755,8 @@ fn output_alignment(
             // 仅输出唯一比对
             continue;
         }
-        if config.report_repeat_hits == 1 && i > 0 {
-            // 随机选择一个，只输出第一个
-            break;
+        if config.report_repeat_hits == 1 && i != selected_hit {
+            continue;
         }
 
         let line = match config.out_sam {

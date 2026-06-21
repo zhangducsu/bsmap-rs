@@ -506,7 +506,8 @@ pub fn is_unique_hit(hits: &[Vec<GHit>]) -> bool {
 /// # 返回值
 /// (最佳命中列表, 最佳 mismatch 数)
 pub fn select_best_hits(hits: &[Vec<GHit>]) -> (Vec<GHit>, u8) {
-    let mut result = Vec::new();
+    let mut read_chain_0 = Vec::new();
+    let mut read_chain_1 = Vec::new();
     let mut best_snp = 0u8;
 
     // 优先选择 mismatch 数少的
@@ -518,16 +519,22 @@ pub fn select_best_hits(hits: &[Vec<GHit>]) -> (Vec<GHit>, u8) {
             for hit in level.iter() {
                 let key = (hit.chr, hit.loc, hit.strand);
                 if seen.insert(key) {
-                    result.push(*hit);
+                    if hit.strand & 1 == 0 {
+                        read_chain_0.push(*hit);
+                    } else {
+                        read_chain_1.push(*hit);
+                    }
                 }
             }
-            if !result.is_empty() {
+            if !read_chain_0.is_empty() || !read_chain_1.is_empty() {
                 best_snp = snp_level as u8;
                 break;
             }
         }
     }
 
+    read_chain_0.extend(read_chain_1);
+    let result = read_chain_0;
     (result, best_snp)
 }
 
@@ -554,6 +561,36 @@ mod tests {
         let mut sorted = order;
         sorted.sort_unstable();
         assert_eq!(sorted, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn best_hits_match_cpp_read_chain_grouping() {
+        let mut levels = vec![Vec::new(); HIT_LEVELS];
+        levels[0] = vec![
+            GHit {
+                strand: 1,
+                ..hit(10, 0)
+            },
+            GHit {
+                strand: 0,
+                ..hit(20, 0)
+            },
+            GHit {
+                strand: 3,
+                ..hit(30, 0)
+            },
+            GHit {
+                strand: 2,
+                ..hit(40, 0)
+            },
+        ];
+
+        let (best, snps) = select_best_hits(&levels);
+        assert_eq!(snps, 0);
+        assert_eq!(
+            best.iter().map(|hit| hit.loc).collect::<Vec<_>>(),
+            vec![20, 40, 10, 30]
+        );
     }
 
     #[test]

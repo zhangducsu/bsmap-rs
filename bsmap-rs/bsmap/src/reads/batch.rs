@@ -27,6 +27,7 @@ use super::fastq::RawRead;
 pub fn process_batch(
     raw_reads: Vec<RawRead>,
     read_set: u32,
+    start_index: u32,
     config: &AlignConfig,
 ) -> Vec<ReadInf> {
     let mut result = Vec::with_capacity(raw_reads.len());
@@ -93,7 +94,7 @@ pub fn process_batch(
         };
 
         result.push(ReadInf {
-            index: i as u32,
+            index: start_index + i as u32,
             read_set,
             name,
             seq,
@@ -330,7 +331,7 @@ mod tests {
             },
         ];
 
-        let result = process_batch(raw_reads, 0, &config);
+        let result = process_batch(raw_reads, 0, 0, &config);
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].name, "read1");
@@ -357,7 +358,7 @@ mod tests {
             },
         ];
 
-        let result = process_batch(raw_reads, 0, &config);
+        let result = process_batch(raw_reads, 0, 0, &config);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "good");
@@ -375,7 +376,7 @@ mod tests {
             qual: vec![73u8, 73, 73, 73, 73, 73, 35, 35],
         }];
 
-        let result = process_batch(raw_reads, 0, &config);
+        let result = process_batch(raw_reads, 0, 0, &config);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].seq, b"ACGTAC");
@@ -394,7 +395,7 @@ mod tests {
             qual: vec![73u8; 8],
         }];
 
-        let result = process_batch(raw_reads, 0, &config);
+        let result = process_batch(raw_reads, 0, 0, &config);
 
         assert_eq!(result.len(), 0, "短于 min_read_size 的读段应被过滤");
     }
@@ -410,7 +411,7 @@ mod tests {
             qual: vec![73u8; 12],
         }];
 
-        let result = process_batch(raw_reads, 0, &config);
+        let result = process_batch(raw_reads, 0, 0, &config);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].seq, b"ACGTA");
@@ -427,7 +428,7 @@ mod tests {
             qual: vec![], // FASTA 无质量值
         }];
 
-        let result = process_batch(raw_reads, 0, &config);
+        let result = process_batch(raw_reads, 0, 0, &config);
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].qual.len(), 8);
@@ -445,7 +446,7 @@ mod tests {
             qual: vec![73u8; 8],
         }];
 
-        let result = process_batch(raw_reads, 1, &config);
+        let result = process_batch(raw_reads, 1, 0, &config);
 
         assert_eq!(result[0].read_set, 1);
     }
@@ -455,8 +456,29 @@ mod tests {
         let config = test_config();
         let raw_reads: Vec<RawRead> = Vec::new();
 
-        let result = process_batch(raw_reads, 0, &config);
+        let result = process_batch(raw_reads, 0, 0, &config);
 
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_process_batch_preserves_global_index_offset() {
+        let config = test_config();
+        let raw_reads = vec![
+            RawRead {
+                name: b"read100".to_vec(),
+                seq: b"ACGTACGT".to_vec(),
+                qual: vec![73u8; 8],
+            },
+            RawRead {
+                name: b"read101".to_vec(),
+                seq: b"TGCATGCA".to_vec(),
+                qual: vec![73u8; 8],
+            },
+        ];
+
+        let result = process_batch(raw_reads, 0, 100, &config);
+        assert_eq!(result[0].index, 100);
+        assert_eq!(result[1].index, 101);
     }
 }
