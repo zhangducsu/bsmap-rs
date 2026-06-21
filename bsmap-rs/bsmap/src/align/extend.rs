@@ -360,10 +360,10 @@ pub(crate) fn snp_align_segment(
                     let (chr, mut loc) = coll.int2hit(alignment_start);
 
                     if ref_chain == 1 {
-                        // C++ int2hit() flips against title[chr].rc_offset, which includes padding.
-                        // AddHit() then validates the converted location against the true length.
-                        let rc_offset = coll.total_len_for_chr(chr as usize);
-                        let Some(reverse_loc) = rc_offset
+                        // WGBS flat reverse positions are already normalized to the true
+                        // chromosome span, unlike RRBS block-local positions.
+                        let chr_len = crate::align::output::get_chromosome_length(chr, coll);
+                        let Some(reverse_loc) = chr_len
                             .checked_sub(read_len)
                             .and_then(|end| end.checked_sub(loc))
                         else {
