@@ -51,6 +51,9 @@ const INDEX_VERSION_V2: u32 = 2;
 /// Version 3: version 2 layout with mode-aware RRBS hit encoding.
 const INDEX_VERSION_RRBS_MODE_AWARE: u32 = 3;
 
+/// 版本 4：reference metadata 同时保存染色体真实长度。
+const INDEX_VERSION_CHR_LENGTHS: u32 = 4;
+
 /// WGBS alignment mode.
 const MODE_WGBS: u32 = 0;
 
@@ -214,18 +217,21 @@ pub fn save_index_v2(
     ref_names: &[String],
     is_rrbs: bool,
 ) -> Result<()> {
+    if coll.chr_lengths.len() != ref_names.len() {
+        bail!(
+            "Reference name/length count mismatch: {} names, {} lengths",
+            ref_names.len(),
+            coll.chr_lengths.len(),
+        );
+    }
     let file = File::create(path)
         .with_context(|| format!("Cannot create index file: {}", path.display()))?;
     let mut writer = BufWriter::new(file);
 
-    // ── Header (version 2) ──
+    // ── 当前完整索引格式的 header ──
     let mut header = [0u8; HEADER_SIZE];
     header[0..8].copy_from_slice(INDEX_MAGIC);
-    let version = if is_rrbs {
-        INDEX_VERSION_RRBS_MODE_AWARE
-    } else {
-        INDEX_VERSION_V2
-    };
+    let version = INDEX_VERSION_CHR_LENGTHS;
     header[8..12].copy_from_slice(&version.to_le_bytes());
     header[12..16].copy_from_slice(&seed_size.to_le_bytes());
     let mode = if is_rrbs { MODE_RRBS } else { MODE_WGBS };
@@ -236,16 +242,17 @@ pub fn save_index_v2(
     header[32..40].copy_from_slice(&max_kmer_ratio.to_le_bytes());
     header[40..44].copy_from_slice(&(ref_names.len() as u32).to_le_bytes());
 
-    // Serialize reference names
+    // reference metadata：每个名称后紧跟染色体真实长度。
     let mut names_buf: Vec<u8> = Vec::new();
-    for name in ref_names {
+    for (name, &chr_len) in ref_names.iter().zip(&coll.chr_lengths) {
         let name_bytes = name.as_bytes();
         names_buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
         names_buf.extend_from_slice(name_bytes);
+        names_buf.extend_from_slice(&chr_len.to_le_bytes());
     }
     header[44..48].copy_from_slice(&(names_buf.len() as u32).to_le_bytes());
 
-    // Version 2 new fields: refcat/crefcat word counts
+    // 完整索引字段：refcat/crefcat word 数量。
     let refcat_slice = coll.refcat.as_slice();
     let crefcat_slice = coll.crefcat.as_slice();
     header[48..56].copy_from_slice(&(refcat_slice.len() as u64).to_le_bytes());
@@ -284,7 +291,7 @@ pub fn save_index_v2(
 
     writer.flush().context("Failed to flush index file")?;
     log::info!(
-        "索引已保存到 {} (v2, refcat={} words, crefcat={} words)",
+        "索引已保存到 {} (v4, refcat={} words, crefcat={} words)",
         path.display(),
         refcat_slice.len(),
         crefcat_slice.len(),
@@ -303,6 +310,7 @@ pub struct IndexMeta {
     pub index_interval: u32,
     pub max_kmer_ratio: f64,
     pub ref_names: Vec<String>,
+    pub ref_lengths: Vec<u32>,
 }
 
 /// Load index metadata from a file without deserializing the full index.
@@ -332,13 +340,15 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
     if version != INDEX_VERSION
         && version != INDEX_VERSION_V2
         && version != INDEX_VERSION_RRBS_MODE_AWARE
+        && version != INDEX_VERSION_CHR_LENGTHS
     {
         bail!(
-            "Unsupported index version {} (expected {}, {}, or {}): {}",
+            "Unsupported index version {} (expected {}, {}, {}, or {}): {}",
             version,
             INDEX_VERSION,
             INDEX_VERSION_V2,
             INDEX_VERSION_RRBS_MODE_AWARE,
+            INDEX_VERSION_CHR_LENGTHS,
             path.display()
         );
     }
@@ -359,6 +369,7 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
         .context("Failed to read reference names")?;
 
     let mut ref_names = Vec::with_capacity(num_refs as usize);
+    let mut ref_lengths = Vec::with_capacity(num_refs as usize);
     let mut offset = 0;
     while offset < names_buf.len() && ref_names.len() < num_refs as usize {
         if offset + 2 > names_buf.len() {
@@ -372,6 +383,20 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
         let name = String::from_utf8_lossy(&names_buf[offset..offset + len]).to_string();
         ref_names.push(name);
         offset += len;
+        if version >= INDEX_VERSION_CHR_LENGTHS {
+            if offset + 4 > names_buf.len() {
+                bail!("Truncated reference length metadata: {}", path.display());
+            }
+            ref_lengths.push(u32::from_le_bytes(
+                names_buf[offset..offset + 4].try_into().unwrap(),
+            ));
+            offset += 4;
+        }
+    }
+    if version >= INDEX_VERSION_CHR_LENGTHS
+        && (ref_names.len() != num_refs as usize || ref_lengths.len() != num_refs as usize)
+    {
+        bail!("Incomplete reference metadata: {}", path.display());
     }
 
     Ok(IndexMeta {
@@ -383,6 +408,7 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
         index_interval,
         max_kmer_ratio,
         ref_names,
+        ref_lengths,
     })
 }
 
@@ -495,11 +521,12 @@ pub fn load_index_with_mode(
             .context("Failed to deserialize index data")?;
         let index = reconstruct_kmer_index(data, meta.seed_size);
         let coll = BinSeqCollection {
-            total_num: 0,
-            sum_length: 0,
+            total_num: meta.ref_names.len() as u32 * 2,
+            sum_length: meta.ref_lengths.iter().map(|&len| len as u64).sum(),
             refcat: Box::new(VecStorage::new(vec![])),
             crefcat: Box::new(VecStorage::new(vec![])),
             ref_anchor: vec![],
+            chr_lengths: meta.ref_lengths.clone(),
             blocks: vec![],
             seqs: vec![],
             chr_names: meta.ref_names.clone(),
@@ -512,7 +539,10 @@ pub fn load_index_with_mode(
         return Ok((coll, index, meta));
     }
 
-    if version != INDEX_VERSION_V2 && version != INDEX_VERSION_RRBS_MODE_AWARE {
+    if version != INDEX_VERSION_V2
+        && version != INDEX_VERSION_RRBS_MODE_AWARE
+        && version != INDEX_VERSION_CHR_LENGTHS
+    {
         bail!(
             "Unsupported index version {}: {}",
             version,
@@ -570,11 +600,12 @@ pub fn load_index_with_mode(
                 reader.read_exact(bytes)?;
             }
             let coll = BinSeqCollection {
-                total_num: 0,
-                sum_length: 0,
+                total_num: meta.ref_names.len() as u32 * 2,
+                sum_length: meta.ref_lengths.iter().map(|&len| len as u64).sum(),
                 refcat: Box::new(VecStorage::new(refcat_data)),
                 crefcat: Box::new(VecStorage::new(crefcat_data)),
                 ref_anchor: vec![],
+                chr_lengths: meta.ref_lengths.clone(),
                 blocks: vec![],
                 seqs: vec![],
                 chr_names: meta.ref_names.clone(),
@@ -585,8 +616,9 @@ pub fn load_index_with_mode(
                     .collect(),
             };
             log::info!(
-                "索引已从 {} 加载 (v2, memory, refcat={} words, crefcat={} words)",
+                "索引已从 {} 加载 (v{}, memory, refcat={} words, crefcat={} words)",
                 path.display(),
+                version,
                 refcat_len,
                 crefcat_len,
             );
@@ -600,11 +632,12 @@ pub fn load_index_with_mode(
             let refcat_storage = MmapStorage::with_offset(mmap1, refcat_offset, refcat_len);
             let crefcat_storage = MmapStorage::with_offset(mmap2, crefcat_offset, crefcat_len);
             let coll = BinSeqCollection {
-                total_num: 0,
-                sum_length: 0,
+                total_num: meta.ref_names.len() as u32 * 2,
+                sum_length: meta.ref_lengths.iter().map(|&len| len as u64).sum(),
                 refcat: Box::new(refcat_storage),
                 crefcat: Box::new(crefcat_storage),
                 ref_anchor: vec![],
+                chr_lengths: meta.ref_lengths.clone(),
                 blocks: vec![],
                 seqs: vec![],
                 chr_names: meta.ref_names.clone(),
@@ -615,8 +648,9 @@ pub fn load_index_with_mode(
                     .collect(),
             };
             log::info!(
-                "索引已从 {} 加载 (v2, mmap, refcat={} words, crefcat={} words)",
+                "索引已从 {} 加载 (v{}, mmap, refcat={} words, crefcat={} words)",
                 path.display(),
+                version,
                 refcat_len,
                 crefcat_len,
             );
@@ -674,7 +708,7 @@ pub fn is_index_compatible(
     }
 
     let meta = read_index_meta(path)?;
-    if is_rrbs && meta.version != INDEX_VERSION_RRBS_MODE_AWARE {
+    if is_rrbs && meta.version != INDEX_VERSION_CHR_LENGTHS {
         log::info!(
             "缂撳瓨 RRBS 绱㈠紩鐗堟湰 {} 涓嶅吋瀹癸紝闇€瑕侀噸寤虹储寮?",
             meta.version,
@@ -772,6 +806,25 @@ mod tests {
         for (a, b) in loaded_index.index2.iter().zip(index.index2.iter()) {
             assert_eq!(a.n, b.n);
         }
+    }
+
+    #[test]
+    fn test_v4_save_load_preserves_chromosome_lengths() {
+        let refs = make_test_refs();
+        let coll = BinSeqCollection::from_references(&refs);
+        let ref_names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
+        let index = KmerIndex::build_wgbs(&coll, 3, 4, 0.01);
+        let tmp = NamedTempFile::new().unwrap();
+
+        save_index_v2(tmp.path(), &index, &coll, 3, 4, 0.01, &ref_names, false).unwrap();
+        let (loaded_coll, _loaded_index, meta) =
+            load_index_with_mode(tmp.path(), LoadMode::Memory).unwrap();
+
+        assert_eq!(meta.version, INDEX_VERSION_CHR_LENGTHS);
+        assert_eq!(meta.ref_lengths, vec![32, 12]);
+        assert_eq!(loaded_coll.chr_lengths, coll.chr_lengths);
+        assert_eq!(loaded_coll.sum_length, coll.sum_length);
+        assert_eq!(loaded_coll.total_num, coll.total_num);
     }
 
     #[test]

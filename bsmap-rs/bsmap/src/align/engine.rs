@@ -247,6 +247,8 @@ impl SingleAlign {
                     &mut self.level_counts,
                     &mut snp_thres,
                     config.max_num_hits as usize,
+                    &coll.chr_lengths,
+                    read_len,
                     &mut self.dedup_no_gap,
                     &mut self.dedup_gap,
                 );
@@ -258,6 +260,7 @@ impl SingleAlign {
                     read_chain,
                     config.gap,
                     config.nt3,
+                    config.randseed,
                     query,
                     mask,
                     n_count,

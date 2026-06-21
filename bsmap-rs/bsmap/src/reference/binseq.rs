@@ -52,6 +52,8 @@ pub struct BinSeqCollection {
     /// Anchor positions: ref_anchor[chr/2] + loc → flattened offset.
     /// Length = total_num + 1 (sentinel at end).
     pub ref_anchor: Vec<u32>,
+    /// FASTA 中每条染色体的真实长度，不含对齐和二进制存储 padding。
+    pub chr_lengths: Vec<u32>,
     /// Unmasked regions sorted by (id, begin).
     pub blocks: Vec<Block>,
     /// Per-chromosome BinarySeq (for other consumers, not used in alignment).
@@ -130,6 +132,7 @@ impl BinSeqCollection {
         }
 
         let sum_length: u64 = refs.iter().map(|r| r.len as u64).sum();
+        let chr_lengths: Vec<u32> = refs.iter().map(|r| r.len).collect();
 
         // Collect chromosome names
         let chr_names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
@@ -146,6 +149,7 @@ impl BinSeqCollection {
             refcat: Box::new(VecStorage::new(refcat)),
             crefcat: Box::new(VecStorage::new(crefcat)),
             ref_anchor,
+            chr_lengths,
             blocks,
             seqs: Vec::new(),
             chr_names,
@@ -390,6 +394,7 @@ mod tests {
         let coll = BinSeqCollection::from_references(&refs);
         assert_eq!(coll.total_num, 4); // 2 chr × 2 strands
         assert_eq!(coll.sum_length, 36);
+        assert_eq!(coll.chr_lengths, vec![32, 4]);
         // P12: ref_anchor is per-chromosome (not per-strand), so length = num_chr + 1
         assert_eq!(coll.ref_anchor.len(), 3);
     }

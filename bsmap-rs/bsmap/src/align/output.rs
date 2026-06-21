@@ -378,6 +378,9 @@ pub fn get_reference_name(chr: u32, coll: &BinSeqCollection) -> String {
 /// 从 ref_anchor 计算染色体长度（不包括 BINSEQPAD padding）。
 pub fn get_chromosome_length(chr: u32, coll: &BinSeqCollection) -> u32 {
     let chr_idx = chr as usize;
+    if let Some(&length) = coll.chr_lengths.get(chr_idx) {
+        return length;
+    }
     if chr_idx + 1 >= coll.ref_anchor.len() {
         return 0;
     }
@@ -684,5 +687,25 @@ mod tests {
         assert!(header.contains("@PG"));
         assert!(header.contains("bsmap"));
         assert!(header.contains("1.0.0"));
+    }
+
+    #[test]
+    fn test_get_chromosome_length_uses_true_reference_lengths() {
+        let refs = vec![
+            crate::reference::fasta::Reference {
+                name: "chr1".to_string(),
+                seq: vec![b'A'; 33],
+                len: 33,
+            },
+            crate::reference::fasta::Reference {
+                name: "chr2".to_string(),
+                seq: vec![b'C'; 5],
+                len: 5,
+            },
+        ];
+        let coll = crate::reference::binseq::BinSeqCollection::from_references(&refs);
+
+        assert_eq!(get_chromosome_length(0, &coll), 33);
+        assert_eq!(get_chromosome_length(1, &coll), 5);
     }
 }
