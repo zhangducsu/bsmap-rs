@@ -57,6 +57,9 @@ const INDEX_VERSION_CHR_LENGTHS: u32 = 4;
 /// Version 5: compact RRBS offset table plus flat hit storage.
 const INDEX_VERSION_RRBS_FLAT: u32 = 5;
 
+/// Version 6: persists RRBS digestion sites for C++-compatible ZP/ZL tags.
+const INDEX_VERSION_RRBS_SITES: u32 = 6;
+
 /// WGBS alignment mode.
 const MODE_WGBS: u32 = 0;
 
@@ -94,17 +97,6 @@ struct IndexDataV4 {
     rrbs_index: Option<Vec<IndexKmerLoc>>,
 }
 
-#[derive(Serialize)]
-struct IndexDataV5Ref<'a> {
-    total_kmers: u32,
-    max_kmer_num: u32,
-    index2: Vec<IndexKmerLoc2>,
-    positions: &'a [u32],
-    start_offsets: &'a [u32],
-    rrbs_offsets: &'a [u32],
-    rrbs_hits: &'a [crate::param::Hit],
-}
-
 #[derive(Deserialize)]
 struct IndexDataV5 {
     total_kmers: u32,
@@ -114,6 +106,32 @@ struct IndexDataV5 {
     start_offsets: Vec<u32>,
     rrbs_offsets: Vec<u32>,
     rrbs_hits: Vec<crate::param::Hit>,
+}
+
+#[derive(Serialize)]
+struct IndexDataV6Ref<'a> {
+    total_kmers: u32,
+    max_kmer_num: u32,
+    index2: Vec<IndexKmerLoc2>,
+    positions: &'a [u32],
+    start_offsets: &'a [u32],
+    rrbs_offsets: &'a [u32],
+    rrbs_hits: &'a [crate::param::Hit],
+    rrbs_site_offsets: &'a [u32],
+    rrbs_sites: &'a [(u32, u32)],
+}
+
+#[derive(Deserialize)]
+struct IndexDataV6 {
+    total_kmers: u32,
+    max_kmer_num: u32,
+    index2: Vec<IndexKmerLoc2>,
+    positions: Vec<u32>,
+    start_offsets: Vec<u32>,
+    rrbs_offsets: Vec<u32>,
+    rrbs_hits: Vec<crate::param::Hit>,
+    rrbs_site_offsets: Vec<u32>,
+    rrbs_sites: Vec<(u32, u32)>,
 }
 
 /// Serializable WGBS index entry.
@@ -142,20 +160,18 @@ struct IndexHit {
 
 // ── Conversion ───────────────────────────────────────────────────────────────
 
-impl<'a> From<&'a KmerIndex> for IndexDataV5Ref<'a> {
+impl<'a> From<&'a KmerIndex> for IndexDataV6Ref<'a> {
     fn from(idx: &'a KmerIndex) -> Self {
         Self {
             total_kmers: idx.total_kmers,
             max_kmer_num: idx.max_kmer_num,
-            index2: idx
-                .index2
-                .iter()
-                .map(|e| IndexKmerLoc2 { n: e.n })
-                .collect(),
+            index2: idx.index2.iter().map(|e| IndexKmerLoc2 { n: e.n }).collect(),
             positions: &idx.positions,
             start_offsets: &idx.start_offsets,
             rrbs_offsets: &idx.rrbs_offsets,
             rrbs_hits: &idx.rrbs_hits,
+            rrbs_site_offsets: &idx.rrbs_site_offsets,
+            rrbs_sites: &idx.rrbs_sites,
         }
     }
 }
@@ -250,7 +266,7 @@ pub fn save_index_v2(
     // ── 当前完整索引格式的 header ──
     let mut header = [0u8; HEADER_SIZE];
     header[0..8].copy_from_slice(INDEX_MAGIC);
-    let version = INDEX_VERSION_RRBS_FLAT;
+    let version = INDEX_VERSION_RRBS_SITES;
     header[8..12].copy_from_slice(&version.to_le_bytes());
     header[12..16].copy_from_slice(&seed_size.to_le_bytes());
     let mode = if is_rrbs { MODE_RRBS } else { MODE_WGBS };
@@ -281,7 +297,7 @@ pub fn save_index_v2(
     writer.write_all(&names_buf).context("Failed to write reference names")?;
 
     // ── Index data (bincode) ──
-    let data = IndexDataV5Ref::from(index);
+    let data = IndexDataV6Ref::from(index);
     bincode_opts()
         .serialize_into(&mut writer, &data)
         .context("Failed to serialize index data")?;
@@ -310,8 +326,9 @@ pub fn save_index_v2(
 
     writer.flush().context("Failed to flush index file")?;
     log::info!(
-        "索引已保存到 {} (v5, refcat={} words, crefcat={} words)",
+        "索引已保存到 {} (v{}, refcat={} words, crefcat={} words)",
         path.display(),
+        version,
         refcat_slice.len(),
         crefcat_slice.len(),
     );
@@ -361,15 +378,17 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
         && version != INDEX_VERSION_RRBS_MODE_AWARE
         && version != INDEX_VERSION_CHR_LENGTHS
         && version != INDEX_VERSION_RRBS_FLAT
+        && version != INDEX_VERSION_RRBS_SITES
     {
         bail!(
-            "Unsupported index version {} (expected {}, {}, {}, {}, or {}): {}",
+            "Unsupported index version {} (expected {}, {}, {}, {}, {}, or {}): {}",
             version,
             INDEX_VERSION,
             INDEX_VERSION_V2,
             INDEX_VERSION_RRBS_MODE_AWARE,
             INDEX_VERSION_CHR_LENGTHS,
             INDEX_VERSION_RRBS_FLAT,
+            INDEX_VERSION_RRBS_SITES,
             path.display()
         );
     }
@@ -568,6 +587,7 @@ pub fn load_index_with_mode(
         && version != INDEX_VERSION_RRBS_MODE_AWARE
         && version != INDEX_VERSION_CHR_LENGTHS
         && version != INDEX_VERSION_RRBS_FLAT
+        && version != INDEX_VERSION_RRBS_SITES
     {
         bail!(
             "Unsupported index version {}: {}",
@@ -687,6 +707,12 @@ fn deserialize_kmer_index<R: Read>(
     version: u32,
     seed_size: u32,
 ) -> Result<KmerIndex> {
+    if version >= INDEX_VERSION_RRBS_SITES {
+        let data: IndexDataV6 = bincode_opts()
+            .deserialize_from(reader)
+            .context("Failed to deserialize v6 index data")?;
+        return Ok(reconstruct_kmer_index_v6(data, seed_size));
+    }
     if version >= INDEX_VERSION_RRBS_FLAT {
         let data: IndexDataV5 = bincode_opts()
             .deserialize_from(reader)
@@ -698,6 +724,21 @@ fn deserialize_kmer_index<R: Read>(
         .deserialize_from(reader)
         .context("Failed to deserialize legacy index data")?;
     Ok(reconstruct_kmer_index_v4(data, seed_size))
+}
+
+fn reconstruct_kmer_index_v6(data: IndexDataV6, seed_size: u32) -> KmerIndex {
+    KmerIndex {
+        total_kmers: data.total_kmers,
+        max_kmer_num: data.max_kmer_num,
+        index2: data.index2.into_iter().map(|e| crate::param::KmerLoc2 { n: e.n }).collect(),
+        positions: data.positions,
+        start_offsets: data.start_offsets,
+        rrbs_offsets: data.rrbs_offsets,
+        rrbs_hits: data.rrbs_hits,
+        rrbs_site_offsets: data.rrbs_site_offsets,
+        rrbs_sites: data.rrbs_sites,
+        seed_size,
+    }
 }
 
 fn reconstruct_kmer_index_v5(data: IndexDataV5, seed_size: u32) -> KmerIndex {
@@ -715,6 +756,8 @@ fn reconstruct_kmer_index_v5(data: IndexDataV5, seed_size: u32) -> KmerIndex {
         start_offsets: data.start_offsets,
         rrbs_offsets: data.rrbs_offsets,
         rrbs_hits: data.rrbs_hits,
+        rrbs_site_offsets: Vec::new(),
+        rrbs_sites: Vec::new(),
         seed_size,
     }
 }
@@ -749,6 +792,8 @@ fn reconstruct_kmer_index_v4(data: IndexDataV4, seed_size: u32) -> KmerIndex {
         start_offsets: data.start_offsets,
         rrbs_offsets,
         rrbs_hits,
+        rrbs_site_offsets: Vec::new(),
+        rrbs_sites: Vec::new(),
         seed_size,
     }
 }
@@ -769,7 +814,7 @@ pub fn is_index_compatible(
     }
 
     let meta = read_index_meta(path)?;
-    if is_rrbs && meta.version != INDEX_VERSION_RRBS_FLAT {
+    if is_rrbs && meta.version != INDEX_VERSION_RRBS_SITES {
         log::info!(
             "缂撳瓨 RRBS 绱㈠紩鐗堟湰 {} 涓嶅吋瀹癸紝闇€瑕侀噸寤虹储寮?",
             meta.version,
@@ -870,7 +915,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v5_save_load_preserves_chromosome_lengths() {
+    fn test_v6_save_load_preserves_chromosome_lengths() {
         let refs = make_test_refs();
         let coll = BinSeqCollection::from_references(&refs);
         let ref_names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
@@ -881,7 +926,7 @@ mod tests {
         let (loaded_coll, _loaded_index, meta) =
             load_index_with_mode(tmp.path(), LoadMode::Memory).unwrap();
 
-        assert_eq!(meta.version, INDEX_VERSION_RRBS_FLAT);
+        assert_eq!(meta.version, INDEX_VERSION_RRBS_SITES);
         assert_eq!(meta.ref_lengths, vec![32, 12]);
         assert_eq!(loaded_coll.chr_lengths, coll.chr_lengths);
         assert_eq!(loaded_coll.sum_length, coll.sum_length);
@@ -889,7 +934,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v5_rrbs_roundtrip_preserves_flat_buckets() {
+    fn test_v6_rrbs_roundtrip_preserves_flat_buckets_and_sites() {
         let refs = vec![Reference {
             name: "chr1".into(),
             seq: b"ACGTCCGGAAAAAAAAAAAAAAAAAAAAAAACCGGTTTTTTTTTTTTTTTTTTTTTTTTCCGG"
@@ -914,10 +959,12 @@ mod tests {
         let (_loaded_coll, loaded, meta) =
             load_index_with_mode(tmp.path(), LoadMode::Memory).unwrap();
 
-        assert_eq!(meta.version, INDEX_VERSION_RRBS_FLAT);
+        assert_eq!(meta.version, INDEX_VERSION_RRBS_SITES);
         assert!(meta.is_rrbs);
         assert_eq!(loaded.rrbs_offsets, index.rrbs_offsets);
         assert_eq!(loaded.rrbs_hits, index.rrbs_hits);
+        assert_eq!(loaded.rrbs_site_offsets, index.rrbs_site_offsets);
+        assert_eq!(loaded.rrbs_sites, index.rrbs_sites);
         for hash in 0..index.total_kmers {
             assert_eq!(loaded.lookup_rrbs(hash), index.lookup_rrbs(hash));
         }

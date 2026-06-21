@@ -673,6 +673,8 @@ mod tests {
             start_offsets: Vec::new(),
             rrbs_offsets,
             rrbs_hits,
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
             seed_size: 2,
         }
     }
@@ -792,6 +794,8 @@ mod tests {
             start_offsets: vec![0, 0],
             rrbs_offsets: Vec::new(),
             rrbs_hits: Vec::new(),
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
             seed_size: 2,
         };
 
@@ -815,6 +819,8 @@ mod tests {
             start_offsets: vec![],
             rrbs_offsets: Vec::new(),
             rrbs_hits: Vec::new(),
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
             seed_size: 16,
         };
 

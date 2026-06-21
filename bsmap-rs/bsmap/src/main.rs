@@ -563,6 +563,7 @@ fn run_single_align(
                     output,
                     &reads[result.read_idx as usize],
                     result,
+                    index,
                     coll,
                     config,
                 )?;
@@ -739,6 +740,7 @@ fn output_alignment(
     output: &mut OutputWriter,
     read: &ReadInf,
     result: &AlignmentResult,
+    index: &KmerIndex,
     coll: &BinSeqCollection,
     config: &AlignConfig,
 ) -> Result<()> {
@@ -761,7 +763,22 @@ fn output_alignment(
 
         let line = match config.out_sam {
             0 => format_bsp(read, hit, coll, config, if result.is_unique { "UM" } else { "MA" }),
-            _ => format_sam(read, hit, coll, config, result.is_unique, total_hits),
+            _ => {
+                let fragment = if config.rrbs_flag {
+                    index.rrbs_fragment(hit.chr, hit.loc, read.seq.len() as u32)
+                } else {
+                    None
+                };
+                format_sam(
+                    read,
+                    hit,
+                    coll,
+                    config,
+                    result.is_unique,
+                    total_hits,
+                    fragment,
+                )
+            }
         };
 
         write_output_line(output, &line)?;

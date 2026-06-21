@@ -11,7 +11,7 @@ use crate::alphabet::make_seed;
 use crate::param::{Hit, KmerLoc2, SEGLEN};
 use crate::reference::binseq::{BinSeqCollection, Block};
 use crate::reference::fasta::Reference;
-use crate::reference::rrbs::{build_rrbs_index, DigestionSite};
+use crate::reference::rrbs::{build_rrbs_index_from_sites, find_sites, DigestionSite};
 
 /// Prefetch lookahead for frequency counting.
 const PREFETCH_CAL_UNIT: usize = 8;
@@ -69,6 +69,10 @@ pub struct KmerIndex {
     pub rrbs_offsets: Vec<u32>,
     /// Flat RRBS hit storage in the same order as C++ `FillIndex()`.
     pub rrbs_hits: Vec<Hit>,
+    /// Per-chromosome boundaries into `rrbs_sites`.
+    pub(crate) rrbs_site_offsets: Vec<u32>,
+    /// Sorted `(cut_position, reverse_offset)` pairs used for RRBS ZP/ZL.
+    pub(crate) rrbs_sites: Vec<(u32, u32)>,
 
     /// Seed size (k-mer length), required for RRBS position conversion.
     pub seed_size: u32,
@@ -83,6 +87,8 @@ pub struct RrbsIndexBuilder {
     min_insert: u32,
     max_insert: u32,
     ccgg_index: Vec<Vec<Vec<(u32, u32)>>>,
+    rrbs_site_offsets: Vec<u32>,
+    rrbs_sites: Vec<(u32, u32)>,
 }
 
 impl RrbsIndexBuilder {
@@ -106,22 +112,29 @@ impl RrbsIndexBuilder {
             min_insert,
             max_insert,
             ccgg_index: vec![vec![Vec::new(); total_blocks]; max_modes as usize],
+            rrbs_site_offsets: vec![0],
+            rrbs_sites: Vec::new(),
         }
     }
 
     pub fn push_reference(&mut self, chromosome_index: usize, reference: &Reference) {
-        if self.sites.is_empty() || chromosome_index * 2 + 1 >= self.total_blocks {
+        if chromosome_index * 2 + 1 >= self.total_blocks {
+            return;
+        }
+        let chromosome_sites = find_sites(&reference.seq, &self.sites);
+        self.rrbs_sites.extend_from_slice(&chromosome_sites);
+        self.rrbs_site_offsets.push(self.rrbs_sites.len() as u32);
+        if chromosome_sites.is_empty() {
             return;
         }
         let rc_offset = ((reference.len + SEGLEN as u32 - 1) / SEGLEN as u32
             + crate::param::BINSEQPAD as u32)
             * SEGLEN as u32;
-        let digested = build_rrbs_index(
-            &reference.seq,
+        let digested = build_rrbs_index_from_sites(
+            &chromosome_sites,
             reference.len,
             rc_offset,
             self.seed_size,
-            &self.sites,
             self.min_insert,
             self.max_insert,
         );
@@ -140,13 +153,16 @@ impl RrbsIndexBuilder {
     }
 
     pub fn finish(self, coll: &BinSeqCollection) -> KmerIndex {
-        build_flat_rrbs_index(
+        let mut index = build_flat_rrbs_index(
             coll,
             &self.ccgg_index,
             self.total_blocks,
             self.seed_size,
             self.total_kmers,
-        )
+        );
+        index.rrbs_site_offsets = self.rrbs_site_offsets;
+        index.rrbs_sites = self.rrbs_sites;
+        index
     }
 }
 
@@ -301,6 +317,8 @@ impl KmerIndex {
             start_offsets,
             rrbs_offsets: Vec::new(),
             rrbs_hits: Vec::new(),
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
             seed_size,
         }
     }
@@ -330,6 +348,43 @@ impl KmerIndex {
             builder.push_reference(chromosome_index, reference);
         }
         builder.finish(coll)
+    }
+
+    /// Return C++ `CCGG_seglen()` output `(ZP, ZL)` for an RRBS alignment.
+    pub fn rrbs_fragment(&self, chr: u32, pos: u32, read_len: u32) -> Option<(u32, u32)> {
+        let chr = chr as usize;
+        let start = *self.rrbs_site_offsets.get(chr)? as usize;
+        let end = *self.rrbs_site_offsets.get(chr + 1)? as usize;
+        let sites = self.rrbs_sites.get(start..end)?;
+        if sites.len() < 2 {
+            return None;
+        }
+
+        let mut left = 0usize;
+        let mut right = sites.len() - 1;
+        while left < right - 1 {
+            let mid = (left + right) / 2;
+            if sites[mid].0 == pos {
+                left = mid;
+                right = mid + 1;
+                break;
+            } else if sites[mid].0 < pos {
+                left = mid;
+            } else {
+                right = mid;
+            }
+        }
+
+        let target_end = pos.checked_add(read_len)?;
+        while right < sites.len() {
+            let site_end = sites[right].0.checked_add(sites[right].1)?;
+            if site_end >= target_end {
+                let segment_start = sites[left].0;
+                return Some((segment_start + 1, site_end - segment_start));
+            }
+            right += 1;
+        }
+        None
     }
 
     /// Look up k-mer seed in WGBS index.
@@ -469,6 +524,8 @@ fn build_flat_rrbs_index(
             start_offsets: Vec::new(),
             rrbs_offsets: Vec::new(),
             rrbs_hits: Vec::new(),
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
             seed_size,
         };
     }
@@ -513,6 +570,8 @@ fn build_flat_rrbs_index(
         start_offsets: Vec::new(),
         rrbs_offsets,
         rrbs_hits,
+        rrbs_site_offsets: Vec::new(),
+        rrbs_sites: Vec::new(),
         seed_size,
     }
 }
@@ -723,6 +782,28 @@ mod tests {
 
         assert_eq!(streamed.rrbs_offsets, batch.rrbs_offsets);
         assert_eq!(streamed.rrbs_hits, batch.rrbs_hits);
+        assert_eq!(streamed.rrbs_site_offsets, batch.rrbs_site_offsets);
+        assert_eq!(streamed.rrbs_sites, batch.rrbs_sites);
+    }
+
+    #[test]
+    fn test_rrbs_fragment_matches_cpp_ccgg_seglen() {
+        let index = KmerIndex {
+            total_kmers: 0,
+            max_kmer_num: 0,
+            index2: Vec::new(),
+            positions: Vec::new(),
+            start_offsets: Vec::new(),
+            rrbs_offsets: Vec::new(),
+            rrbs_hits: Vec::new(),
+            rrbs_site_offsets: vec![0, 3],
+            rrbs_sites: vec![(5, 2), (40, 2), (90, 2)],
+            seed_size: 12,
+        };
+
+        assert_eq!(index.rrbs_fragment(0, 10, 20), Some((6, 37)));
+        assert_eq!(index.rrbs_fragment(0, 40, 20), Some((41, 52)));
+        assert_eq!(index.rrbs_fragment(1, 10, 20), None);
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub struct AlignmentRecord {
     pub nm: u32,
     /// 链信息（ZS 标签）。
     pub zs: String,
+    /// RRBS fragment `(ZP, ZL)` tags.
+    pub rrbs_fragment: Option<(u32, u32)>,
     /// 是否为唯一比对。
     pub is_unique: bool,
     /// 总命中数。
@@ -71,8 +73,9 @@ pub fn format_sam(
     config: &AlignConfig,
     is_unique: bool,
     total_hits: usize,
+    rrbs_fragment: Option<(u32, u32)>,
 ) -> String {
-    let record = build_record(read, hit, coll, config, is_unique, total_hits);
+    let record = build_record(read, hit, coll, config, is_unique, total_hits, rrbs_fragment);
     format_sam_record(&record)
 }
 
@@ -152,6 +155,7 @@ fn build_record(
     config: &AlignConfig,
     is_unique: bool,
     total_hits: usize,
+    rrbs_fragment: Option<(u32, u32)>,
 ) -> AlignmentRecord {
     // 获取参考名称
     let ref_name = get_reference_name(hit.chr, coll);
@@ -198,6 +202,7 @@ fn build_record(
         cigar,
         nm: hit.snps as u32,
         zs,
+        rrbs_fragment,
         is_unique,
         total_hits,
     }
@@ -207,8 +212,8 @@ fn build_record(
 fn format_sam_record(record: &AlignmentRecord) -> String {
     // SAM 格式：
     // QNAME\tFLAG\tRNAME\tPOS\tMAPQ\tCIGAR\tRNEXT\tPNEXT\tTLEN\tSEQ\tQUAL\t[TAG:TYPE:VALUE...]
-    format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tNM:i:{}\tZS:Z:{}",
+    let mut output = format!(
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\tNM:i:{}",
         record.read_name,
         record.flag,
         record.ref_name,
@@ -220,9 +225,13 @@ fn format_sam_record(record: &AlignmentRecord) -> String {
         0,   // TLEN
         record.seq,
         record.qual,
-        record.nm,
-        record.zs
-    )
+        record.nm
+    );
+    if let Some((position, length)) = record.rrbs_fragment {
+        output.push_str(&format!("\tZP:i:{}\tZL:i:{}", position, length));
+    }
+    output.push_str(&format!("\tZS:Z:{}", record.zs));
+    output
 }
 
 /// 生成 CIGAR 字符串。
@@ -659,6 +668,7 @@ mod tests {
             cigar: "4M".to_string(),
             nm: 0,
             zs: "++".to_string(),
+            rrbs_fragment: Some((81, 120)),
             is_unique: true,
             total_hits: 1,
         };
@@ -668,6 +678,7 @@ mod tests {
         assert!(sam.contains("chr1"));
         assert!(sam.contains("100"));
         assert!(sam.contains("NM:i:0"));
+        assert!(sam.contains("\tZP:i:81\tZL:i:120\tZS:Z:++"));
         assert!(sam.contains("ZS:Z:++"));
     }
 

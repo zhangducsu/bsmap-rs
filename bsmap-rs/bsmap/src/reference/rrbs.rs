@@ -108,7 +108,9 @@ pub fn find_sites(seq: &[u8], sites: &[DigestionSite]) -> Vec<(u32, u32)> {
         }
     }
 
-    results.sort_by(|a, b| a.0.cmp(&b.0));
+    // C++ sorts std::pair lexicographically, including reverse_offset for
+    // digestion sites that share the same cut position.
+    results.sort_unstable();
     results
 }
 
@@ -126,12 +128,31 @@ pub fn build_rrbs_index(
     min_insert: u32,
     max_insert: u32,
 ) -> RrbsModeIndex {
+    let all_sites = find_sites(seq, sites);
+    build_rrbs_index_from_sites(
+        &all_sites,
+        chr_size,
+        rc_offset,
+        seed_size,
+        min_insert,
+        max_insert,
+    )
+}
+
+/// Build RRBS seed positions from precomputed digestion sites.
+pub fn build_rrbs_index_from_sites(
+    all_sites: &[(u32, u32)],
+    chr_size: u32,
+    rc_offset: u32,
+    seed_size: u32,
+    min_insert: u32,
+    max_insert: u32,
+) -> RrbsModeIndex {
     use crate::param::FIXELEMENT;
 
     let max_seedseg_num = ((FIXELEMENT - 1) * SEGLEN) as u32 / seed_size;
     let mut by_mode = vec![vec![Vec::new(), Vec::new()]; max_seedseg_num as usize];
 
-    let all_sites = find_sites(seq, sites);
     if all_sites.is_empty() {
         return by_mode;
     }
