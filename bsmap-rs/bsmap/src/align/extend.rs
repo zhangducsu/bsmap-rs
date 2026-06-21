@@ -340,83 +340,85 @@ pub(crate) fn snp_align_segment(
             // ── WGBS mode: existing lookup_separated logic ──
             let (fwd_positions, rev_positions) = index.lookup_separated(seed_hash);
 
-            let bucket_len = fwd_positions.len() + rev_positions.len();
-            for bucket_idx in
-                circular_bucket_indices(bucket_len, encoded.info.index, randseed)
-            {
-                let (ref_chain, flat_pos) = if bucket_idx < fwd_positions.len() {
-                    (0u8, fwd_positions[bucket_idx])
+            for ref_chain in 0..2u8 {
+                let positions = if ref_chain == 0 {
+                    fwd_positions
                 } else {
-                    (1u8, rev_positions[bucket_idx - fwd_positions.len()])
+                    rev_positions
                 };
                 let ref_seq = if ref_chain == 0 { fwd_slice } else { rev_slice };
+                if positions.is_empty() {
+                    continue;
+                }
                 let strand = (ref_chain << 1) | read_chain;
 
-                let Some(alignment_start) = flat_pos.checked_sub(seed_pos_in_read) else {
-                    continue;
-                };
-                let ref_offset = alignment_start as u64 * 2;
-                let (chr, mut loc) = coll.int2hit(alignment_start);
-
-                if ref_chain == 1 {
-                    // C++ int2hit() flips against title[chr].rc_offset, which includes padding.
-                    // AddHit() then validates the converted location against the true length.
-                    let rc_offset = coll.total_len_for_chr(chr as usize);
-                    let Some(reverse_loc) = rc_offset
-                        .checked_sub(read_len)
-                        .and_then(|end| end.checked_sub(loc))
-                    else {
+                for &flat_pos in positions {
+                    let Some(alignment_start) = flat_pos.checked_sub(seed_pos_in_read) else {
                         continue;
                     };
-                    loc = reverse_loc;
-                }
+                    let ref_offset = alignment_start as u64 * 2;
+                    let (chr, mut loc) = coll.int2hit(alignment_start);
 
-                if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
-                    continue;
-                }
-
-                let snp_thres = collector.snp_thres();
-                let mm_count =
-                    count_mismatch(query, ref_offset, ref_seq, mask, snp_thres, n_count, nt3);
-
-                if mm_count <= snp_thres {
-                    let hit = GHit {
-                        chr,
-                        loc,
-                        snps: mm_count as u8,
-                        strand,
-                        gap_size: 0,
-                        gap_pos: 0,
-                    };
-                    if collector.try_add_hit(hit, read_chain) {
-                        return true;
+                    if ref_chain == 1 {
+                        // C++ int2hit() flips against title[chr].rc_offset, which includes padding.
+                        // AddHit() then validates the converted location against the true length.
+                        let rc_offset = coll.total_len_for_chr(chr as usize);
+                        let Some(reverse_loc) = rc_offset
+                            .checked_sub(read_len)
+                            .and_then(|end| end.checked_sub(loc))
+                        else {
+                            continue;
+                        };
+                        loc = reverse_loc;
                     }
-                }
 
-                let snp_thres = collector.snp_thres();
-                if gap_size > 0 && mm_count > snp_thres && mm_count <= snp_thres + 2 {
-                    if let Some(gap_result) = gap_align(
-                        query,
-                        ref_seq,
-                        alignment_start,
-                        seed_pos_in_read,
-                        8,
-                        snp_thres,
-                        gap_size,
-                        nt3,
-                        read_len,
-                        3,
-                    ) {
+                    if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
+                        continue;
+                    }
+
+                    let snp_thres = collector.snp_thres();
+                    let mm_count =
+                        count_mismatch(query, ref_offset, ref_seq, mask, snp_thres, n_count, nt3);
+
+                    if mm_count <= snp_thres {
                         let hit = GHit {
                             chr,
                             loc,
-                            snps: gap_result.snp_count as u8,
+                            snps: mm_count as u8,
                             strand,
-                            gap_size: gap_result.gap_size as i16,
-                            gap_pos: gap_result.gap_pos as u16,
+                            gap_size: 0,
+                            gap_pos: 0,
                         };
                         if collector.try_add_hit(hit, read_chain) {
                             return true;
+                        }
+                    }
+
+                    let snp_thres = collector.snp_thres();
+                    if gap_size > 0 && mm_count > snp_thres && mm_count <= snp_thres + 2 {
+                        if let Some(gap_result) = gap_align(
+                            query,
+                            ref_seq,
+                            alignment_start,
+                            seed_pos_in_read,
+                            8,
+                            snp_thres,
+                            gap_size,
+                            nt3,
+                            read_len,
+                            3,
+                        ) {
+                            let hit = GHit {
+                                chr,
+                                loc,
+                                snps: gap_result.snp_count as u8,
+                                strand,
+                                gap_size: gap_result.gap_size as i16,
+                                gap_pos: gap_result.gap_pos as u16,
+                            };
+                            if collector.try_add_hit(hit, read_chain) {
+                                return true;
+                            }
                         }
                     }
                 }
