@@ -213,7 +213,7 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
     let mut timer = Timer::new();
     info!("加载参考序列...");
     let ref_path = args.reference.as_ref().unwrap();
-    let coll = load_binseq_collection(ref_path)?;
+    let coll = load_binseq_collection(ref_path, config.rrbs_flag)?;
     let ref_names = coll.chr_names.clone();
     let ref_lengths = coll.chr_lengths.clone();
     info!(
@@ -283,9 +283,13 @@ fn load_references(path: &Path) -> Result<Vec<Reference>> {
     }
 }
 
-fn load_binseq_collection(path: &Path) -> Result<BinSeqCollection> {
+fn load_binseq_collection(path: &Path, rrbs: bool) -> Result<BinSeqCollection> {
     let mut reader = ReferenceReader::open(path)?;
-    let mut builder = BinSeqCollectionBuilder::new();
+    let mut builder = if rrbs {
+        BinSeqCollectionBuilder::new_rrbs()
+    } else {
+        BinSeqCollectionBuilder::new()
+    };
     while let Some(reference) = reader.next_reference()? {
         builder.push(&reference);
     }

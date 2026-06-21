@@ -73,6 +73,7 @@ pub struct BinSeqCollectionBuilder {
     blocks: Vec<Block>,
     chr_names: Vec<String>,
     sum_length: u64,
+    cpp_padded_reverse: bool,
 }
 
 impl BinSeqCollectionBuilder {
@@ -85,6 +86,14 @@ impl BinSeqCollectionBuilder {
             blocks: Vec::new(),
             chr_names: Vec::new(),
             sum_length: 0,
+            cpp_padded_reverse: false,
+        }
+    }
+
+    pub fn new_rrbs() -> Self {
+        Self {
+            cpp_padded_reverse: true,
+            ..Self::new()
         }
     }
 
@@ -98,8 +107,13 @@ impl BinSeqCollectionBuilder {
         self.refcat.extend_from_slice(&forward);
         drop(forward);
 
-        let mut reverse = encode_revcomp(&reference.seq).words;
-        reverse.resize(words, 0);
+        let reverse = if self.cpp_padded_reverse {
+            encode_revcomp_padded(&reference.seq, words)
+        } else {
+            let mut reverse = encode_revcomp(&reference.seq).words;
+            reverse.resize(words, 0);
+            reverse
+        };
         self.crefcat.extend_from_slice(&reverse);
 
         find_blocks(&mut self.blocks, chr_id * 2, &reference.seq, total_bases);
@@ -259,6 +273,27 @@ pub fn encode_revcomp(seq: &[u8]) -> BinarySeq {
     }
 }
 
+/// Match C++ `cBinSeq()`: reverse-complement the sequence after forward
+/// storage has been padded to its complete word count. Padding therefore
+/// appears before the reverse-complemented biological sequence.
+fn encode_revcomp_padded(seq: &[u8], word_count: usize) -> Vec<u64> {
+    let total_bases = word_count * SEGLEN;
+    let leading_padding = total_bases.saturating_sub(seq.len());
+    let mut words = vec![0u64; word_count];
+
+    for position in 0..total_bases {
+        let code = if position < leading_padding {
+            REV_ALPHABET[b'N' as usize]
+        } else {
+            let source = total_bases - 1 - position;
+            REV_ALPHABET[seq[source] as usize]
+        };
+        let word = position / SEGLEN;
+        words[word] = (words[word] << 2) | code as u64;
+    }
+    words
+}
+
 // ── Unmasked Region Detection ─────────────────────────────────────────────────
 
 const USEFUL_NT: &[u8] = b"ACGTacgt";
@@ -344,6 +379,28 @@ mod tests {
         let bs = encode_revcomp(seq);
         let expected: u64 = 0b00011011u64 << 56;
         assert_eq!(bs.words[0], expected);
+    }
+
+    #[test]
+    fn test_encode_revcomp_padded_matches_cpp_layout() {
+        let words = encode_revcomp_padded(b"ACGT", 3);
+        assert_eq!(words, vec![u64::MAX, u64::MAX, 0xffff_ffff_ffff_ff1b]);
+    }
+
+    #[test]
+    fn test_rrbs_builder_uses_cpp_reverse_padding() {
+        let reference = Reference {
+            name: "chr1".into(),
+            seq: b"ACGT".to_vec(),
+            len: 4,
+        };
+        let mut builder = BinSeqCollectionBuilder::new_rrbs();
+        builder.push(&reference);
+        let collection = builder.finish();
+        assert_eq!(
+            &collection.crefcat.as_slice()[REF_MARGIN..REF_MARGIN + 3],
+            &[u64::MAX, u64::MAX, 0xffff_ffff_ffff_ff1b]
+        );
     }
 
     #[test]
