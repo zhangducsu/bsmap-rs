@@ -647,6 +647,10 @@ mod tests {
             rrbs_hits,
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
             seed_size: 2,
             mapped: None,
         }
@@ -769,6 +773,10 @@ mod tests {
             rrbs_hits: Vec::new(),
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
             seed_size: 2,
             mapped: None,
         };
@@ -795,6 +803,10 @@ mod tests {
             rrbs_hits: Vec::new(),
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
             seed_size: 16,
             mapped: None,
         };
@@ -821,6 +833,10 @@ mod tests {
             rrbs_hits: Vec::new(),
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
             seed_size: 2,
             mapped: None,
         };

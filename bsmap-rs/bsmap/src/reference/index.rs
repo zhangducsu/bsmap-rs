@@ -41,6 +41,10 @@ pub(crate) struct MappedKmerIndex {
     pub rrbs_hits: MappedSection,
     pub rrbs_site_offsets: MappedSection,
     pub rrbs_sites: MappedSection,
+    pub wgbs_occupancy: MappedSection,
+    pub wgbs_rank: MappedSection,
+    pub wgbs_buckets: MappedSection,
+    pub wgbs_overflow: MappedSection,
 }
 
 impl MappedKmerIndex {
@@ -51,6 +55,53 @@ impl MappedKmerIndex {
             section.len,
         )
     }
+}
+
+const WGBS_COUNT_OVERFLOW: u16 = u16::MAX;
+
+/// Compact WGBS bucket descriptor used by the v8 succinct index.
+///
+/// The offset addresses the first forward hit in `positions`; reverse hits
+/// immediately follow forward hits. Counts that do not fit in 16 bits are
+/// stored in the sparse overflow table.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PackedWgbsBucket {
+    pub offset: u32,
+    pub counts: u32,
+}
+
+impl PackedWgbsBucket {
+    #[inline]
+    fn new(offset: u32, fwd_count: u32, rev_count: u32) -> Self {
+        let counts = if fwd_count >= WGBS_COUNT_OVERFLOW as u32
+            || rev_count >= WGBS_COUNT_OVERFLOW as u32
+        {
+            u32::MAX
+        } else {
+            fwd_count | (rev_count << 16)
+        };
+        Self { offset, counts }
+    }
+
+    #[inline]
+    fn inline_counts(self) -> Option<(u32, u32)> {
+        let fwd = self.counts as u16;
+        let rev = (self.counts >> 16) as u16;
+        if fwd == WGBS_COUNT_OVERFLOW && rev == WGBS_COUNT_OVERFLOW {
+            None
+        } else {
+            Some((fwd as u32, rev as u32))
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WgbsCountOverflow {
+    pub bucket_index: u32,
+    pub fwd_count: u32,
+    pub rev_count: u32,
 }
 
 /// 安全的种子提取：检查边界，避免越界访问。
@@ -101,6 +152,16 @@ pub struct KmerIndex {
     pub(crate) rrbs_site_offsets: Vec<u32>,
     /// Sorted `(cut_position, reverse_offset)` pairs used for RRBS ZP/ZL.
     pub(crate) rrbs_sites: Vec<[u32; 2]>,
+
+    // ── WGBS v8 succinct mode ─────────────────────────────────────────
+    /// One bit per possible hash. Only non-empty hashes have descriptors.
+    pub(crate) wgbs_occupancy: Vec<u64>,
+    /// Prefix popcount at the beginning of every occupancy word.
+    pub(crate) wgbs_rank: Vec<u32>,
+    /// Descriptors for non-empty hashes in ascending hash order.
+    pub(crate) wgbs_buckets: Vec<PackedWgbsBucket>,
+    /// Raw counts that exceed the descriptor's 16-bit inline fields.
+    pub(crate) wgbs_overflow: Vec<WgbsCountOverflow>,
 
     /// Seed size (k-mer length), required for RRBS position conversion.
     pub seed_size: u32,
@@ -259,6 +320,78 @@ impl KmerIndex {
     }
 
     #[inline]
+    pub(crate) fn wgbs_occupancy_slice(&self) -> &[u64] {
+        match &self.mapped {
+            Some(mapped) if mapped.wgbs_occupancy.len > 0 => unsafe {
+                mapped.slice(mapped.wgbs_occupancy)
+            },
+            _ => &self.wgbs_occupancy,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn wgbs_rank_slice(&self) -> &[u32] {
+        match &self.mapped {
+            Some(mapped) if mapped.wgbs_rank.len > 0 => unsafe { mapped.slice(mapped.wgbs_rank) },
+            _ => &self.wgbs_rank,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn wgbs_buckets_slice(&self) -> &[PackedWgbsBucket] {
+        match &self.mapped {
+            Some(mapped) if mapped.wgbs_buckets.len > 0 => unsafe {
+                mapped.slice(mapped.wgbs_buckets)
+            },
+            _ => &self.wgbs_buckets,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn wgbs_overflow_slice(&self) -> &[WgbsCountOverflow] {
+        match &self.mapped {
+            Some(mapped) if mapped.wgbs_overflow.len > 0 => unsafe {
+                mapped.slice(mapped.wgbs_overflow)
+            },
+            _ => &self.wgbs_overflow,
+        }
+    }
+
+    #[inline]
+    fn compact_bucket(&self, seed_hash: u32) -> Option<(PackedWgbsBucket, u32, u32)> {
+        let hash = seed_hash as usize;
+        let occupancy = self.wgbs_occupancy_slice();
+        let word_index = hash / 64;
+        let bit_index = hash % 64;
+        let &word = occupancy.get(word_index)?;
+        let bit = 1u64 << bit_index;
+        if word & bit == 0 {
+            return None;
+        }
+
+        let rank = self.wgbs_rank_slice();
+        let before = if bit_index == 0 {
+            0
+        } else {
+            (word & (bit - 1)).count_ones()
+        };
+        let bucket_index = rank.get(word_index)?.checked_add(before)? as usize;
+        let bucket = *self.wgbs_buckets_slice().get(bucket_index)?;
+        let (fwd, rev) = match bucket.inline_counts() {
+            Some(counts) => counts,
+            None => {
+                let overflow = self.wgbs_overflow_slice();
+                let entry = overflow
+                    .binary_search_by_key(&(bucket_index as u32), |entry| entry.bucket_index)
+                    .ok()
+                    .and_then(|index| overflow.get(index))?;
+                (entry.fwd_count, entry.rev_count)
+            }
+        };
+        Some((bucket, fwd, rev))
+    }
+
+    #[inline]
     pub fn has_rrbs_index(&self) -> bool {
         !self.rrbs_offsets_slice().is_empty()
     }
@@ -323,9 +456,12 @@ impl KmerIndex {
             u32::MAX
         };
 
-        // Keep raw counts for every bucket. C++ CountSeeds uses these counts even
-        // when SnpAlign later skips an over-represented bucket.
-        let mut index2: Vec<KmerLoc2> = Vec::with_capacity(total_kmers as usize);
+        // Keep raw counts for every non-empty bucket. C++ CountSeeds uses these
+        // counts even when SnpAlign later skips an over-represented bucket.
+        let occupancy_words = (total_kmers as usize + 63) / 64;
+        let mut wgbs_occupancy = vec![0u64; occupancy_words];
+        let mut wgbs_buckets = Vec::new();
+        let mut wgbs_overflow = Vec::new();
         let mut total_positions: u32 = 0;
 
         // C++ filters by n[0] which is the TOTAL count across both chains.
@@ -334,13 +470,33 @@ impl KmerIndex {
             let fwd = fwd_counts[i];
             let rev = rev_counts[i];
             let total = fwd + rev;
-            index2.push(KmerLoc2 {
-                n: [rev, fwd],
-            });
+            if total > 0 {
+                wgbs_occupancy[i / 64] |= 1u64 << (i % 64);
+                let descriptor_index = wgbs_buckets.len() as u32;
+                let offset = total_positions;
+                wgbs_buckets.push(PackedWgbsBucket::new(offset, fwd, rev));
+                if fwd >= WGBS_COUNT_OVERFLOW as u32 || rev >= WGBS_COUNT_OVERFLOW as u32 {
+                    wgbs_overflow.push(WgbsCountOverflow {
+                        bucket_index: descriptor_index,
+                        fwd_count: fwd,
+                        rev_count: rev,
+                    });
+                }
+            }
             if total > 0 && total <= max_kmer_num {
                 total_positions += fwd + rev;
             }
         }
+
+        let mut wgbs_rank = Vec::with_capacity(wgbs_occupancy.len() + 1);
+        let mut rank = 0u32;
+        for &word in &wgbs_occupancy {
+            wgbs_rank.push(rank);
+            rank = rank
+                .checked_add(word.count_ones())
+                .expect("WGBS compact rank overflow");
+        }
+        wgbs_rank.push(rank);
 
         // ── Pass 3: Fill positions (forward first, then reverse) ──────
         let mut positions: Vec<u32> = vec![0u32; total_positions as usize];
@@ -365,9 +521,6 @@ impl KmerIndex {
                 // For filtered-out k-mers, offsets remain 0 (unused)
             }
         }
-
-        // Save start offsets for O(1) lookup
-        let start_offsets = fwd_write_offsets.clone();
 
         // Fill forward chain positions (chain=0)
         fill_positions_chain(
@@ -404,13 +557,17 @@ impl KmerIndex {
         Self {
             total_kmers,
             max_kmer_num,
-            index2,
+            index2: Vec::new(),
             positions,
-            start_offsets,
+            start_offsets: Vec::new(),
             rrbs_offsets: Vec::new(),
             rrbs_hits: Vec::new(),
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
+            wgbs_occupancy,
+            wgbs_rank,
+            wgbs_buckets,
+            wgbs_overflow,
             seed_size,
             mapped: None,
         }
@@ -514,6 +671,24 @@ impl KmerIndex {
     /// reverse positions with `crefcat` for validation.
     #[inline]
     pub fn lookup_separated(&self, seed_hash: u32) -> (&[u32], &[u32]) {
+        if let Some((bucket, fwd_count, rev_count)) = self.compact_bucket(seed_hash) {
+            let total = fwd_count.saturating_add(rev_count);
+            if total == 0 || total > self.max_kmer_num {
+                return (&[], &[]);
+            }
+            let start = bucket.offset as usize;
+            let fwd_count = fwd_count as usize;
+            let rev_count = rev_count as usize;
+            let positions = self.positions_slice();
+            let Some(fwd) = positions.get(start..start + fwd_count) else {
+                return (&[], &[]);
+            };
+            let Some(rev) = positions.get(start + fwd_count..start + fwd_count + rev_count) else {
+                return (&[], &[]);
+            };
+            return (fwd, rev);
+        }
+
         let index2 = self.index2_slice();
         let start_offsets = self.start_offsets_slice();
         let positions = self.positions_slice();
@@ -541,6 +716,9 @@ impl KmerIndex {
     /// Return the raw WGBS bucket size used by C++ `CountSeeds()`.
     #[inline]
     pub fn wgbs_candidate_count(&self, seed_hash: u32) -> u32 {
+        if let Some((_bucket, fwd, rev)) = self.compact_bucket(seed_hash) {
+            return fwd.saturating_add(rev);
+        }
         self.index2_slice()
             .get(seed_hash as usize)
             .map_or(0, |entry| entry.n[0].saturating_add(entry.n[1]))
@@ -634,6 +812,10 @@ fn build_flat_rrbs_index(
             rrbs_hits: Vec::new(),
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
             seed_size,
             mapped: None,
         };
@@ -681,6 +863,10 @@ fn build_flat_rrbs_index(
         rrbs_hits,
         rrbs_site_offsets: Vec::new(),
         rrbs_sites: Vec::new(),
+        wgbs_occupancy: Vec::new(),
+        wgbs_rank: Vec::new(),
+        wgbs_buckets: Vec::new(),
+        wgbs_overflow: Vec::new(),
         seed_size,
         mapped: None,
     }
@@ -908,6 +1094,10 @@ mod tests {
             rrbs_hits: Vec::new(),
             rrbs_site_offsets: vec![0, 3],
             rrbs_sites: vec![[5, 2], [40, 2], [90, 2]],
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
             seed_size: 12,
             mapped: None,
         };
@@ -975,11 +1165,10 @@ mod tests {
 
         // Check hash 106288 (forward chain hits for ACGT repeating pattern)
         let hash = 106288u32;
-        let entry = &index.index2[hash as usize];
-
         let (fwd, rev) = index.lookup_separated(hash);
-        assert_eq!(fwd.len(), entry.n[1] as usize, "fwd count should match n[1]");
-        assert_eq!(rev.len(), entry.n[0] as usize, "rev count should match n[0]");
+        assert_eq!(fwd.len(), 14, "forward chain should have 14 seed positions");
+        assert_eq!(rev.len(), 14, "reverse chain should have 14 seed positions");
+        assert_eq!(index.wgbs_candidate_count(hash), 28);
 
         // Verify lookup returns combined
         let combined = index.lookup(hash);
@@ -989,15 +1178,9 @@ mod tests {
             "lookup should return fwd + rev combined"
         );
 
-        // Forward chain should have hits
-        assert!(entry.n[1] > 0, "forward chain should have hits");
-        assert_eq!(entry.n[1], 14, "forward chain should have 14 seed positions");
-
-        // Total positions across all hashes should account for both chains
-        let total_fwd: u32 = index.index2.iter().map(|e| e.n[1]).sum();
-        let total_rev: u32 = index.index2.iter().map(|e| e.n[0]).sum();
-        assert_eq!(total_fwd, 14, "total forward positions should be 14");
-        assert_eq!(total_rev, 14, "total reverse positions should be 14");
+        assert!(index.index2.is_empty(), "v8 WGBS must not retain dense buckets");
+        assert!(!index.wgbs_occupancy.is_empty());
+        assert!(!index.wgbs_buckets.is_empty());
         assert_eq!(index.positions.len(), 28, "total positions should be 28");
     }
 }

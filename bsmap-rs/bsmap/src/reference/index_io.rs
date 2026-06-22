@@ -37,7 +37,9 @@ use bincode::Options;
 use serde::{Deserialize, Serialize};
 
 use super::binseq::BinSeqCollection;
-use super::index::{KmerIndex, MappedKmerIndex, MappedSection};
+use super::index::{
+    KmerIndex, MappedKmerIndex, MappedSection, PackedWgbsBucket, WgbsCountOverflow,
+};
 use super::storage::{MmapStorage, VecStorage};
 use crate::param::{BINSEQPAD, REF_MARGIN, SEGLEN};
 
@@ -65,6 +67,9 @@ const INDEX_VERSION_RRBS_SITES: u32 = 6;
 /// Version 7: supports FASTA-stat and complete index-parameter compatibility checks.
 const INDEX_VERSION_FAST_COMPAT: u32 = 7;
 
+/// Version 8: succinct WGBS bucket metadata and raw-section layout marker v2.
+const INDEX_VERSION_SUCCINCT_WGBS: u32 = 8;
+
 /// WGBS alignment mode.
 const MODE_WGBS: u32 = 0;
 
@@ -84,7 +89,8 @@ const SECTION_DIRECTORY_OFFSET: usize = 100;
 const SECTION_ENTRY_SIZE: usize = 16;
 const SECTION_COUNT: usize = 9;
 const RAW_SECTION_MARKER_OFFSET: usize = 248;
-const RAW_SECTION_MARKER: &[u8; 8] = b"RAWSECT1";
+const RAW_SECTION_MARKER_V1: &[u8; 8] = b"RAWSECT1";
+const RAW_SECTION_MARKER_V2: &[u8; 8] = b"RAWSECT2";
 
 const SECTION_INDEX2: usize = 0;
 const SECTION_POSITIONS: usize = 1;
@@ -348,7 +354,7 @@ pub fn save_index_v2(
     // ── 当前完整索引格式的 header ──
     let mut header = [0u8; HEADER_SIZE];
     header[0..8].copy_from_slice(INDEX_MAGIC);
-    let version = INDEX_VERSION_FAST_COMPAT;
+    let version = INDEX_VERSION_SUCCINCT_WGBS;
     header[8..12].copy_from_slice(&version.to_le_bytes());
     header[12..16].copy_from_slice(&params.seed_size.to_le_bytes());
     let mode = if params.is_rrbs { MODE_RRBS } else { MODE_WGBS };
@@ -395,31 +401,39 @@ pub fn save_index_v2(
         bail!("v7 raw index format currently requires a little-endian target");
     }
 
-    let index2 = index.index2_slice();
     let positions = index.positions_slice();
-    let start_offsets = index.start_offsets_slice();
-    let rrbs_offsets = index.rrbs_offsets_slice();
-    let rrbs_hits = index.rrbs_hits_slice();
-    let rrbs_site_offsets = index.rrbs_site_offsets_slice();
-    let rrbs_sites = index.rrbs_sites_slice();
-    let lengths = [
-        (index2.len(), std::mem::size_of::<crate::param::KmerLoc2>()),
-        (positions.len(), std::mem::size_of::<u32>()),
-        (start_offsets.len(), std::mem::size_of::<u32>()),
-        (rrbs_offsets.len(), std::mem::size_of::<u32>()),
-        (rrbs_hits.len(), std::mem::size_of::<crate::param::Hit>()),
-        (rrbs_site_offsets.len(), std::mem::size_of::<u32>()),
-        (rrbs_sites.len(), std::mem::size_of::<[u32; 2]>()),
-        (refcat_slice.len(), std::mem::size_of::<u64>()),
-        (crefcat_slice.len(), std::mem::size_of::<u64>()),
-    ];
+    let lengths = if params.is_rrbs {
+        [
+            (0, std::mem::size_of::<crate::param::KmerLoc2>()),
+            (positions.len(), std::mem::size_of::<u32>()),
+            (0, std::mem::size_of::<u32>()),
+            (index.rrbs_offsets_slice().len(), std::mem::size_of::<u32>()),
+            (index.rrbs_hits_slice().len(), std::mem::size_of::<crate::param::Hit>()),
+            (index.rrbs_site_offsets_slice().len(), std::mem::size_of::<u32>()),
+            (index.rrbs_sites_slice().len(), std::mem::size_of::<[u32; 2]>()),
+            (refcat_slice.len(), std::mem::size_of::<u64>()),
+            (crefcat_slice.len(), std::mem::size_of::<u64>()),
+        ]
+    } else {
+        [
+            (index.wgbs_buckets_slice().len(), std::mem::size_of::<PackedWgbsBucket>()),
+            (positions.len(), std::mem::size_of::<u32>()),
+            (index.wgbs_occupancy_slice().len(), std::mem::size_of::<u64>()),
+            (index.wgbs_rank_slice().len(), std::mem::size_of::<u32>()),
+            (index.wgbs_overflow_slice().len(), std::mem::size_of::<WgbsCountOverflow>()),
+            (0, std::mem::size_of::<u32>()),
+            (0, std::mem::size_of::<[u32; 2]>()),
+            (refcat_slice.len(), std::mem::size_of::<u64>()),
+            (crefcat_slice.len(), std::mem::size_of::<u64>()),
+        ]
+    };
     let sections = raw_section_layout(names_buf.len(), &lengths)?;
     debug_assert_eq!(sections.len(), SECTION_COUNT);
     for (section_index, &section) in sections.iter().enumerate() {
         write_section_entry(&mut header, section_index, section);
     }
-    header[RAW_SECTION_MARKER_OFFSET..RAW_SECTION_MARKER_OFFSET + RAW_SECTION_MARKER.len()]
-        .copy_from_slice(RAW_SECTION_MARKER);
+    header[RAW_SECTION_MARKER_OFFSET..RAW_SECTION_MARKER_OFFSET + RAW_SECTION_MARKER_V2.len()]
+        .copy_from_slice(RAW_SECTION_MARKER_V2);
 
     writer.write_all(&header).context("Failed to write index header")?;
     writer.write_all(&names_buf).context("Failed to write reference names")?;
@@ -439,15 +453,39 @@ pub fn save_index_v2(
         Ok(())
     };
 
-    write_section(SECTION_INDEX2, &mut |writer| write_raw_slice(writer, index2))?;
-    write_section(SECTION_POSITIONS, &mut |writer| write_raw_slice(writer, positions))?;
-    write_section(SECTION_START_OFFSETS, &mut |writer| write_raw_slice(writer, start_offsets))?;
-    write_section(SECTION_RRBS_OFFSETS, &mut |writer| write_raw_slice(writer, rrbs_offsets))?;
-    write_section(SECTION_RRBS_HITS, &mut |writer| write_raw_slice(writer, rrbs_hits))?;
-    write_section(SECTION_RRBS_SITE_OFFSETS, &mut |writer| {
-        write_raw_slice(writer, rrbs_site_offsets)
-    })?;
-    write_section(SECTION_RRBS_SITES, &mut |writer| write_rrbs_sites(writer, rrbs_sites))?;
+    if params.is_rrbs {
+        write_section(SECTION_INDEX2, &mut |_writer| Ok(()))?;
+        write_section(SECTION_POSITIONS, &mut |writer| write_raw_slice(writer, positions))?;
+        write_section(SECTION_START_OFFSETS, &mut |_writer| Ok(()))?;
+        write_section(SECTION_RRBS_OFFSETS, &mut |writer| {
+            write_raw_slice(writer, index.rrbs_offsets_slice())
+        })?;
+        write_section(SECTION_RRBS_HITS, &mut |writer| {
+            write_raw_slice(writer, index.rrbs_hits_slice())
+        })?;
+        write_section(SECTION_RRBS_SITE_OFFSETS, &mut |writer| {
+            write_raw_slice(writer, index.rrbs_site_offsets_slice())
+        })?;
+        write_section(SECTION_RRBS_SITES, &mut |writer| {
+            write_rrbs_sites(writer, index.rrbs_sites_slice())
+        })?;
+    } else {
+        write_section(SECTION_INDEX2, &mut |writer| {
+            write_raw_slice(writer, index.wgbs_buckets_slice())
+        })?;
+        write_section(SECTION_POSITIONS, &mut |writer| write_raw_slice(writer, positions))?;
+        write_section(SECTION_START_OFFSETS, &mut |writer| {
+            write_raw_slice(writer, index.wgbs_occupancy_slice())
+        })?;
+        write_section(SECTION_RRBS_OFFSETS, &mut |writer| {
+            write_raw_slice(writer, index.wgbs_rank_slice())
+        })?;
+        write_section(SECTION_RRBS_HITS, &mut |writer| {
+            write_raw_slice(writer, index.wgbs_overflow_slice())
+        })?;
+        write_section(SECTION_RRBS_SITE_OFFSETS, &mut |_writer| Ok(()))?;
+        write_section(SECTION_RRBS_SITES, &mut |_writer| Ok(()))?;
+    }
     write_section(SECTION_REFCAT, &mut |writer| write_raw_slice(writer, refcat_slice))?;
     write_section(SECTION_CREFCAT, &mut |writer| write_raw_slice(writer, crefcat_slice))?;
 
@@ -596,9 +634,10 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
         && version != INDEX_VERSION_RRBS_FLAT
         && version != INDEX_VERSION_RRBS_SITES
         && version != INDEX_VERSION_FAST_COMPAT
+        && version != INDEX_VERSION_SUCCINCT_WGBS
     {
         bail!(
-            "Unsupported index version {} (expected {}, {}, {}, {}, {}, {}, or {}): {}",
+            "Unsupported index version {} (expected {}, {}, {}, {}, {}, {}, {}, or {}): {}",
             version,
             INDEX_VERSION,
             INDEX_VERSION_V2,
@@ -607,6 +646,7 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
             INDEX_VERSION_RRBS_FLAT,
             INDEX_VERSION_RRBS_SITES,
             INDEX_VERSION_FAST_COMPAT,
+            INDEX_VERSION_SUCCINCT_WGBS,
             path.display()
         );
     }
@@ -751,7 +791,9 @@ impl IndexDataV4 {
 /// Returns the reconstructed `KmerIndex` and its metadata.
 pub fn load_index(path: &Path) -> Result<(KmerIndex, IndexMeta)> {
     let meta = read_index_meta(path)?;
-    if meta.version == INDEX_VERSION_FAST_COMPAT {
+    if meta.version == INDEX_VERSION_FAST_COMPAT
+        || meta.version == INDEX_VERSION_SUCCINCT_WGBS
+    {
         let (_coll, index, meta) = load_index_with_mode(path, LoadMode::Memory)?;
         return Ok((index, meta));
     }
@@ -794,9 +836,8 @@ pub enum LoadMode {
     Mmap,
 }
 
-fn has_raw_section_marker(header: &[u8; HEADER_SIZE]) -> bool {
-    &header[RAW_SECTION_MARKER_OFFSET..RAW_SECTION_MARKER_OFFSET + RAW_SECTION_MARKER.len()]
-        == RAW_SECTION_MARKER
+fn has_raw_section_marker(header: &[u8; HEADER_SIZE], marker: &[u8; 8]) -> bool {
+    &header[RAW_SECTION_MARKER_OFFSET..RAW_SECTION_MARKER_OFFSET + marker.len()] == marker
 }
 
 fn checked_mapped_section<T>(section: RawSection, file_size: u64) -> Result<MappedSection> {
@@ -862,40 +903,104 @@ fn make_loaded_collection(
     }
 }
 
-fn load_v7_raw_index(
+fn load_raw_index(
     path: &Path,
     mode: LoadMode,
     meta: IndexMeta,
     ref_anchor: Vec<u32>,
     header: &[u8; HEADER_SIZE],
 ) -> Result<(BinSeqCollection, KmerIndex, IndexMeta)> {
-    if !has_raw_section_marker(header) {
-        bail!("v7 index uses the obsolete bincode layout; rebuild it with `bsmap index`");
+    let expected_marker = if meta.version == INDEX_VERSION_SUCCINCT_WGBS {
+        RAW_SECTION_MARKER_V2
+    } else {
+        RAW_SECTION_MARKER_V1
+    };
+    if !has_raw_section_marker(header, expected_marker) {
+        bail!(
+            "v{} index uses an obsolete or unknown raw-section layout; rebuild it with `bsmap index`",
+            meta.version
+        );
     }
     if !cfg!(target_endian = "little") {
-        bail!("v7 raw index format currently requires a little-endian target");
+        bail!("raw index format currently requires a little-endian target");
     }
 
     let sections: [RawSection; SECTION_COUNT] =
         std::array::from_fn(|index| read_section_entry(header, index));
     let file_size = std::fs::metadata(path)?.len();
-    let index2 = checked_mapped_section::<crate::param::KmerLoc2>(sections[SECTION_INDEX2], file_size)?;
     let positions = checked_mapped_section::<u32>(sections[SECTION_POSITIONS], file_size)?;
-    let start_offsets =
-        checked_mapped_section::<u32>(sections[SECTION_START_OFFSETS], file_size)?;
-    let rrbs_offsets = checked_mapped_section::<u32>(sections[SECTION_RRBS_OFFSETS], file_size)?;
-    let rrbs_hits = checked_mapped_section::<crate::param::Hit>(sections[SECTION_RRBS_HITS], file_size)?;
-    let rrbs_site_offsets =
-        checked_mapped_section::<u32>(sections[SECTION_RRBS_SITE_OFFSETS], file_size)?;
-    let rrbs_sites =
-        checked_mapped_section::<[u32; 2]>(sections[SECTION_RRBS_SITES], file_size)?;
     let refcat = checked_mapped_section::<u64>(sections[SECTION_REFCAT], file_size)?;
     let crefcat = checked_mapped_section::<u64>(sections[SECTION_CREFCAT], file_size)?;
+    let succinct_wgbs = meta.version == INDEX_VERSION_SUCCINCT_WGBS && !meta.is_rrbs;
+
+    let (index2, start_offsets, rrbs_offsets, rrbs_hits, rrbs_site_offsets, rrbs_sites) =
+        if succinct_wgbs {
+            (
+                MappedSection::default(),
+                MappedSection::default(),
+                MappedSection::default(),
+                MappedSection::default(),
+                MappedSection::default(),
+                MappedSection::default(),
+            )
+        } else {
+            (
+                checked_mapped_section::<crate::param::KmerLoc2>(
+                    sections[SECTION_INDEX2],
+                    file_size,
+                )?,
+                checked_mapped_section::<u32>(sections[SECTION_START_OFFSETS], file_size)?,
+                checked_mapped_section::<u32>(sections[SECTION_RRBS_OFFSETS], file_size)?,
+                checked_mapped_section::<crate::param::Hit>(sections[SECTION_RRBS_HITS], file_size)?,
+                checked_mapped_section::<u32>(
+                    sections[SECTION_RRBS_SITE_OFFSETS],
+                    file_size,
+                )?,
+                checked_mapped_section::<[u32; 2]>(sections[SECTION_RRBS_SITES], file_size)?,
+            )
+        };
+    let (wgbs_buckets, wgbs_occupancy, wgbs_rank, wgbs_overflow) = if succinct_wgbs {
+        (
+            checked_mapped_section::<PackedWgbsBucket>(sections[SECTION_INDEX2], file_size)?,
+            checked_mapped_section::<u64>(sections[SECTION_START_OFFSETS], file_size)?,
+            checked_mapped_section::<u32>(sections[SECTION_RRBS_OFFSETS], file_size)?,
+            checked_mapped_section::<WgbsCountOverflow>(sections[SECTION_RRBS_HITS], file_size)?,
+        )
+    } else {
+        (
+            MappedSection::default(),
+            MappedSection::default(),
+            MappedSection::default(),
+            MappedSection::default(),
+        )
+    };
 
     let mut reader = BufReader::new(File::open(path)?);
     let (coll, index) = match mode {
         LoadMode::Memory => {
-            let index = KmerIndex {
+            let index = if succinct_wgbs {
+                KmerIndex {
+                    total_kmers: meta.total_kmers,
+                    max_kmer_num: meta.max_kmer_num,
+                    index2: Vec::new(),
+                    positions: read_raw_vec(&mut reader, sections[SECTION_POSITIONS])?,
+                    start_offsets: Vec::new(),
+                    rrbs_offsets: Vec::new(),
+                    rrbs_hits: Vec::new(),
+                    rrbs_site_offsets: Vec::new(),
+                    rrbs_sites: Vec::new(),
+                    wgbs_occupancy: read_raw_vec(
+                        &mut reader,
+                        sections[SECTION_START_OFFSETS],
+                    )?,
+                    wgbs_rank: read_raw_vec(&mut reader, sections[SECTION_RRBS_OFFSETS])?,
+                    wgbs_buckets: read_raw_vec(&mut reader, sections[SECTION_INDEX2])?,
+                    wgbs_overflow: read_raw_vec(&mut reader, sections[SECTION_RRBS_HITS])?,
+                    seed_size: meta.seed_size,
+                    mapped: None,
+                }
+            } else {
+                KmerIndex {
                 total_kmers: meta.total_kmers,
                 max_kmer_num: meta.max_kmer_num,
                 index2: read_raw_vec(&mut reader, sections[SECTION_INDEX2])?,
@@ -908,8 +1013,13 @@ fn load_v7_raw_index(
                     sections[SECTION_RRBS_SITE_OFFSETS],
                 )?,
                 rrbs_sites: read_raw_vec(&mut reader, sections[SECTION_RRBS_SITES])?,
+                wgbs_occupancy: Vec::new(),
+                wgbs_rank: Vec::new(),
+                wgbs_buckets: Vec::new(),
+                wgbs_overflow: Vec::new(),
                 seed_size: meta.seed_size,
                 mapped: None,
+                }
             };
             let refcat_data = read_raw_vec(&mut reader, sections[SECTION_REFCAT])?;
             let crefcat_data = read_raw_vec(&mut reader, sections[SECTION_CREFCAT])?;
@@ -938,6 +1048,10 @@ fn load_v7_raw_index(
                 rrbs_hits: Vec::new(),
                 rrbs_site_offsets: Vec::new(),
                 rrbs_sites: Vec::new(),
+                wgbs_occupancy: Vec::new(),
+                wgbs_rank: Vec::new(),
+                wgbs_buckets: Vec::new(),
+                wgbs_overflow: Vec::new(),
                 seed_size: meta.seed_size,
                 mapped: Some(MappedKmerIndex {
                     mmap: index_mmap,
@@ -948,6 +1062,10 @@ fn load_v7_raw_index(
                     rrbs_hits,
                     rrbs_site_offsets,
                     rrbs_sites,
+                    wgbs_occupancy,
+                    wgbs_rank,
+                    wgbs_buckets,
+                    wgbs_overflow,
                 }),
             };
             let ref_file = File::open(path)?;
@@ -970,8 +1088,9 @@ fn load_v7_raw_index(
     };
 
     log::info!(
-        "索引已从 {} 加载 (v7, {}, raw sections)",
+        "索引已从 {} 加载 (v{}, {}, raw sections)",
         path.display(),
+        meta.version,
         if matches!(mode, LoadMode::Mmap) { "mmap" } else { "memory" },
     );
     Ok((coll, index, meta))
@@ -993,9 +1112,9 @@ pub fn load_index_with_mode(
     reader.read_exact(&mut header)?;
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
 
-    if version == INDEX_VERSION_FAST_COMPAT {
+    if version == INDEX_VERSION_FAST_COMPAT || version == INDEX_VERSION_SUCCINCT_WGBS {
         drop(reader);
-        return load_v7_raw_index(path, mode, meta, ref_anchor, &header);
+        return load_raw_index(path, mode, meta, ref_anchor, &header);
     }
 
     if version == 1 {
@@ -1036,6 +1155,7 @@ pub fn load_index_with_mode(
         && version != INDEX_VERSION_RRBS_FLAT
         && version != INDEX_VERSION_RRBS_SITES
         && version != INDEX_VERSION_FAST_COMPAT
+        && version != INDEX_VERSION_SUCCINCT_WGBS
     {
         bail!(
             "Unsupported index version {}: {}",
@@ -1211,6 +1331,10 @@ fn reconstruct_kmer_index_v6(data: IndexDataV6, seed_size: u32) -> KmerIndex {
             .into_iter()
             .map(|(position, reverse_offset)| [position, reverse_offset])
             .collect(),
+        wgbs_occupancy: Vec::new(),
+        wgbs_rank: Vec::new(),
+        wgbs_buckets: Vec::new(),
+        wgbs_overflow: Vec::new(),
         seed_size,
         mapped: None,
     }
@@ -1233,6 +1357,10 @@ fn reconstruct_kmer_index_v5(data: IndexDataV5, seed_size: u32) -> KmerIndex {
         rrbs_hits: data.rrbs_hits,
         rrbs_site_offsets: Vec::new(),
         rrbs_sites: Vec::new(),
+        wgbs_occupancy: Vec::new(),
+        wgbs_rank: Vec::new(),
+        wgbs_buckets: Vec::new(),
+        wgbs_overflow: Vec::new(),
         seed_size,
         mapped: None,
     }
@@ -1270,12 +1398,16 @@ fn reconstruct_kmer_index_v4(data: IndexDataV4, seed_size: u32) -> KmerIndex {
         rrbs_hits,
         rrbs_site_offsets: Vec::new(),
         rrbs_sites: Vec::new(),
+        wgbs_occupancy: Vec::new(),
+        wgbs_rank: Vec::new(),
+        wgbs_buckets: Vec::new(),
+        wgbs_overflow: Vec::new(),
         seed_size,
         mapped: None,
     }
 }
 
-/// Check whether a v7 cached index matches the source FASTA and all build parameters.
+/// Check whether a v8 cached index matches the source FASTA and all build parameters.
 pub fn is_index_compatible(
     path: &Path,
     reference_path: &Path,
@@ -1286,18 +1418,18 @@ pub fn is_index_compatible(
     }
 
     let meta = read_index_meta(path)?;
-    if meta.version != INDEX_VERSION_FAST_COMPAT {
+    if meta.version != INDEX_VERSION_SUCCINCT_WGBS {
         log::info!(
             "缓存索引版本 {} 不兼容，需要重建 v{} 索引",
             meta.version,
-            INDEX_VERSION_FAST_COMPAT,
+            INDEX_VERSION_SUCCINCT_WGBS,
         );
         return Ok(false);
     }
     let mut header = [0u8; HEADER_SIZE];
     File::open(path)?.read_exact(&mut header)?;
-    if !has_raw_section_marker(&header) {
-        log::info!("缓存 v7 索引使用旧布局，需要重建 raw-section 索引");
+    if !has_raw_section_marker(&header, RAW_SECTION_MARKER_V2) {
+        log::info!("缓存 v8 索引使用旧布局，需要重建 raw-section 索引");
         return Ok(false);
     }
 
@@ -1498,7 +1630,7 @@ mod tests {
         let (loaded_coll, loaded_index, meta) =
             load_index_with_mode(tmp.path(), LoadMode::Mmap).unwrap();
 
-        assert_eq!(meta.version, INDEX_VERSION_FAST_COMPAT);
+        assert_eq!(meta.version, INDEX_VERSION_SUCCINCT_WGBS);
         assert_eq!(meta.ref_lengths, vec![32, 12]);
         assert_eq!(loaded_coll.chr_lengths, coll.chr_lengths);
         assert_eq!(loaded_coll.ref_anchor, coll.ref_anchor);
@@ -1585,7 +1717,7 @@ mod tests {
         let (_loaded_coll, loaded, meta) =
             load_index_with_mode(tmp.path(), LoadMode::Memory).unwrap();
 
-        assert_eq!(meta.version, INDEX_VERSION_FAST_COMPAT);
+        assert_eq!(meta.version, INDEX_VERSION_SUCCINCT_WGBS);
         assert!(meta.is_rrbs);
         assert_eq!(loaded.rrbs_offsets, index.rrbs_offsets);
         assert_eq!(loaded.rrbs_hits, index.rrbs_hits);
