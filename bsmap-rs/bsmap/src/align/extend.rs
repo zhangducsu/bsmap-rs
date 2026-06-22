@@ -15,7 +15,7 @@ use std::collections::HashSet;
 use crate::align::gap::gap_align;
 use crate::align::mismatch::count_mismatch;
 use crate::align::seed::SeedSegment;
-use crate::param::{GHit, MAXSNPS};
+use crate::param::{GHit, FIXELEMENT, MAXSNPS};
 use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
 use crate::reference::index::{KmerIndex, RRBS_BSC_FLAG, RRBS_CHR_MASK};
@@ -236,13 +236,16 @@ pub(crate) fn snp_align_segment(
     let fwd_slice = coll.refcat.as_slice();
     let rev_slice = coll.crefcat.as_slice();
 
-    for (seed_idx, &seed_hash) in segment.seeds.iter().enumerate() {
-        if seed_idx < segment.reg_masks.len() && segment.reg_masks[seed_idx] == 0 {
+    let seeds = segment.seeds();
+    let reg_masks = segment.reg_masks();
+    let seed_positions = segment.seed_positions();
+    for (seed_idx, &seed_hash) in seeds.iter().enumerate() {
+        if seed_idx < reg_masks.len() && reg_masks[seed_idx] == 0 {
             continue;
         }
 
-        let seed_pos_in_read = if seed_idx < segment.seed_positions.len() {
-            segment.seed_positions[seed_idx]
+        let seed_pos_in_read = if seed_idx < seed_positions.len() {
+            seed_positions[seed_idx]
         } else {
             segment.start_offset + seed_idx as u32 * 4
         };
@@ -305,9 +308,25 @@ pub(crate) fn snp_align_segment(
                     let Some(alignment_start) = anchor.checked_add(local_start) else {
                         continue;
                     };
-                    let ref_offset = alignment_start as u64 * 2;
-                    let ref_seq = if ref_chain == 0 { fwd_slice } else { rev_slice };
-                    if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
+                    let mut generated_reverse = [0u64; FIXELEMENT];
+                    let (ref_seq, reference_start) = if ref_chain == 0 {
+                        (fwd_slice, alignment_start)
+                    } else if !rev_slice.is_empty() {
+                        (rev_slice, alignment_start)
+                    } else {
+                        let window_len = read_len.saturating_add(gap_size);
+                        if !coll.fill_reverse_window(
+                            chr_idx,
+                            local_start,
+                            window_len,
+                            &mut generated_reverse,
+                        ) {
+                            continue;
+                        }
+                        (&generated_reverse[..], 0)
+                    };
+                    let ref_offset = reference_start as u64 * 2;
+                    if (ref_offset / 64) as usize + query.len() > ref_seq.len() {
                         continue;
                     }
 
@@ -348,7 +367,7 @@ pub(crate) fn snp_align_segment(
                         if let Some(gap_result) = gap_align(
                             query,
                             ref_seq,
-                            alignment_start,
+                            reference_start,
                             seed_pos_in_read,
                             8,
                             snp_thres,

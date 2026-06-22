@@ -27,12 +27,14 @@ use crate::reads::encode::EncodedRead;
 use crate::reference::index::{KmerIndex, RRBS_BSC_FLAG};
 
 const NO_SEED_CANDIDATES: u32 = 9_999_999;
+const MAX_SEGMENT_SEEDS: usize = 16;
+const MAX_SEED_SEGMENTS: usize = crate::param::MAXSNPS as usize + 1;
 
 /// Seed segment 信息。
 ///
 /// 一个读段被划分为多个 seed segments，每个 segment 包含多个种子位置。
 /// 通过重排序 segments，可以优先处理候选数少的 segment，提高比对效率。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct SeedSegment {
     /// Segment 索引（0-based）。
     pub index: usize,
@@ -41,24 +43,68 @@ pub struct SeedSegment {
     /// 该 segment 的候选数（用于排序）。
     pub candidates: u32,
     /// 该 segment 的所有种子哈希值。
-    pub seeds: Vec<u32>,
+    seeds: [u32; MAX_SEGMENT_SEEDS],
     /// 该 segment 的有效种子掩码（标记哪些种子可用）。
-    pub reg_masks: Vec<u32>,
+    reg_masks: [u32; MAX_SEGMENT_SEEDS],
     /// 每个种子在读段中的碱基位置（0-based）。与 seeds 一一对应。
-    pub seed_positions: Vec<u32>,
+    seed_positions: [u32; MAX_SEGMENT_SEEDS],
+    seed_count: u8,
 }
 
 impl SeedSegment {
     /// 创建新的 SeedSegment。
-    fn new(index: usize, start_offset: u32, seeds: Vec<u32>, reg_masks: Vec<u32>, seed_positions: Vec<u32>) -> Self {
+    const fn new(index: usize, start_offset: u32) -> Self {
         Self {
             index,
             start_offset,
             candidates: 0,
-            seeds,
-            reg_masks,
-            seed_positions,
+            seeds: [0; MAX_SEGMENT_SEEDS],
+            reg_masks: [0; MAX_SEGMENT_SEEDS],
+            seed_positions: [0; MAX_SEGMENT_SEEDS],
+            seed_count: 0,
         }
+    }
+
+    #[inline]
+    fn push_seed(&mut self, seed: u32, reg_mask: u32, position: u32) {
+        let index = self.seed_count as usize;
+        debug_assert!(index < MAX_SEGMENT_SEEDS);
+        if index >= MAX_SEGMENT_SEEDS {
+            return;
+        }
+        self.seeds[index] = seed;
+        self.reg_masks[index] = reg_mask;
+        self.seed_positions[index] = position;
+        self.seed_count += 1;
+    }
+
+    #[inline]
+    fn clear_seeds(&mut self) {
+        self.seed_count = 0;
+    }
+
+    #[inline]
+    pub(crate) fn seeds(&self) -> &[u32] {
+        &self.seeds[..self.seed_count as usize]
+    }
+
+    #[inline]
+    pub(crate) fn reg_masks(&self) -> &[u32] {
+        &self.reg_masks[..self.seed_count as usize]
+    }
+
+    #[inline]
+    pub(crate) fn seed_positions(&self) -> &[u32] {
+        &self.seed_positions[..self.seed_count as usize]
+    }
+
+    #[inline]
+    fn copy_seed_data_from(&mut self, source: &Self) {
+        self.start_offset = source.start_offset;
+        self.seeds = source.seeds;
+        self.reg_masks = source.reg_masks;
+        self.seed_positions = source.seed_positions;
+        self.seed_count = source.seed_count;
     }
 }
 
@@ -75,10 +121,24 @@ pub fn extract_seeds(
     _index_interval: u32,
     _profile: &[[u32; 16]],
 ) -> Vec<Vec<u32>> {
+    let mut all_seeds = [Vec::new(), Vec::new()];
+    extract_seeds_into(encoded, seed_size, &mut all_seeds);
+    Vec::from(all_seeds)
+}
+
+/// 将两条 read-chain 的所有 seed 写入可复用 worker scratch。
+pub(crate) fn extract_seeds_into(
+    encoded: &EncodedRead,
+    seed_size: u32,
+    all_seeds: &mut [Vec<u32>; 2],
+) {
     let read_len = encoded.read_len();
     let num_words = encoded.num_words();
-    
-    let mut all_seeds: Vec<Vec<u32>> = vec![Vec::new(); 2];
+    let seed_count = if read_len >= seed_size {
+        (read_len - seed_size + 1) as usize
+    } else {
+        0
+    };
 
     for chain in 0..2u32 {
         let words = if chain == 0 {
@@ -87,7 +147,11 @@ pub fn extract_seeds(
             encoded.rev_words()
         };
 
-        let mut seeds = Vec::new();
+        let seeds = &mut all_seeds[chain as usize];
+        seeds.clear();
+        if seeds.capacity() < seed_count {
+            seeds.reserve(seed_count);
+        }
 
         // 提取所有位置的种子（每个位置都提取）
         // 对应 C++ 的 xseed_array[chain][pos]
@@ -98,10 +162,7 @@ pub fn extract_seeds(
             pos += 1;
         }
 
-        all_seeds[chain as usize] = seeds;
     }
-
-    all_seeds
 }
 
 /// 从指定位置提取种子哈希。
@@ -221,6 +282,36 @@ pub fn reorder_seeds_for_chain_with_cross_chain(
     read_chain: u8,
     cross_chain_enabled: bool,
 ) -> Vec<SeedSegment> {
+    let mut segments = Vec::new();
+    reorder_seeds_for_chain_with_cross_chain_into(
+        chain_seeds,
+        index,
+        seed_size,
+        index_interval,
+        profile,
+        map_readlen,
+        is_rrbs,
+        read_chain,
+        cross_chain_enabled,
+        &mut segments,
+    );
+    segments
+}
+
+/// 将重排后的 seed segments 写入可复用 worker scratch。
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reorder_seeds_for_chain_with_cross_chain_into(
+    chain_seeds: &[u32],
+    index: &KmerIndex,
+    seed_size: u32,
+    index_interval: u32,
+    profile: &[[u32; 16]],
+    map_readlen: u32,
+    is_rrbs: bool,
+    read_chain: u8,
+    cross_chain_enabled: bool,
+    segments: &mut Vec<SeedSegment>,
+) {
     // C++ RRBS: cseed_offset = map_readlen % seed_size
     // 用于 read_chain=1 时偏移种子位置，补偿 RC 编码的相位差
     let cseed_offset = if is_rrbs { map_readlen % seed_size } else { 0 };
@@ -242,8 +333,12 @@ pub fn reorder_seeds_for_chain_with_cross_chain(
         )
     };
 
+    segments.clear();
+    if segments.capacity() < num_segments {
+        segments.reserve(num_segments);
+    }
+
     if is_rrbs {
-        let mut segments: Vec<SeedSegment> = Vec::with_capacity(num_segments);
         for seg_idx in 0..num_segments {
             let profile_val = if seg_idx < profile.len() {
                 profile[seg_idx][0]
@@ -251,22 +346,13 @@ pub fn reorder_seeds_for_chain_with_cross_chain(
                 continue;
             };
             let seed_pos = profile_val + cseed_offset * read_chain as u32;
-            let mut segment = if seed_pos < chain_seeds.len() as u32
-                && seed_pos + seed_size <= map_readlen
-            {
-                SeedSegment::new(
-                    seg_idx,
-                    0,
-                    vec![chain_seeds[seed_pos as usize]],
-                    vec![1],
-                    vec![seed_pos],
-                )
-            } else {
-                SeedSegment::new(seg_idx, 0, Vec::new(), Vec::new(), Vec::new())
-            };
+            let mut segment = SeedSegment::new(seg_idx, 0);
+            if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
+                segment.push_seed(chain_seeds[seed_pos as usize], 1, seed_pos);
+            }
             segment.candidates = count_seeds_for_chain_with_cross_chain(
-                &segment.seeds,
-                &segment.reg_masks,
+                segment.seeds(),
+                segment.reg_masks(),
                 index,
                 true,
                 cross_chain_enabled,
@@ -274,16 +360,12 @@ pub fn reorder_seeds_for_chain_with_cross_chain(
             segments.push(segment);
         }
         segments.sort_by_key(|s| (s.candidates, s.index));
-        return segments;
+        return;
     }
 
     // 3. 为每个 segment 创建 SeedSegment
-    let mut segments: Vec<SeedSegment> = Vec::with_capacity(num_segments);
-
     for seg_idx in 0..num_segments {
-        let mut seg_seeds: Vec<u32> = Vec::with_capacity(index_interval as usize);
-        let mut seg_masks: Vec<u32> = Vec::with_capacity(index_interval as usize);
-        let mut seg_positions: Vec<u32> = Vec::with_capacity(index_interval as usize);
+        let mut segment = SeedSegment::new(seg_idx, best_start_offset);
 
         // C++ RRBS: xseeds[chain][seg][0] = xseed_array[chain][profile[seg][0] + cseed_offset * read_chain]
         // C++ WGBS: xseeds[chain][seg][ii] = xseed_array[chain][profile[seg][ii] + start - ii]
@@ -300,43 +382,43 @@ pub fn reorder_seeds_for_chain_with_cross_chain(
             }
 
             if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
-                seg_seeds.push(chain_seeds[seed_pos as usize]);
-                seg_masks.push(1);
-                seg_positions.push(seed_pos);
+                segment.push_seed(chain_seeds[seed_pos as usize], 1, seed_pos);
             }
         }
 
-        let mut segment = SeedSegment::new(seg_idx, best_start_offset, seg_seeds, seg_masks, seg_positions);
-
         // 统计该 segment 的候选数
-        segment.candidates = count_seeds_for_chain(&segment.seeds, &segment.reg_masks, index, is_rrbs);
+        segment.candidates =
+            count_seeds_for_chain(segment.seeds(), segment.reg_masks(), index, is_rrbs);
 
         segments.push(segment);
     }
 
     // 4. 调整每个 segment 的起始位置（AdjustSeedStartArray）
-    adjust_seed_starts_for_chain(&mut segments, index, seed_size, index_interval, map_readlen, chain_seeds, profile, is_rrbs);
+    adjust_seed_starts_for_chain(
+        segments,
+        index,
+        seed_size,
+        index_interval,
+        map_readlen,
+        chain_seeds,
+        profile,
+        is_rrbs,
+    );
 
     // C++ cmodeindex 反转：chain 1 将 segment 索引反转，
     // 使两端第一批种子都从读段起始位置附近开始采样
     if read_chain == 1 {
         let n = segments.len();
-        let orig_data: Vec<_> = segments.iter().map(|s| {
-            (s.seeds.clone(), s.reg_masks.clone(), s.seed_positions.clone(), s.start_offset)
-        }).collect();
+        let mut original = [SeedSegment::new(0, 0); MAX_SEED_SEGMENTS];
+        original[..n].copy_from_slice(segments);
         for s in segments.iter_mut() {
             let rev_idx = n - 1 - s.index;
-            s.seeds.clone_from(&orig_data[rev_idx].0);
-            s.reg_masks.clone_from(&orig_data[rev_idx].1);
-            s.seed_positions.clone_from(&orig_data[rev_idx].2);
-            s.start_offset = orig_data[rev_idx].3;
+            s.copy_seed_data_from(&original[rev_idx]);
         }
     }
 
     // 5. 按候选数升序排序
     segments.sort_by_key(|s| s.candidates);
-
-    segments
 }
 
 /// 计算 segment 数量。
@@ -346,12 +428,13 @@ fn calculate_num_segments(
     index_interval: u32,
     profile: &[[u32; 16]],
 ) -> usize {
-    map_readlen
+    (map_readlen
         .saturating_sub(index_interval - 1)
         .checked_div(seed_size)
         .unwrap_or(0)
         .max(1)
-        .min(profile.len() as u32) as usize
+        .min(profile.len() as u32) as usize)
+        .min(MAX_SEED_SEGMENTS)
 }
 
 /// 调整 seed segment 起始位置（逐链独立）。
@@ -377,8 +460,11 @@ fn adjust_seed_starts_for_chain(
     let num_segments = segments.len();
     let max_offset = (map_readlen - index_interval + 1) % seed_size;
 
-    // 创建临时数组存储调整后的起始位置
-    let mut start_array: Vec<u32> = segments.iter().map(|s| s.start_offset).collect();
+    // 创建栈上临时数组存储调整后的起始位置
+    let mut start_array = [0u32; MAX_SEED_SEGMENTS];
+    for (target, segment) in start_array.iter_mut().zip(segments.iter()) {
+        *target = segment.start_offset;
+    }
 
     // 从中间向两端交替扩展遍历
     // C++: for(i=0; i<seedseg_num; i++) { if(i%2==0) ptr = i/2; else ptr = seedseg_num - 1 - i/2; }
@@ -426,9 +512,7 @@ fn adjust_seed_starts_for_chain(
         segment.start_offset = new_start;
 
         // Re-extract seeds at the new start offset
-        segment.seeds.clear();
-        segment.reg_masks.clear();
-        segment.seed_positions.clear();
+        segment.clear_seeds();
 
         for ii in 0..index_interval as usize {
             let profile_val = if i < profile.len() && ii < profile[i].len() {
@@ -440,9 +524,7 @@ fn adjust_seed_starts_for_chain(
             let seed_pos = (profile_val + new_start).saturating_sub(ii as u32);
 
             if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
-                segment.seeds.push(chain_seeds[seed_pos as usize]);
-                segment.reg_masks.push(1);
-                segment.seed_positions.push(seed_pos);
+                segment.push_seed(chain_seeds[seed_pos as usize], 1, seed_pos);
             }
         }
 
@@ -629,6 +711,22 @@ mod tests {
         assert!(!seeds[1].is_empty(), "反向链应该有种子");
     }
 
+    #[test]
+    fn extract_seeds_into_reuses_worker_buffers() {
+        let encoded = make_test_read(b"ACGTACGTACGTACGTACGTACGTACGTACGT");
+        let mut scratch = [Vec::new(), Vec::new()];
+        extract_seeds_into(&encoded, 8, &mut scratch);
+        let pointers = [scratch[0].as_ptr(), scratch[1].as_ptr()];
+        let capacities = [scratch[0].capacity(), scratch[1].capacity()];
+        let expected = scratch.clone();
+
+        extract_seeds_into(&encoded, 8, &mut scratch);
+
+        assert_eq!(scratch, expected);
+        assert_eq!([scratch[0].as_ptr(), scratch[1].as_ptr()], pointers);
+        assert_eq!([scratch[0].capacity(), scratch[1].capacity()], capacities);
+    }
+
     fn make_rrbs_count_index(buckets: Vec<Vec<Hit>>) -> KmerIndex {
         let mut rrbs_offsets = Vec::with_capacity(buckets.len() + 1);
         let mut rrbs_hits = Vec::new();
@@ -758,6 +856,45 @@ mod tests {
                 .map(|segment| (segment.index, segment.candidates))
                 .collect::<Vec<_>>(),
             vec![(1, 2), (0, 5)]
+        );
+
+        let mut scratch = Vec::new();
+        reorder_seeds_for_chain_with_cross_chain_into(
+            &chain_seeds,
+            &index,
+            2,
+            1,
+            &profile,
+            4,
+            true,
+            0,
+            true,
+            &mut scratch,
+        );
+        let pointer = scratch.as_ptr();
+        let expected: Vec<_> = scratch
+            .iter()
+            .map(|segment| (segment.index, segment.candidates))
+            .collect();
+        reorder_seeds_for_chain_with_cross_chain_into(
+            &chain_seeds,
+            &index,
+            2,
+            1,
+            &profile,
+            4,
+            true,
+            0,
+            true,
+            &mut scratch,
+        );
+        assert_eq!(scratch.as_ptr(), pointer);
+        assert_eq!(
+            scratch
+                .iter()
+                .map(|segment| (segment.index, segment.candidates))
+                .collect::<Vec<_>>(),
+            expected
         );
     }
 

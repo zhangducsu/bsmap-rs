@@ -23,7 +23,9 @@ use rayon::prelude::*;
 use crate::align::extend::{
     clear_hits, is_unique_hit, select_best_hits, snp_align_segment, HitCollector,
 };
-use crate::align::seed::{extract_seeds, reorder_seeds_for_chain_with_cross_chain};
+use crate::align::seed::{
+    extract_seeds_into, reorder_seeds_for_chain_with_cross_chain_into, SeedSegment,
+};
 use crate::param::{AlignConfig, GHit, MAXSNPS};
 use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
@@ -78,6 +80,10 @@ pub struct SingleAlign {
     dedup_gap: HashSet<(u32, u32)>,
     /// C++ `x_cur_n_hit[read_chain][snp_level]`，跨 segment 累计。
     level_counts: [[usize; MAXSNPS as usize + 1]; 2],
+    /// Worker-local seed hash scratch，跨 read 复用容量。
+    seed_chains: [Vec<u32>; 2],
+    /// Worker-local segment scratch，跨 read 复用容量。
+    seed_segments: [Vec<SeedSegment>; 2],
 }
 
 impl SingleAlign {
@@ -96,6 +102,10 @@ impl SingleAlign {
             dedup_no_gap: HashSet::new(),
             dedup_gap: HashSet::new(),
             level_counts: [[0; MAXSNPS as usize + 1]; 2],
+            seed_chains: std::array::from_fn(|_| Vec::with_capacity(crate::param::FIXSIZE)),
+            seed_segments: std::array::from_fn(|_| {
+                Vec::with_capacity(MAXSNPS as usize + 1)
+            }),
         }
     }
 
@@ -150,12 +160,7 @@ impl SingleAlign {
         let xflag_chain1 = config.chains || encoded.read_set == 2;
 
         // 提取种子（两条链）
-        let seeds = extract_seeds(
-            encoded,
-            config.seed_size,
-            config.index_interval,
-            &config.profile,
-        );
+        extract_seeds_into(encoded, config.seed_size, &mut self.seed_chains);
 
         // 计算最大允许的 mismatch 数（C++ 动态阈值：在处理过程中会被降低）
         let max_snp = if config.max_snp_num >= 100 {
@@ -168,43 +173,40 @@ impl SingleAlign {
         // 预计算两条链的 segments（C++ 逐 segment 处理架构）
         // 仅对启用的链（xflag_chain）进行重排序
         let cross_chain_enabled = config.paired_end || config.chains;
-        let chain0_segments: Option<Vec<_>> =
-            if !xflag_chain0 || seeds.get(0).map_or(true, |s| s.is_empty()) {
-                None
-            } else {
-                Some(reorder_seeds_for_chain_with_cross_chain(
-                    &seeds[0],
-                    index,
-                    config.seed_size,
-                    config.index_interval,
-                    &config.profile,
-                    read_len,
-                    config.rrbs_flag,
-                    0,
-                    cross_chain_enabled,
-                ))
-            };
-        let chain1_segments: Option<Vec<_>> =
-            if !xflag_chain1 || seeds.get(1).map_or(true, |s| s.is_empty()) {
-                None
-            } else {
-                Some(reorder_seeds_for_chain_with_cross_chain(
-                    &seeds[1],
-                    index,
-                    config.seed_size,
-                    config.index_interval,
-                    &config.profile,
-                    read_len,
-                    config.rrbs_flag,
-                    1,
-                    cross_chain_enabled,
-                ))
-            };
+        self.seed_segments[0].clear();
+        if xflag_chain0 && !self.seed_chains[0].is_empty() {
+            reorder_seeds_for_chain_with_cross_chain_into(
+                &self.seed_chains[0],
+                index,
+                config.seed_size,
+                config.index_interval,
+                &config.profile,
+                read_len,
+                config.rrbs_flag,
+                0,
+                cross_chain_enabled,
+                &mut self.seed_segments[0],
+            );
+        }
+        self.seed_segments[1].clear();
+        if xflag_chain1 && !self.seed_chains[1].is_empty() {
+            reorder_seeds_for_chain_with_cross_chain_into(
+                &self.seed_chains[1],
+                index,
+                config.seed_size,
+                config.index_interval,
+                &config.profile,
+                read_len,
+                config.rrbs_flag,
+                1,
+                cross_chain_enabled,
+                &mut self.seed_segments[1],
+            );
+        }
 
-        let num_segments = chain0_segments
-            .as_ref()
-            .map_or(0, |s| s.len())
-            .max(chain1_segments.as_ref().map_or(0, |s| s.len()));
+        let num_segments = self.seed_segments[0]
+            .len()
+            .max(self.seed_segments[1].len());
 
         // C++ 两条 read-chain 共享一个动态 mismatch 阈值。
         let mut snp_thres = max_snp;
@@ -222,14 +224,14 @@ impl SingleAlign {
                     continue;
                 }
                 let chain_segs = match read_chain {
-                    0 => chain0_segments.as_ref(),
-                    1 => chain1_segments.as_ref(),
+                    0 => &self.seed_segments[0],
+                    1 => &self.seed_segments[1],
                     _ => unreachable!(),
                 };
-                if chain_segs.map_or(true, |s| seg_idx >= s.len()) {
+                if seg_idx >= chain_segs.len() {
                     continue;
                 }
-                let segment = &chain_segs.unwrap()[seg_idx];
+                let segment = &chain_segs[seg_idx];
 
                 let query = if read_chain == 0 {
                     encoded.fwd_words()

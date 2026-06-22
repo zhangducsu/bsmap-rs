@@ -70,6 +70,9 @@ const INDEX_VERSION_FAST_COMPAT: u32 = 7;
 /// Version 8: succinct WGBS bucket metadata and raw-section layout marker v2.
 const INDEX_VERSION_SUCCINCT_WGBS: u32 = 8;
 
+/// Version 9: RRBS stores only the forward reference and generates reverse windows on demand.
+const INDEX_VERSION_SINGLE_RRBS_REFERENCE: u32 = 9;
+
 /// WGBS alignment mode.
 const MODE_WGBS: u32 = 0;
 
@@ -354,7 +357,11 @@ pub fn save_index_v2(
     // ── 当前完整索引格式的 header ──
     let mut header = [0u8; HEADER_SIZE];
     header[0..8].copy_from_slice(INDEX_MAGIC);
-    let version = INDEX_VERSION_SUCCINCT_WGBS;
+    let version = if params.is_rrbs {
+        INDEX_VERSION_SINGLE_RRBS_REFERENCE
+    } else {
+        INDEX_VERSION_SUCCINCT_WGBS
+    };
     header[8..12].copy_from_slice(&version.to_le_bytes());
     header[12..16].copy_from_slice(&params.seed_size.to_le_bytes());
     let mode = if params.is_rrbs { MODE_RRBS } else { MODE_WGBS };
@@ -377,7 +384,11 @@ pub fn save_index_v2(
 
     // 完整索引字段：refcat/crefcat word 数量。
     let refcat_slice = coll.refcat.as_slice();
-    let crefcat_slice = coll.crefcat.as_slice();
+    let crefcat_slice: &[u64] = if params.is_rrbs {
+        &[]
+    } else {
+        coll.crefcat.as_slice()
+    };
     header[48..56].copy_from_slice(&(refcat_slice.len() as u64).to_le_bytes());
     header[56..64].copy_from_slice(&(crefcat_slice.len() as u64).to_le_bytes());
 
@@ -635,9 +646,10 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
         && version != INDEX_VERSION_RRBS_SITES
         && version != INDEX_VERSION_FAST_COMPAT
         && version != INDEX_VERSION_SUCCINCT_WGBS
+        && version != INDEX_VERSION_SINGLE_RRBS_REFERENCE
     {
         bail!(
-            "Unsupported index version {} (expected {}, {}, {}, {}, {}, {}, {}, or {}): {}",
+            "Unsupported index version {} (expected {}, {}, {}, {}, {}, {}, {}, {}, or {}): {}",
             version,
             INDEX_VERSION,
             INDEX_VERSION_V2,
@@ -647,6 +659,7 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
             INDEX_VERSION_RRBS_SITES,
             INDEX_VERSION_FAST_COMPAT,
             INDEX_VERSION_SUCCINCT_WGBS,
+            INDEX_VERSION_SINGLE_RRBS_REFERENCE,
             path.display()
         );
     }
@@ -813,6 +826,7 @@ pub fn load_index(path: &Path) -> Result<(KmerIndex, IndexMeta)> {
     let meta = read_index_meta(path)?;
     if meta.version == INDEX_VERSION_FAST_COMPAT
         || meta.version == INDEX_VERSION_SUCCINCT_WGBS
+        || meta.version == INDEX_VERSION_SINGLE_RRBS_REFERENCE
     {
         let (_coll, index, meta) = load_index_with_mode(path, LoadMode::Memory)?;
         return Ok((index, meta));
@@ -930,7 +944,9 @@ fn load_raw_index(
     ref_anchor: Vec<u32>,
     header: &[u8; HEADER_SIZE],
 ) -> Result<(BinSeqCollection, KmerIndex, IndexMeta)> {
-    let expected_marker = if meta.version == INDEX_VERSION_SUCCINCT_WGBS {
+    let expected_marker = if meta.version == INDEX_VERSION_SUCCINCT_WGBS
+        || meta.version == INDEX_VERSION_SINGLE_RRBS_REFERENCE
+    {
         RAW_SECTION_MARKER_V2
     } else {
         RAW_SECTION_MARKER_V1
@@ -1132,7 +1148,10 @@ pub fn load_index_with_mode(
     reader.read_exact(&mut header)?;
     let version = u32::from_le_bytes(header[8..12].try_into().unwrap());
 
-    if version == INDEX_VERSION_FAST_COMPAT || version == INDEX_VERSION_SUCCINCT_WGBS {
+    if version == INDEX_VERSION_FAST_COMPAT
+        || version == INDEX_VERSION_SUCCINCT_WGBS
+        || version == INDEX_VERSION_SINGLE_RRBS_REFERENCE
+    {
         drop(reader);
         return load_raw_index(path, mode, meta, ref_anchor, &header);
     }
@@ -1176,6 +1195,7 @@ pub fn load_index_with_mode(
         && version != INDEX_VERSION_RRBS_SITES
         && version != INDEX_VERSION_FAST_COMPAT
         && version != INDEX_VERSION_SUCCINCT_WGBS
+        && version != INDEX_VERSION_SINGLE_RRBS_REFERENCE
     {
         bail!(
             "Unsupported index version {}: {}",
@@ -1438,11 +1458,16 @@ pub fn is_index_compatible(
     }
 
     let meta = read_index_meta(path)?;
-    if meta.version != INDEX_VERSION_SUCCINCT_WGBS {
+    let expected_version = if params.is_rrbs {
+        INDEX_VERSION_SINGLE_RRBS_REFERENCE
+    } else {
+        INDEX_VERSION_SUCCINCT_WGBS
+    };
+    if meta.version != expected_version {
         log::info!(
             "缓存索引版本 {} 不兼容，需要重建 v{} 索引",
             meta.version,
-            INDEX_VERSION_SUCCINCT_WGBS,
+            expected_version,
         );
         return Ok(false);
     }
@@ -1743,11 +1768,12 @@ mod tests {
         };
 
         save_index_v2(tmp.path(), &index, &coll, &ref_names, fasta.path(), &params).unwrap();
-        let (_loaded_coll, loaded, meta) =
+        let (loaded_coll, loaded, meta) =
             load_index_with_mode(tmp.path(), LoadMode::Memory).unwrap();
 
-        assert_eq!(meta.version, INDEX_VERSION_SUCCINCT_WGBS);
+        assert_eq!(meta.version, INDEX_VERSION_SINGLE_RRBS_REFERENCE);
         assert!(meta.is_rrbs);
+        assert!(loaded_coll.crefcat.is_empty());
         assert_eq!(loaded.rrbs_offsets, index.rrbs_offsets);
         assert_eq!(loaded.rrbs_hits, index.rrbs_hits);
         assert_eq!(loaded.rrbs_site_offsets, index.rrbs_site_offsets);
@@ -1756,9 +1782,10 @@ mod tests {
             assert_eq!(loaded.lookup_rrbs(hash), index.lookup_rrbs(hash));
         }
 
-        let (_mapped_coll, mapped, _) =
+        let (mapped_coll, mapped, _) =
             load_index_with_mode(tmp.path(), LoadMode::Mmap).unwrap();
         assert!(mapped.mapped.is_some());
+        assert!(mapped_coll.crefcat.is_empty());
         for hash in 0..index.total_kmers {
             assert_eq!(mapped.lookup_rrbs(hash), index.lookup_rrbs(hash));
         }

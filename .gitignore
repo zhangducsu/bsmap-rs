@@ -3,6 +3,10 @@
 **/*.rs.bk
 *.pdb
 
+# Python
+__pycache__/
+*.py[cod]
+
 # IDE
 .vscode/
 .idea/
@@ -43,6 +47,7 @@ benchmark/results_p6_final/
 benchmark/rrbssim/
 benchmark/p13/runs/
 bsmap-rs/benchmark/p13/runs/
+bsmap-rs/benchmark/p15/runs/
 benchmark/tmp/
 
 # Trae documents

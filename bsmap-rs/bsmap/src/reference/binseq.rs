@@ -224,6 +224,56 @@ impl BinSeqCollection {
             self.ref_anchor[chr_idx] // fallback
         }
     }
+
+    /// 从正向 reference 即时生成 C++ padded reverse-chain 的局部窗口。
+    pub fn fill_reverse_window(
+        &self,
+        chr_idx: usize,
+        reverse_start: u32,
+        base_len: u32,
+        output: &mut [u64],
+    ) -> bool {
+        output.fill(0);
+        let Some(&chr_len) = self.chr_lengths.get(chr_idx) else {
+            return false;
+        };
+        if chr_idx + 1 >= self.ref_anchor.len() {
+            return false;
+        }
+        let anchor = self.ref_anchor[chr_idx];
+        let rc_offset = self.ref_anchor[chr_idx + 1] - anchor;
+        let leading_padding = rc_offset.saturating_sub(chr_len);
+        let forward = self.refcat.as_slice();
+        let output_bases = base_len.min((output.len() * SEGLEN) as u32);
+
+        for output_pos in 0..output_bases {
+            let Some(reverse_pos) = reverse_start.checked_add(output_pos) else {
+                return false;
+            };
+            let code = if reverse_pos < leading_padding {
+                3u64
+            } else if reverse_pos < rc_offset {
+                let source_pos = rc_offset - 1 - reverse_pos;
+                let flat_pos = anchor + source_pos;
+                let word_index = flat_pos as usize / SEGLEN;
+                let bit_offset = (flat_pos as usize % SEGLEN) * 2;
+                let Some(&word) = forward.get(word_index) else {
+                    return false;
+                };
+                3 - ((word >> (62 - bit_offset)) & 0b11)
+            } else if chr_idx + 1 < self.chr_lengths.len() {
+                // 下一个 chromosome 以至少 BINSEQPAD 个 T-coded reverse padding words 开头。
+                3u64
+            } else {
+                // 最后一个 chromosome 后是 REF_MARGIN 个零 word。
+                0u64
+            };
+            let word_index = output_pos as usize / SEGLEN;
+            let bit_offset = (output_pos as usize % SEGLEN) * 2;
+            output[word_index] |= code << (62 - bit_offset);
+        }
+        true
+    }
 }
 
 // ── Encoding ──────────────────────────────────────────────────────────────────
@@ -385,6 +435,54 @@ mod tests {
     fn test_encode_revcomp_padded_matches_cpp_layout() {
         let words = encode_revcomp_padded(b"ACGT", 3);
         assert_eq!(words, vec![u64::MAX, u64::MAX, 0xffff_ffff_ffff_ff1b]);
+    }
+
+    #[test]
+    fn generated_reverse_windows_match_materialized_crefcat() {
+        let refs = vec![
+            Reference {
+                name: "chr1".to_string(),
+                seq: b"ACGTNACGTACGTACGTACGTACGTACGTACGT".to_vec(),
+                len: 34,
+            },
+            Reference {
+                name: "chr2".to_string(),
+                seq: b"TGCAACG".to_vec(),
+                len: 7,
+            },
+        ];
+        let collection = BinSeqCollection::from_references(&refs);
+        let crefcat = collection.crefcat.as_slice();
+
+        for chr_idx in 0..refs.len() {
+            let anchor = collection.ref_anchor[chr_idx];
+            let rc_offset = collection.ref_anchor[chr_idx + 1] - anchor;
+            let leading_padding = rc_offset - collection.chr_lengths[chr_idx];
+            let starts = [
+                0,
+                leading_padding.saturating_sub(1),
+                leading_padding,
+                rc_offset.saturating_sub(5),
+                rc_offset.saturating_sub(1),
+            ];
+            for reverse_start in starts {
+                let mut generated = [0u64; 2];
+                assert!(collection.fill_reverse_window(chr_idx, reverse_start, 40, &mut generated));
+                for offset in 0..40u32 {
+                    let generated_word = generated[offset as usize / SEGLEN];
+                    let generated_shift = 62 - (offset as usize % SEGLEN) * 2;
+                    let generated_code = (generated_word >> generated_shift) & 0b11;
+                    let flat_pos = anchor + reverse_start + offset;
+                    let expected_word = crefcat[flat_pos as usize / SEGLEN];
+                    let expected_shift = 62 - (flat_pos as usize % SEGLEN) * 2;
+                    let expected_code = (expected_word >> expected_shift) & 0b11;
+                    assert_eq!(
+                        generated_code, expected_code,
+                        "chr={chr_idx}, reverse_start={reverse_start}, offset={offset}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

@@ -233,3 +233,17 @@
 - 原因：signal termination 的 GNU time 展示不能只靠最后一个字段判断；Linux time 的 RSS 数值按 KiB 换算更准确。
 - 规避：C++ PE 同时检查 signal 行、stderr、SAM 大小和外层退出码；运行前 `ulimit -c 0`。RSS 报告保留原始 KiB，并用 `KiB / 1,048,576` 给出 GiB。
 - 验证：WGBS example2 C++ PE 记录 signal 6、buffer overflow、0-byte SAM；mm10 C++ PE 记录 signal 6/134，均未伪装成有效对照。
+
+### 25. 托管沙箱可能隐藏 WSL 发行版
+
+- 现象：托管沙箱内执行 `wsl.exe --list --verbose` 返回“没有已安装发行版”，同一会话在沙箱外执行却能列出 Ubuntu 和 `docker-desktop`，均为 WSL2。
+- 原因：沙箱进程看不到宿主用户的完整 WSL 注册状态；该结果不等于发行版被卸载。
+- 规避：沙箱内出现空列表时，不得直接判定 WSL 环境丢失。先申请只读的沙箱外 `wsl.exe --list --verbose` 检查；后续 WSL 编译和 benchmark 也在获批的宿主环境中执行。
+- 验证：2026-06-22 沙箱外列出 Ubuntu 与 `docker-desktop`；随后 Ubuntu 登录 shell 中 `cargo build --release -p bsmap` 成功。
+
+### 26. PE 输入 FIFO 的打开顺序会死锁
+
+- 现象：单个 producer 依次打开 R1、R2 FIFO 且等待两者都打开后才写数据时，PE runner 中 producer、`bsmap` 和 GNU time 长时间全部处于等待状态。
+- 原因：`FastqReader` 打开 R1 后会先读取格式字节，再打开 R2，而且后续也可能按 mate 分批读取。单 writer 会阻塞在打开 R2；按 pair 向两个 bounded writer 锁步投递时，R2 管道/队列先填满又会反向阻塞 R1，形成第二种死锁。
+- 规避：R1、R2 必须由两个完全独立的常数内存 producer 流式输出，使用相同 repeat count，结束后核对 records 数。PE 规模测试使用 `TARGET_SOURCE_BYTES` 或 `REPEATS`；不能用需要逐 pair 联动停止的 `TARGET_EMITTED_BYTES`。
+- 验证：POSIX FIFO 单测按“读取完 R1 后才打开并读取 R2”的顺序执行，两个 mate 均完整输出且线程正常退出；example2 smoke run `20260622T145010Z.meNSxk` 在 1.17 秒完成，66,958 条 SAM 的 SHA256 与 P15 Phase 1 完全一致。
