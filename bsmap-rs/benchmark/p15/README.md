@@ -5,7 +5,7 @@
 ## 工具
 
 - `metrics.py`：解析 GNU `/usr/bin/time -v`，同时识别 signal、外层退出码、RSS、CPU、缺页与上下文切换。
-- `index_sections.py`：只读检查 v8/v9 `.bsi` header、mode/version 配对、marker、section offset/count/bytes 和文件边界；RRBS v9 还会确认未保存 materialized `crefcat`。
+- `index_sections.py`：只读检查 v8-v10 `.bsi` header、mode/version 配对、marker、section offset/count/bytes 和文件边界；RRBS v9/v10 还会确认未保存 materialized `crefcat`，v10 使用 7-byte packed hit。
 - `stream_fastq.py`：逐记录解压并重复 FASTQ，直接写入 FIFO；不会生成 90G/10G 中间 FASTQ。
 - `slow_sink.py`：常数内存消费 SAM FIFO，可限速以验证输出背压。
 - `run_stream_scale.sh`：串起 producer、Rust align、sink、GNU time 和 SHA256，生成单轮 `summary.json`。

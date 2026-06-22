@@ -62,7 +62,7 @@ class IndexSectionsTest(unittest.TestCase):
         struct.pack_into("<Q", header, 48, refcat_count)
         struct.pack_into("<Q", header, 56, crefcat_count)
         cursor = HEADER_SIZE
-        sizes = (8, 4, 8, 4, 12, 4, 8, 8, 8)
+        sizes = (8, 4, 8, 4, 7 if version == 10 and mode == 1 else 12, 4, 8, 8, 8)
         for index, size in enumerate(sizes):
             count = refcat_count if index == 7 else crefcat_count if index == 8 else 0
             struct.pack_into("<QQ", header, 100 + index * 16, cursor, count)
@@ -118,6 +118,21 @@ class IndexSectionsTest(unittest.TestCase):
             )
         self.assertFalse(report["valid"])
         self.assertTrue(any("省略 materialized crefcat" in error for error in report["errors"]))
+
+    def test_valid_v10_rrbs_uses_seven_byte_hits(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = inspect_index(
+                self.make_index(
+                    Path(temp_dir),
+                    version=10,
+                    mode=1,
+                    refcat_count=1,
+                    crefcat_count=0,
+                )
+            )
+        self.assertTrue(report["valid"])
+        self.assertEqual(report["sections"][4]["name"], "packed_rrbs_hits")
+        self.assertEqual(report["sections"][4]["item_size"], 7)
 
 
 class StreamFastqTest(unittest.TestCase):

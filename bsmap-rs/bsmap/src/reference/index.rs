@@ -25,6 +25,137 @@ pub const RRBS_MODE_SHIFT: u32 = 16;
 /// C++ marker for cross-chain RRBS entries.
 pub const RRBS_BSC_FLAG: u32 = 0x01000000;
 
+/// RRBS v10 stores one hit in seven bytes: four bytes of location, two bytes
+/// of block id, and one byte containing a 7-bit mode plus the BSC flag.
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PackedRrbsHit([u8; 7]);
+
+impl PackedRrbsHit {
+    pub(crate) fn from_hit(hit: Hit) -> Option<Self> {
+        const ALLOWED_CHR_BITS: u32 = RRBS_CHR_MASK | (0x7f << RRBS_MODE_SHIFT) | RRBS_BSC_FLAG;
+        if hit.chr & !ALLOWED_CHR_BITS != 0 {
+            return None;
+        }
+        let block_id = (hit.chr & RRBS_CHR_MASK) as u16;
+        let mode = ((hit.chr >> RRBS_MODE_SHIFT) & 0x7f) as u8;
+        let mode_and_flag = mode
+            | if hit.chr & RRBS_BSC_FLAG != 0 {
+                0x80
+            } else {
+                0
+            };
+        let loc = hit.loc.to_le_bytes();
+        let block = block_id.to_le_bytes();
+        Some(Self([
+            loc[0], loc[1], loc[2], loc[3], block[0], block[1], mode_and_flag,
+        ]))
+    }
+
+    #[inline(always)]
+    pub(crate) fn to_hit(self) -> Hit {
+        let loc = unsafe { std::ptr::read_unaligned(self.0.as_ptr() as *const u32) };
+        let block_id = unsafe {
+            std::ptr::read_unaligned(self.0.as_ptr().add(4) as *const u16) as u32
+        };
+        let mode_and_flag = self.0[6] as u32;
+        Hit {
+            chr: block_id
+                | ((mode_and_flag & 0x7f) << RRBS_MODE_SHIFT)
+                | ((mode_and_flag & 0x80) << 17),
+            loc,
+        }
+    }
+
+    pub(crate) fn into_bytes(self) -> [u8; 7] {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct RrbsHitView<'a> {
+    storage: RrbsHitStorage<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum RrbsHitStorage<'a> {
+    Unpacked(&'a [Hit]),
+    Packed(&'a [PackedRrbsHit]),
+}
+
+impl<'a> RrbsHitView<'a> {
+    fn unpacked(hits: &'a [Hit]) -> Self {
+        Self {
+            storage: RrbsHitStorage::Unpacked(hits),
+        }
+    }
+
+    fn packed(hits: &'a [PackedRrbsHit]) -> Self {
+        Self {
+            storage: RrbsHitStorage::Packed(hits),
+        }
+    }
+
+    pub fn len(self) -> usize {
+        match self.storage {
+            RrbsHitStorage::Unpacked(hits) => hits.len(),
+            RrbsHitStorage::Packed(hits) => hits.len(),
+        }
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(self, index: usize) -> Option<Hit> {
+        match self.storage {
+            RrbsHitStorage::Unpacked(hits) => hits.get(index).copied(),
+            RrbsHitStorage::Packed(hits) => hits.get(index).copied().map(PackedRrbsHit::to_hit),
+        }
+    }
+
+    fn slice(self, start: usize, end: usize) -> Option<Self> {
+        match self.storage {
+            RrbsHitStorage::Unpacked(hits) => hits.get(start..end).map(Self::unpacked),
+            RrbsHitStorage::Packed(hits) => hits.get(start..end).map(Self::packed),
+        }
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = Hit> + ExactSizeIterator + Clone + 'a {
+        match self.storage {
+            RrbsHitStorage::Unpacked(hits) => RrbsHitIter::Unpacked(hits.iter()),
+            RrbsHitStorage::Packed(hits) => RrbsHitIter::Packed(hits.iter()),
+        }
+    }
+}
+
+#[derive(Clone)]
+enum RrbsHitIter<'a> {
+    Unpacked(std::slice::Iter<'a, Hit>),
+    Packed(std::slice::Iter<'a, PackedRrbsHit>),
+}
+
+impl Iterator for RrbsHitIter<'_> {
+    type Item = Hit;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Unpacked(hits) => hits.next().copied(),
+            Self::Packed(hits) => hits.next().copied().map(PackedRrbsHit::to_hit),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Unpacked(hits) => hits.size_hint(),
+            Self::Packed(hits) => hits.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for RrbsHitIter<'_> {}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MappedSection {
     pub offset: usize,
@@ -39,6 +170,7 @@ pub(crate) struct MappedKmerIndex {
     pub start_offsets: MappedSection,
     pub rrbs_offsets: MappedSection,
     pub rrbs_hits: MappedSection,
+    pub packed_rrbs_hits: bool,
     pub rrbs_site_offsets: MappedSection,
     pub rrbs_sites: MappedSection,
     pub wgbs_occupancy: MappedSection,
@@ -298,8 +430,20 @@ impl KmerIndex {
     #[inline]
     pub(crate) fn rrbs_hits_slice(&self) -> &[Hit] {
         match &self.mapped {
-            Some(mapped) => unsafe { mapped.slice(mapped.rrbs_hits) },
+            Some(mapped) if !mapped.packed_rrbs_hits => unsafe { mapped.slice(mapped.rrbs_hits) },
+            Some(_) => panic!("packed RRBS mmap does not expose an unpacked hit slice"),
             None => &self.rrbs_hits,
+        }
+    }
+
+    #[inline]
+    fn rrbs_hit_view(&self) -> RrbsHitView<'_> {
+        match &self.mapped {
+            Some(mapped) if mapped.packed_rrbs_hits => {
+                RrbsHitView::packed(unsafe { mapped.slice(mapped.rrbs_hits) })
+            }
+            Some(mapped) => RrbsHitView::unpacked(unsafe { mapped.slice(mapped.rrbs_hits) }),
+            None => RrbsHitView::unpacked(&self.rrbs_hits),
         }
     }
 
@@ -729,16 +873,18 @@ impl KmerIndex {
 
     /// Look up one RRBS k-mer bucket in flat storage.
     #[inline]
-    pub fn lookup_rrbs(&self, seed_hash: u32) -> &[Hit] {
+    pub fn lookup_rrbs(&self, seed_hash: u32) -> RrbsHitView<'_> {
         let rrbs_offsets = self.rrbs_offsets_slice();
-        let rrbs_hits = self.rrbs_hits_slice();
+        let rrbs_hits = self.rrbs_hit_view();
         let idx = seed_hash as usize;
         if idx + 1 >= rrbs_offsets.len() {
-            return &[];
+            return RrbsHitView::unpacked(&[]);
         }
         let start = rrbs_offsets[idx] as usize;
         let end = rrbs_offsets[idx + 1] as usize;
-        rrbs_hits.get(start..end).unwrap_or(&[])
+        rrbs_hits
+            .slice(start, end)
+            .unwrap_or_else(|| RrbsHitView::unpacked(&[]))
     }
 }
 
@@ -760,17 +906,18 @@ fn visit_rrbs_hits<F>(
             }
             let anchor = coll.ref_anchor[chr_idx];
             let rc_offset = coll.ref_anchor[chr_idx + 1] - anchor;
-            let words = if block_id & 1 == 0 {
-                coll.refcat.as_slice()
-            } else {
-                coll.crefcat.as_slice()
-            };
             let hit_chr = block_id | ((mode as u32) << RRBS_MODE_SHIFT);
 
             for &loc in &mode_blocks[block_id as usize] {
-                if let Some(hash) =
-                    try_make_seed(words, (anchor as u64 + loc as u64) * 2, seed_bits_lz)
-                {
+                if let Some(hash) = try_make_rrbs_seed(
+                    coll,
+                    block_id,
+                    chr_idx,
+                    anchor,
+                    loc,
+                    seed_size,
+                    seed_bits_lz,
+                ) {
                     visit(hash as usize, Hit { chr: hit_chr, loc });
                 }
             }
@@ -780,9 +927,15 @@ fn visit_rrbs_hits<F>(
             let cross_hit_chr = hit_chr | RRBS_BSC_FLAG;
             for &other_pos in &mode_blocks[other_block] {
                 if let Some(loc) = tmp_offset.checked_sub(other_pos) {
-                    if let Some(hash) =
-                        try_make_seed(words, (anchor as u64 + loc as u64) * 2, seed_bits_lz)
-                    {
+                    if let Some(hash) = try_make_rrbs_seed(
+                        coll,
+                        block_id,
+                        chr_idx,
+                        anchor,
+                        loc,
+                        seed_size,
+                        seed_bits_lz,
+                    ) {
                         visit(
                             hash as usize,
                             Hit {
@@ -794,6 +947,27 @@ fn visit_rrbs_hits<F>(
                 }
             }
         }
+    }
+}
+
+#[inline]
+fn try_make_rrbs_seed(
+    coll: &BinSeqCollection,
+    block_id: u32,
+    chr_idx: usize,
+    anchor: u32,
+    loc: u32,
+    seed_size: u32,
+    seed_bits_lz: u32,
+) -> Option<u32> {
+    if block_id & 1 == 0 {
+        try_make_seed(
+            coll.refcat.as_slice(),
+            (anchor as u64 + loc as u64) * 2,
+            seed_bits_lz,
+        )
+    } else {
+        coll.reverse_seed_hash(chr_idx, loc, seed_size)
     }
 }
 
@@ -1108,6 +1282,30 @@ mod tests {
         assert_eq!(index.rrbs_fragment(0, 10, 20), Some((6, 37)));
         assert_eq!(index.rrbs_fragment(0, 40, 20), Some((41, 52)));
         assert_eq!(index.rrbs_fragment(1, 10, 20), None);
+    }
+
+    #[test]
+    fn packed_rrbs_hit_roundtrips_all_fields_in_seven_bytes() {
+        assert_eq!(std::mem::size_of::<PackedRrbsHit>(), 7);
+        for hit in [
+            Hit { chr: 0, loc: 0 },
+            Hit {
+                chr: 0xffff | (13 << RRBS_MODE_SHIFT),
+                loc: u32::MAX,
+            },
+            Hit {
+                chr: 0x1234 | (127 << RRBS_MODE_SHIFT) | RRBS_BSC_FLAG,
+                loc: 0x89abcdef,
+            },
+        ] {
+            let packed = PackedRrbsHit::from_hit(hit).unwrap();
+            assert_eq!(packed.to_hit(), hit);
+        }
+        assert!(PackedRrbsHit::from_hit(Hit {
+            chr: 128 << RRBS_MODE_SHIFT,
+            loc: 0,
+        })
+        .is_none());
     }
 
     #[test]

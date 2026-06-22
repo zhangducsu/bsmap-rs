@@ -266,10 +266,14 @@ pub(crate) fn snp_align_segment(
                 };
                 let read_chain_mask = (read_chain as u32) << 24;
 
-                let logical_bucket_len = hits
-                    .iter()
-                    .filter(|hit| rrbs_bucket_hit_is_eligible(hit, cross_chain_enabled))
-                    .count();
+                let logical_bucket_len = if cross_chain_enabled {
+                    hits.len()
+                } else {
+                    hits
+                        .iter()
+                        .filter(|hit| rrbs_bucket_hit_is_eligible(hit, false))
+                        .count()
+                };
                 if logical_bucket_len == 0 {
                     continue;
                 }

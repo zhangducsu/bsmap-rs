@@ -7,7 +7,7 @@
 //! Mirrors C++ `RefSeq::BinSeq()`, `cBinSeq()`, `UnmaskRegion()`,
 //! and `Run_ConvertBinseq()`.
 
-use crate::alphabet::{ALPHABET, REV_ALPHABET};
+use crate::alphabet::{xt3, ALPHABET, REV_ALPHABET};
 use crate::param::{BINSEQPAD, REF_MARGIN, SEGLEN};
 
 use super::fasta::Reference;
@@ -74,6 +74,7 @@ pub struct BinSeqCollectionBuilder {
     chr_names: Vec<String>,
     sum_length: u64,
     cpp_padded_reverse: bool,
+    materialize_reverse: bool,
 }
 
 impl BinSeqCollectionBuilder {
@@ -87,12 +88,14 @@ impl BinSeqCollectionBuilder {
             chr_names: Vec::new(),
             sum_length: 0,
             cpp_padded_reverse: true,
+            materialize_reverse: true,
         }
     }
 
     pub fn new_rrbs() -> Self {
         Self {
             cpp_padded_reverse: true,
+            materialize_reverse: false,
             ..Self::new()
         }
     }
@@ -107,14 +110,16 @@ impl BinSeqCollectionBuilder {
         self.refcat.extend_from_slice(&forward);
         drop(forward);
 
-        let reverse = if self.cpp_padded_reverse {
-            encode_revcomp_padded(&reference.seq, words)
-        } else {
-            let mut reverse = encode_revcomp(&reference.seq).words;
-            reverse.resize(words, 0);
-            reverse
-        };
-        self.crefcat.extend_from_slice(&reverse);
+        if self.materialize_reverse {
+            let reverse = if self.cpp_padded_reverse {
+                encode_revcomp_padded(&reference.seq, words)
+            } else {
+                let mut reverse = encode_revcomp(&reference.seq).words;
+                reverse.resize(words, 0);
+                reverse
+            };
+            self.crefcat.extend_from_slice(&reverse);
+        }
 
         find_blocks(&mut self.blocks, chr_id * 2, &reference.seq, total_bases);
         self.ref_anchor.push((self.refcat.len() * SEGLEN) as u32);
@@ -127,7 +132,11 @@ impl BinSeqCollectionBuilder {
         self.blocks
             .sort_by(|a, b| a.id.cmp(&b.id).then_with(|| a.begin.cmp(&b.begin)));
         self.refcat.resize(self.refcat.len() + REF_MARGIN, 0);
-        self.crefcat.resize(self.crefcat.len() + REF_MARGIN, 0);
+        if self.materialize_reverse {
+            self.crefcat.resize(self.crefcat.len() + REF_MARGIN, 0);
+        } else {
+            self.crefcat.clear();
+        }
         let chr_accessions = self
             .chr_names
             .iter()
@@ -273,6 +282,41 @@ impl BinSeqCollection {
             output[word_index] |= code << (62 - bit_offset);
         }
         true
+    }
+
+    /// Extract an RRBS seed from the C++ padded reverse chain without
+    /// materializing the full reverse reference.
+    pub fn reverse_seed_hash(
+        &self,
+        chr_idx: usize,
+        reverse_start: u32,
+        seed_size: u32,
+    ) -> Option<u32> {
+        let &chr_len = self.chr_lengths.get(chr_idx)?;
+        let next_anchor = *self.ref_anchor.get(chr_idx + 1)?;
+        let anchor = self.ref_anchor[chr_idx];
+        let rc_offset = next_anchor.checked_sub(anchor)?;
+        let leading_padding = rc_offset.saturating_sub(chr_len);
+        let end = reverse_start.checked_add(seed_size)?;
+        if end > rc_offset {
+            return None;
+        }
+
+        let forward = self.refcat.as_slice();
+        let mut packed = 0u32;
+        for reverse_pos in reverse_start..end {
+            let code = if reverse_pos < leading_padding {
+                3u32
+            } else {
+                let source_pos = rc_offset - 1 - reverse_pos;
+                let flat_pos = anchor + source_pos;
+                let word = *forward.get(flat_pos as usize / SEGLEN)?;
+                let bit_offset = (flat_pos as usize % SEGLEN) * 2;
+                3 - ((word >> (62 - bit_offset)) & 0b11) as u32
+            };
+            packed = (packed << 2) | code;
+        }
+        Some(xt3(packed))
     }
 }
 
@@ -492,12 +536,41 @@ mod tests {
             seq: b"ACGT".to_vec(),
             len: 4,
         };
-        for mut builder in [BinSeqCollectionBuilder::new(), BinSeqCollectionBuilder::new_rrbs()] {
-            builder.push(&reference);
-            let collection = builder.finish();
+        let mut builder = BinSeqCollectionBuilder::new();
+        builder.push(&reference);
+        let collection = builder.finish();
+        assert_eq!(
+            &collection.crefcat.as_slice()[REF_MARGIN..REF_MARGIN + 3],
+            &[u64::MAX, u64::MAX, 0xffff_ffff_ffff_ff1b]
+        );
+
+        let mut rrbs_builder = BinSeqCollectionBuilder::new_rrbs();
+        rrbs_builder.push(&reference);
+        assert!(rrbs_builder.finish().crefcat.is_empty());
+    }
+
+    #[test]
+    fn reverse_seed_hash_matches_materialized_cpp_chain() {
+        let refs = vec![Reference {
+            name: "chr1".to_string(),
+            seq: b"ACGTNACGTACGTACGTACGTACGTACGTACGT".to_vec(),
+            len: 34,
+        }];
+        let collection = BinSeqCollection::from_references(&refs);
+        let anchor = collection.ref_anchor[0];
+        let rc_offset = collection.ref_anchor[1] - anchor;
+        let seed_size = 12;
+        let seed_bits_lz = (SEGLEN as u32 - seed_size) * 2;
+        for reverse_start in 0..=rc_offset - seed_size {
+            let expected = crate::alphabet::make_seed(
+                collection.crefcat.as_slice(),
+                (anchor as u64 + reverse_start as u64) * 2,
+                seed_bits_lz,
+            );
             assert_eq!(
-                &collection.crefcat.as_slice()[REF_MARGIN..REF_MARGIN + 3],
-                &[u64::MAX, u64::MAX, 0xffff_ffff_ffff_ff1b]
+                collection.reverse_seed_hash(0, reverse_start, seed_size),
+                Some(expected),
+                "reverse_start={reverse_start}"
             );
         }
     }

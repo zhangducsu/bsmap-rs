@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect and validate BSMAP v8/v9 raw index sections without loading them."""
+"""Inspect and validate BSMAP v8-v10 raw index sections without loading them."""
 
 import argparse
 import json
@@ -37,6 +37,12 @@ RRBS_SECTIONS = (
     ("crefcat", 8),
 )
 
+RRBS_V10_SECTIONS = (
+    *RRBS_SECTIONS[:4],
+    ("packed_rrbs_hits", 7),
+    *RRBS_SECTIONS[5:],
+)
+
 
 def unpack(header, offset, fmt):
     return struct.unpack_from("<" + fmt, header, offset)[0]
@@ -58,23 +64,23 @@ def inspect_index(path):
     errors = []
     if magic != b"BSMAPIDX":
         errors.append("magic 不匹配")
-    if version not in (8, 9):
-        errors.append(f"只支持检查 v8/v9 raw index，实际为 v{version}")
+    if version not in (8, 9, 10):
+        errors.append(f"只支持检查 v8-v10 raw index，实际为 v{version}")
     if marker != "RAWSECT2":
         errors.append(f"raw section marker 不是 RAWSECT2：{marker!r}")
     if mode_code not in (0, 1):
         errors.append(f"未知 mode：{mode_code}")
     elif mode_code == 0 and version != 8:
         errors.append(f"WGBS raw index 必须为 v8，实际为 v{version}")
-    elif mode_code == 1 and version not in (8, 9):
-        errors.append(f"RRBS raw index 必须为 v8 或 v9，实际为 v{version}")
+    elif mode_code == 1 and version not in (8, 9, 10):
+        errors.append(f"RRBS raw index 必须为 v8、v9 或 v10，实际为 v{version}")
 
     refcat_words = unpack(header, 48, "Q")
     crefcat_words = unpack(header, 56, "Q")
-    if version == 9 and crefcat_words != 0:
-        errors.append("RRBS v9 必须省略 materialized crefcat")
+    if version in (9, 10) and crefcat_words != 0:
+        errors.append(f"RRBS v{version} 必须省略 materialized crefcat")
 
-    specs = RRBS_SECTIONS if mode_code == 1 else WGBS_SECTIONS
+    specs = RRBS_V10_SECTIONS if mode_code == 1 and version == 10 else RRBS_SECTIONS if mode_code == 1 else WGBS_SECTIONS
     sections = []
     previous_end = HEADER_SIZE + unpack(header, 44, "I")
     for index, (name, item_size) in enumerate(specs):
@@ -134,7 +140,7 @@ def inspect_index(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="检查 BSMAP v8/v9 索引 section 布局。")
+    parser = argparse.ArgumentParser(description="检查 BSMAP v8-v10 索引 section 布局。")
     parser.add_argument("index")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()
