@@ -16,5 +16,5 @@ pub mod fastq;
 
 // 从子模块 re-export 关键类型，方便外部使用
 pub use batch::process_batch;
-pub use encode::{encode_read, EncodedRead};
+pub use encode::{encode_read, encode_read_with_quality, EncodedRead};
 pub use fastq::{FastqReader, RawRead};

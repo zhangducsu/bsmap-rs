@@ -14,6 +14,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -24,10 +25,10 @@ use bsmap::align::{format_bsp, format_sam, AlignmentResult, SingleAlign};
 use bsmap::cli::{resolve_command, resolve_index_args, AlignArgs, Cli};
 use bsmap::pairs::{format_pair_sam, PairAlign, PairBatchResult};
 use bsmap::param::{AlignConfig, AlignStats, BATCH_SIZE, ReadInf};
-use bsmap::reads::{encode_read, process_batch, EncodedRead, FastqReader};
+use bsmap::reads::{encode_read_with_quality, process_batch, EncodedRead, FastqReader};
 use bsmap::reference::{
     default_index_path, is_index_compatible, load_index_with_mode, save_index_v2,
-    BinSeqCollection, BinSeqCollectionBuilder, KmerIndex, LoadMode, Reference,
+    BinSeqCollection, BinSeqCollectionBuilder, IndexParameters, KmerIndex, LoadMode,
     ReferenceReader, RrbsIndexBuilder,
 };
 use bsmap::utils::Timer;
@@ -91,75 +92,83 @@ fn run_index_command(args: &bsmap::cli::IndexArgs) -> Result<()> {
     info!("BSMAP-rs v{} [index]", env!("CARGO_PKG_VERSION"));
     info!("参考序列: {}", args.reference.display());
 
-    let mut timer = Timer::new();
-
-    // 1. 加载参考序列
-    info!("加载参考序列...");
-    let refs = load_references(&args.reference)?;
-    let ref_names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
-    let total_bp: u64 = refs.iter().map(|r| r.len as u64).sum();
-    info!(
-        "加载 {} 条参考序列，共 {} bp，耗时 {:.2}s",
-        refs.len(),
-        total_bp,
-        timer.step()
-    );
-
-    // 2. 构建二进制序列集合
-    info!("构建二进制序列集合...");
-    let coll = BinSeqCollection::from_references(&refs);
-    info!("二进制序列集合构建完成，耗时 {:.2}s", timer.step());
-
-    // 3. 检查是否有兼容的缓存索引
     let index_path = default_index_path(&args.reference);
     let is_rrbs = !args.digestion_sites.is_empty();
     let seed_size = if is_rrbs && args.seed_size == 16 { 12 } else { args.seed_size };
+    let index_interval = if is_rrbs { 1 } else { args.index_interval };
+    let params = IndexParameters {
+        seed_size,
+        index_interval,
+        max_kmer_ratio: args.kmer_cutoff,
+        is_rrbs,
+        min_insert: args.min_insert,
+        max_insert: args.max_insert,
+        digest_sites: &args.digestion_sites,
+    };
 
-    if is_index_compatible(&index_path, &ref_names, seed_size, is_rrbs)? {
+    if is_index_compatible(&index_path, &args.reference, &params)? {
         info!("索引文件已存在且兼容: {}", index_path.display());
         info!("如需重建，请删除该文件后重试");
         return Ok(());
     }
 
-    // 4. 构建索引
+    let mut timer = Timer::new();
+    info!("流式编码参考序列...");
+    let (coll, rrbs_builder) = if is_rrbs {
+        let mut reader = ReferenceReader::open(&args.reference)?;
+        let mut coll_builder = BinSeqCollectionBuilder::new_rrbs();
+        let mut index_builder = RrbsIndexBuilder::new(
+            0,
+            seed_size,
+            &args.digestion_sites,
+            args.min_insert,
+            args.max_insert,
+        );
+        let mut chromosome_index = 0usize;
+        while let Some(reference) = reader.next_reference()? {
+            index_builder.push_reference(chromosome_index, &reference);
+            coll_builder.push(&reference);
+            chromosome_index += 1;
+        }
+        (coll_builder.finish(), Some(index_builder))
+    } else {
+        (load_binseq_collection(&args.reference, false)?, None)
+    };
+    let ref_names = coll.chr_names.clone();
+    info!(
+        "编码 {} 条参考序列，共 {} bp，耗时 {:.2}s",
+        ref_names.len(),
+        coll.sum_length,
+        timer.step()
+    );
+
     info!(
         "构建索引 (seed_size={}, interval={}, mode={})...",
         seed_size,
-        args.index_interval,
+        index_interval,
         if is_rrbs { "RRBS" } else { "WGBS" }
     );
 
     let index = if is_rrbs {
-        KmerIndex::build_rrbs(
-            &coll,
-            &refs,
-            seed_size,
-            args.index_interval,
-            &args.digestion_sites,
-            args.min_insert,
-            args.max_insert,
-        )
+        rrbs_builder.expect("RRBS builder is initialized").finish(&coll)
     } else {
         KmerIndex::build_wgbs(
             &coll,
             seed_size,
-            args.index_interval,
+            index_interval,
             args.kmer_cutoff,
         )
     };
 
     info!("索引构建完成，耗时 {:.2}s", timer.step());
 
-    // 5. 保存索引
     match save_index_v2(
         &index_path,
         &index,
         &coll,
-        seed_size,
-        args.index_interval,
-        args.kmer_cutoff,
         &ref_names,
-        is_rrbs,
+        &args.reference,
+        &params,
     ) {
         Ok(()) => {
             info!("索引已保存: {}", index_path.display());
@@ -213,7 +222,13 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
     let mut timer = Timer::new();
     info!("加载参考序列...");
     let ref_path = args.reference.as_ref().unwrap();
-    let coll = load_binseq_collection(ref_path, config.rrbs_flag)?;
+    let (index, coll) = if let Some(cached) = load_cached_index(&config, ref_path) {
+        cached
+    } else {
+        let coll = load_binseq_collection(ref_path, config.rrbs_flag)?;
+        let ref_names = coll.chr_names.clone();
+        load_or_build_index(coll, &mut config, ref_path, &ref_names)?
+    };
     let ref_names = coll.chr_names.clone();
     let ref_lengths = coll.chr_lengths.clone();
     info!(
@@ -224,8 +239,6 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
     );
 
     // 构建或加载索引
-    let (index, coll) = load_or_build_index(coll, &mut config, ref_path, &ref_names)?;
-
     // 打开输出文件
     let mut output = open_output(args)?;
 
@@ -262,27 +275,6 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
 // 参考序列加载
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// 加载参考序列。
-///
-/// 从 FASTA 文件加载所有染色体序列。
-/// 支持普通文件和 gzip 压缩文件。
-///
-/// # 参数
-/// - `path`: FASTA 文件路径
-///
-/// # 返回值
-/// 参考序列列表
-fn load_references(path: &Path) -> Result<Vec<Reference>> {
-    // 检测是否为 gzip 文件
-    let is_gz = bsmap::reference::fasta::is_gzipped(path)?;
-
-    if is_gz {
-        bsmap::reference::fasta::load_fasta_with_gzip(path, true)
-    } else {
-        bsmap::reference::fasta::load_fasta(path, false)
-    }
-}
-
 fn load_binseq_collection(path: &Path, rrbs: bool) -> Result<BinSeqCollection> {
     let mut reader = ReferenceReader::open(path)?;
     let mut builder = if rrbs {
@@ -294,6 +286,42 @@ fn load_binseq_collection(path: &Path, rrbs: bool) -> Result<BinSeqCollection> {
         builder.push(&reference);
     }
     Ok(builder.finish())
+}
+
+fn index_parameters(config: &AlignConfig) -> IndexParameters<'_> {
+    IndexParameters {
+        seed_size: config.seed_size,
+        index_interval: config.index_interval,
+        max_kmer_ratio: config.max_kmer_ratio,
+        is_rrbs: config.rrbs_flag,
+        min_insert: config.min_insert,
+        max_insert: config.max_insert,
+        digest_sites: &config.digest_sites,
+    }
+}
+
+fn load_cached_index(
+    config: &AlignConfig,
+    ref_path: &Path,
+) -> Option<(KmerIndex, BinSeqCollection)> {
+    let index_path = default_index_path(ref_path);
+    match is_index_compatible(&index_path, ref_path, &index_parameters(config)) {
+        Ok(true) => match load_index_with_mode(&index_path, LoadMode::Mmap) {
+            Ok((coll, index, _meta)) => {
+                info!("索引已从缓存加载: {}", index_path.display());
+                Some((index, coll))
+            }
+            Err(error) => {
+                warn!("无法加载缓存索引 {}: {}", index_path.display(), error);
+                None
+            }
+        },
+        Ok(false) => None,
+        Err(error) => {
+            warn!("无法检查缓存索引 {}: {}", index_path.display(), error);
+            None
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -322,7 +350,13 @@ fn load_or_build_index(
 
     // 检查是否有缓存索引
     let index_path = default_index_path(ref_path);
-    let use_cache = is_index_compatible(&index_path, ref_names, config.seed_size, config.rrbs_flag)?;
+    let use_cache = match is_index_compatible(&index_path, ref_path, &index_parameters(config)) {
+        Ok(compatible) => compatible,
+        Err(error) => {
+            warn!("缓存索引检查失败，将重新构建 {}: {}", index_path.display(), error);
+            false
+        }
+    };
 
     if use_cache {
         info!("从缓存加载索引: {}", index_path.display());
@@ -375,11 +409,9 @@ fn load_or_build_index(
         &index_path,
         &index,
         &coll,
-        config.seed_size,
-        config.index_interval,
-        config.max_kmer_ratio,
         ref_names,
-        config.rrbs_flag,
+        ref_path,
+        &index_parameters(config),
     ) {
         warn!("索引保存失败: {}", e);
     }
@@ -535,6 +567,7 @@ fn run_single_align(
     let mut batch_raw = Vec::with_capacity(BATCH_SIZE);
     let mut read_start = config.read_start;
     let read_end = config.read_end;
+    let mut alignment_core = Duration::ZERO;
 
     loop {
         batch_raw.clear();
@@ -551,10 +584,15 @@ fn run_single_align(
         let reads = process_batch(std::mem::take(&mut batch_raw), 0, batch_start_index, config);
 
         // 编码读段
-        let encoded: Vec<EncodedRead> = reads.iter().map(|r| encode_read(r)).collect();
+        let encoded: Vec<EncodedRead> = reads
+            .iter()
+            .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
+            .collect();
 
         // 执行比对
+        let core_start = Instant::now();
         let results = aligner.do_batch(&encoded, index, coll, config);
+        alignment_core += core_start.elapsed();
 
         // 输出结果
         for result in &results {
@@ -586,6 +624,7 @@ fn run_single_align(
     }
 
     progress.finish();
+    info!("单端比对核心耗时: {:.6}s", alignment_core.as_secs_f64());
     info!("单端比对完成");
 
     Ok(())
@@ -637,6 +676,7 @@ fn run_paired_align(
     let mut read_start_a = config.read_start;
     let mut read_start_b = config.read_start;
     let read_end = config.read_end;
+    let mut alignment_core = Duration::ZERO;
 
     loop {
         batch_a.clear();
@@ -660,11 +700,19 @@ fn run_paired_align(
         let reads_b = process_batch(std::mem::take(&mut batch_b), 2, batch_start_index_b, config);
 
         // 编码读段
-        let encoded_a: Vec<EncodedRead> = reads_a.iter().map(|r| encode_read(r)).collect();
-        let encoded_b: Vec<EncodedRead> = reads_b.iter().map(|r| encode_read(r)).collect();
+        let encoded_a: Vec<EncodedRead> = reads_a
+            .iter()
+            .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
+            .collect();
+        let encoded_b: Vec<EncodedRead> = reads_b
+            .iter()
+            .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
+            .collect();
 
         // 执行配对比对
+        let core_start = Instant::now();
         let results = pair_aligner.do_pair_batch(&encoded_a, &encoded_b, index, coll, config);
+        alignment_core += core_start.elapsed();
 
         // 输出结果
         for result in &results {
@@ -724,6 +772,7 @@ fn run_paired_align(
     }
 
     progress.finish();
+    info!("双端比对核心耗时: {:.6}s", alignment_core.as_secs_f64());
     info!("双端比对完成");
 
     Ok(())
@@ -1083,6 +1132,7 @@ fn print_stats(stats: &AlignStats, config: &AlignConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bsmap::reference::Reference;
 
     /// 测试输出写入器的基本功能
     #[test]

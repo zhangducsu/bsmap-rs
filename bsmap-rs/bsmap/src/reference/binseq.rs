@@ -86,7 +86,7 @@ impl BinSeqCollectionBuilder {
             blocks: Vec::new(),
             chr_names: Vec::new(),
             sum_length: 0,
-            cpp_padded_reverse: false,
+            cpp_padded_reverse: true,
         }
     }
 
@@ -388,19 +388,20 @@ mod tests {
     }
 
     #[test]
-    fn test_rrbs_builder_uses_cpp_reverse_padding() {
+    fn test_all_builders_use_cpp_reverse_padding() {
         let reference = Reference {
             name: "chr1".into(),
             seq: b"ACGT".to_vec(),
             len: 4,
         };
-        let mut builder = BinSeqCollectionBuilder::new_rrbs();
-        builder.push(&reference);
-        let collection = builder.finish();
-        assert_eq!(
-            &collection.crefcat.as_slice()[REF_MARGIN..REF_MARGIN + 3],
-            &[u64::MAX, u64::MAX, 0xffff_ffff_ffff_ff1b]
-        );
+        for mut builder in [BinSeqCollectionBuilder::new(), BinSeqCollectionBuilder::new_rrbs()] {
+            builder.push(&reference);
+            let collection = builder.finish();
+            assert_eq!(
+                &collection.crefcat.as_slice()[REF_MARGIN..REF_MARGIN + 3],
+                &[u64::MAX, u64::MAX, 0xffff_ffff_ffff_ff1b]
+            );
+        }
     }
 
     #[test]

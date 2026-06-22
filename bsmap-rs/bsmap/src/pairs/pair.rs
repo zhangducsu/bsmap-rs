@@ -543,8 +543,8 @@ impl PairAlign {
         // 清空之前的命中
         self.clear();
 
-        let read_len_a = encoded_a.info.seq.len() as u32;
-        let read_len_b = encoded_b.info.seq.len() as u32;
+        let read_len_a = encoded_a.read_len();
+        let read_len_b = encoded_b.read_len();
 
         // 分别对 read_a 和 read_b 运行单端比对
         let has_hits_a = self.align_a.run_align(encoded_a, index, coll, config);
@@ -650,76 +650,80 @@ impl PairAlign {
         config: &AlignConfig,
     ) -> Vec<PairBatchResult> {
         let batch_size = reads_a.len().min(reads_b.len());
-
-        // Phase 1: 并行单端比对（P11-14）
-        // 每条 read 创建短生命周期的 SingleAlign 实例，比对完成后仅保留 hit 桶
-        let se_a: Vec<Option<Vec<Vec<GHit>>>> = reads_a.par_iter().map(|read| {
-            if SingleAlign::filter_read(read, config) {
-                return None;
-            }
-            let mut align = SingleAlign::new();
-            if align.run_align(read, index, coll, config) {
-                Some(align.hits)
-            } else {
-                None
-            }
-        }).collect();
-
-        let se_b: Vec<Option<Vec<Vec<GHit>>>> = reads_b.par_iter().map(|read| {
-            if SingleAlign::filter_read(read, config) {
-                return None;
-            }
-            let mut align = SingleAlign::new();
-            if align.run_align(read, index, coll, config) {
-                Some(align.hits)
-            } else {
-                None
-            }
-        }).collect();
-
-        // Phase 2: 串行配对
-        let mut results = Vec::with_capacity(batch_size);
-        for i in 0..batch_size {
-            let (is_unique, best_snps, pair_hits, unpair_hits_a, unpair_hits_b) = match (&se_a[i], &se_b[i]) {
-                (Some(hits_a), Some(hits_b)) => {
-                    let read_len_a = reads_a[i].info.seq.len() as u32;
-                    let read_len_b = reads_b[i].info.seq.len() as u32;
-                    let computed = compute_pair_hits(hits_a, hits_b, read_len_a, read_len_b, config, coll);
-                    let has_pair = computed.iter().any(|v| !v.is_empty());
-                    if has_pair {
-                        let total: usize = computed.iter().map(|v| v.len()).sum();
-                        let unique = total == 1;
-                        let best = computed.iter().position(|v| !v.is_empty()).unwrap_or(0) as u8;
-                        let flat_hits: Vec<PairHit> = computed.into_iter().flatten().collect();
-                        (unique, best, flat_hits, Vec::new(), Vec::new())
+        reads_a[..batch_size]
+            .par_iter()
+            .zip(&reads_b[..batch_size])
+            .enumerate()
+            .map_init(
+                || (SingleAlign::new(), SingleAlign::new()),
+                |(align_a, align_b), (i, (read_a, read_b))| {
+                    let hits_a = if !SingleAlign::filter_read(read_a, config)
+                        && align_a.run_align(read_a, index, coll, config)
+                    {
+                        Some(&align_a.hits)
                     } else {
-                        let (ua, _) = select_best_hits(hits_a);
-                        let (ub, _) = select_best_hits(hits_b);
-                        (false, 0, Vec::new(), ua, ub)
-                    }
-                }
-                _ => {
-                    let (ua, _) = se_a[i].as_ref()
-                        .map(|h| select_best_hits(h))
-                        .unwrap_or((Vec::new(), 0));
-                    let (ub, _) = se_b[i].as_ref()
-                        .map(|h| select_best_hits(h))
-                        .unwrap_or((Vec::new(), 0));
-                    (false, 0, Vec::new(), ua, ub)
-                }
-            };
+                        None
+                    };
+                    let hits_b = if !SingleAlign::filter_read(read_b, config)
+                        && align_b.run_align(read_b, index, coll, config)
+                    {
+                        Some(&align_b.hits)
+                    } else {
+                        None
+                    };
 
-            results.push(PairBatchResult::new(
-                i as u32,
-                pair_hits,
-                is_unique,
-                best_snps,
-                unpair_hits_a,
-                unpair_hits_b,
-            ));
-        }
+                    let (is_unique, best_snps, pair_hits, unpair_hits_a, unpair_hits_b) =
+                        match (hits_a, hits_b) {
+                            (Some(hits_a), Some(hits_b)) => {
+                                let read_len_a = read_a.read_len();
+                                let read_len_b = read_b.read_len();
+                                let computed = compute_pair_hits(
+                                    hits_a,
+                                    hits_b,
+                                    read_len_a,
+                                    read_len_b,
+                                    config,
+                                    coll,
+                                );
+                                let has_pair = computed.iter().any(|hits| !hits.is_empty());
+                                if has_pair {
+                                    let total: usize = computed.iter().map(Vec::len).sum();
+                                    let unique = total == 1;
+                                    let best = computed
+                                        .iter()
+                                        .position(|hits| !hits.is_empty())
+                                        .unwrap_or(0) as u8;
+                                    let flat_hits: Vec<PairHit> =
+                                        computed.into_iter().flatten().collect();
+                                    (unique, best, flat_hits, Vec::new(), Vec::new())
+                                } else {
+                                    let (unpaired_a, _) = select_best_hits(hits_a);
+                                    let (unpaired_b, _) = select_best_hits(hits_b);
+                                    (false, 0, Vec::new(), unpaired_a, unpaired_b)
+                                }
+                            }
+                            _ => {
+                                let (unpaired_a, _) = hits_a
+                                    .map(|hits| select_best_hits(hits))
+                                    .unwrap_or((Vec::new(), 0));
+                                let (unpaired_b, _) = hits_b
+                                    .map(|hits| select_best_hits(hits))
+                                    .unwrap_or((Vec::new(), 0));
+                                (false, 0, Vec::new(), unpaired_a, unpaired_b)
+                            }
+                        };
 
-        results
+                    PairBatchResult::new(
+                        i as u32,
+                        pair_hits,
+                        is_unique,
+                        best_snps,
+                        unpair_hits_a,
+                        unpair_hits_b,
+                    )
+                },
+            )
+            .collect()
     }
 
     /// 修复配对读段名称。
@@ -941,7 +945,6 @@ fn calculate_insert(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alphabet::pack_forward;
     use crate::param::ReadInf;
     use crate::reference::fasta::Reference;
 

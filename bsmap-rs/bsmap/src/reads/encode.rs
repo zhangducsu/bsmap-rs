@@ -4,8 +4,10 @@
 //! 并生成有效碱基掩码，用于比对引擎的快速匹配。
 //! 对应 C++ `align.cpp` 中的 `ConvertBinarySeq()`。
 
-use crate::alphabet::{pack_forward, pack_forward_simd, pack_revcomp, pack_revcomp_simd, REG_ALPHABET};
-use crate::param::{ReadInf, SEGLEN};
+#[cfg(test)]
+use crate::alphabet::{pack_forward, pack_revcomp};
+use crate::alphabet::{ALPHABET, REG_ALPHABET, REV_ALPHABET};
+use crate::param::{ReadInf, FIXELEMENT, FIXSIZE, SEGLEN};
 
 /// 编码后的读段（用于比对引擎）。
 ///
@@ -15,16 +17,51 @@ use crate::param::{ReadInf, SEGLEN};
 pub struct EncodedRead {
     /// 编码后的 u64 数组（正向链）。
     /// 每个元素包含 32 个碱基的 2-bit 编码。
-    pub fwd_words: Vec<u64>,
+    pub fwd_words: [u64; FIXELEMENT],
     /// 编码后的 u64 数组（反向互补链）。
-    pub rev_words: Vec<u64>,
+    pub rev_words: [u64; FIXELEMENT],
     /// 有效碱基掩码（正向链）。
     /// 每个有效碱基位置为 0b11，无效位置（N 等）为 0b00。
-    pub fwd_mask: Vec<u64>,
+    pub fwd_mask: [u64; FIXELEMENT],
     /// 有效碱基掩码（反向互补链）。
-    pub rev_mask: Vec<u64>,
-    /// 原始读段信息。
-    pub info: ReadInf,
+    pub rev_mask: [u64; FIXELEMENT],
+    num_words: u8,
+    read_len: u16,
+    pub low_qual_count: u16,
+    pub index: u32,
+    pub read_set: u8,
+}
+
+impl EncodedRead {
+    #[inline]
+    pub fn num_words(&self) -> usize {
+        self.num_words as usize
+    }
+
+    #[inline]
+    pub fn read_len(&self) -> u32 {
+        self.read_len as u32
+    }
+
+    #[inline]
+    pub fn fwd_words(&self) -> &[u64] {
+        &self.fwd_words[..self.num_words()]
+    }
+
+    #[inline]
+    pub fn rev_words(&self) -> &[u64] {
+        &self.rev_words[..self.num_words()]
+    }
+
+    #[inline]
+    pub fn fwd_mask(&self) -> &[u64] {
+        &self.fwd_mask[..self.num_words()]
+    }
+
+    #[inline]
+    pub fn rev_mask(&self) -> &[u64] {
+        &self.rev_mask[..self.num_words()]
+    }
 }
 
 /// 将读段编码为 2-bit 二进制格式（正向 + 反向互补）。
@@ -49,8 +86,22 @@ pub struct EncodedRead {
 /// // fwd_words[0] = 0b00_01_10_11 << 48
 /// ```
 pub fn encode_read(read: &ReadInf) -> EncodedRead {
+    encode_read_with_quality(read, 0, 0)
+}
+
+pub fn encode_read_with_quality(
+    read: &ReadInf,
+    qual_threshold: u8,
+    zero_qual: u8,
+) -> EncodedRead {
     let seq = &read.seq;
     let len = seq.len();
+    assert!(
+        len <= FIXSIZE,
+        "read length {} exceeds fixed encoding capacity {}",
+        len,
+        FIXSIZE,
+    );
 
     // 计算需要的 word 数量
     let num_words = if len == 0 {
@@ -59,76 +110,55 @@ pub fn encode_read(read: &ReadInf) -> EncodedRead {
         (len + SEGLEN - 1) / SEGLEN
     };
 
-    // 正向编码
-    let fwd_words = pack_forward_simd(seq, num_words);
+    let mut fwd_words = [0u64; FIXELEMENT];
+    let mut rev_words = [0u64; FIXELEMENT];
+    let mut fwd_mask = [0u64; FIXELEMENT];
+    let mut rev_mask = [0u64; FIXELEMENT];
 
-    // 反向互补编码
-    let rev_words = pack_revcomp_simd(seq, num_words);
-
-    // 正向有效碱基掩码
-    let fwd_mask = build_mask(seq, num_words, false);
-
-    // 反向互补有效碱基掩码
-    let rev_mask = build_mask(seq, num_words, true);
+    for word_index in 0..num_words {
+        let start = word_index * SEGLEN;
+        let chunk_len = len.saturating_sub(start).min(SEGLEN);
+        let mut forward = 0u64;
+        let mut reverse = 0u64;
+        let mut forward_mask = 0u64;
+        let mut reverse_mask = 0u64;
+        for offset in 0..chunk_len {
+            let forward_base = seq[start + offset];
+            let reverse_base = seq[len - 1 - (start + offset)];
+            forward = (forward << 2) | ALPHABET[forward_base as usize] as u64;
+            reverse = (reverse << 2) | REV_ALPHABET[reverse_base as usize] as u64;
+            forward_mask =
+                (forward_mask << 2) | REG_ALPHABET[forward_base as usize] as u64;
+            reverse_mask =
+                (reverse_mask << 2) | REG_ALPHABET[reverse_base as usize] as u64;
+        }
+        if chunk_len > 0 {
+            let padding = (SEGLEN - chunk_len) * 2;
+            fwd_words[word_index] = forward << padding;
+            rev_words[word_index] = reverse << padding;
+            fwd_mask[word_index] = forward_mask << padding;
+            rev_mask[word_index] = reverse_mask << padding;
+        }
+    }
 
     EncodedRead {
         fwd_words,
         rev_words,
         fwd_mask,
         rev_mask,
-        info: read.clone(),
+        num_words: num_words as u8,
+        read_len: len as u16,
+        low_qual_count: if qual_threshold == 0 {
+            0
+        } else {
+            read.qual
+                .iter()
+                .filter(|&&quality| quality < qual_threshold.saturating_add(zero_qual))
+                .count() as u16
+        },
+        index: read.index,
+        read_set: read.read_set as u8,
     }
-}
-
-/// 构建有效碱基掩码。
-///
-/// 对于每个碱基位置，如果是有效碱基（A/C/G/T），掩码为 0b11；
-/// 否则（N 等），掩码为 0b00。
-///
-/// # 参数
-/// - `seq`：原始序列
-/// - `num_words`：u64 word 数量
-/// - `reverse`：是否反向（用于反向互补掩码）
-fn build_mask(seq: &[u8], num_words: usize, reverse: bool) -> Vec<u64> {
-    let mut mask = vec![0u64; num_words];
-
-    if reverse {
-        // 反向互补掩码：序列反向遍历，使用 REV_REG 掩码
-        // 对于反向互补，有效碱基掩码也需要反向
-        let total_bases = seq.len().min(num_words * SEGLEN);
-        let reversed_mask: Vec<u8> = seq[..total_bases]
-            .iter()
-            .rev()
-            .map(|&c| REG_ALPHABET[c as usize])
-            .collect();
-
-        for (i, chunk) in reversed_mask.chunks(SEGLEN).enumerate() {
-            if i >= num_words {
-                break;
-            }
-            let mut w: u64 = 0;
-            for &m in chunk {
-                w = (w << 2) | m as u64;
-            }
-            w <<= (SEGLEN - chunk.len()) * 2;
-            mask[i] = w;
-        }
-    } else {
-        // 正向掩码
-        for (i, chunk) in seq.chunks(SEGLEN).enumerate() {
-            if i >= num_words {
-                break;
-            }
-            let mut w: u64 = 0;
-            for &c in chunk {
-                w = (w << 2) | REG_ALPHABET[c as usize] as u64;
-            }
-            w <<= (SEGLEN - chunk.len()) * 2;
-            mask[i] = w;
-        }
-    }
-
-    mask
 }
 
 #[cfg(test)]
@@ -163,7 +193,7 @@ mod tests {
         let encoded = encode_read(&read);
 
         let expected = pack_forward(b"ACGTACGTACGTACGT", 1);
-        assert_eq!(encoded.fwd_words, expected);
+        assert_eq!(encoded.fwd_words(), expected.as_slice());
     }
 
     #[test]
@@ -172,7 +202,7 @@ mod tests {
         let encoded = encode_read(&read);
 
         let expected = pack_revcomp(b"ACGTACGT", 1);
-        assert_eq!(encoded.rev_words, expected);
+        assert_eq!(encoded.rev_words(), expected.as_slice());
     }
 
     #[test]
@@ -216,21 +246,32 @@ mod tests {
         let read = make_read("test", &seq);
         let encoded = encode_read(&read);
 
-        assert_eq!(encoded.fwd_words.len(), 2);
-        assert_eq!(encoded.rev_words.len(), 2);
-        assert_eq!(encoded.fwd_mask.len(), 2);
-        assert_eq!(encoded.rev_mask.len(), 2);
+        assert_eq!(encoded.num_words(), 2);
+        assert_eq!(encoded.fwd_words().len(), 2);
+        assert_eq!(encoded.rev_words().len(), 2);
+        assert_eq!(encoded.fwd_mask().len(), 2);
+        assert_eq!(encoded.rev_mask().len(), 2);
     }
 
     #[test]
-    fn test_encode_preserves_info() {
+    fn test_encode_preserves_minimal_metadata() {
         let read = make_read("my_read", b"ACGT");
         let encoded = encode_read(&read);
 
-        assert_eq!(encoded.info.name, "my_read");
-        assert_eq!(encoded.info.seq, b"ACGT");
-        assert_eq!(encoded.info.index, 0);
-        assert_eq!(encoded.info.read_set, 0);
+        assert_eq!(encoded.read_len(), 4);
+        assert_eq!(encoded.index, 0);
+        assert_eq!(encoded.read_set, 0);
+        assert!(std::mem::size_of::<EncodedRead>() <= 208);
+    }
+
+    #[test]
+    fn test_encode_summarizes_quality_without_cloning_read() {
+        let mut read = make_read("quality", b"ACGT");
+        read.qual = vec![33, 34, 35, 40];
+        let encoded = encode_read_with_quality(&read, 2, 33);
+
+        assert_eq!(encoded.low_qual_count, 2);
+        assert_eq!(encoded.read_len(), 4);
     }
 
     #[test]
@@ -239,8 +280,8 @@ mod tests {
         let encoded = encode_read(&read);
 
         // 空序列仍应有 1 个 word
-        assert_eq!(encoded.fwd_words.len(), 1);
-        assert_eq!(encoded.rev_words.len(), 1);
+        assert_eq!(encoded.fwd_words().len(), 1);
+        assert_eq!(encoded.rev_words().len(), 1);
         assert_eq!(encoded.fwd_words[0], 0);
         assert_eq!(encoded.rev_words[0], 0);
     }
@@ -284,8 +325,15 @@ mod tests {
             let num_words = if seq.is_empty() { 1 } else { (seq.len() + SEGLEN - 1) / SEGLEN };
             let expected_fwd = pack_forward(seq, num_words);
             let expected_rev = pack_revcomp(seq, num_words);
-            assert_eq!(encoded.fwd_words, expected_fwd, "fwd_words mismatch for len={}", seq.len());
-            assert_eq!(encoded.rev_words, expected_rev, "rev_words mismatch for len={}", seq.len());
+            assert_eq!(encoded.fwd_words(), expected_fwd.as_slice(), "fwd_words mismatch for len={}", seq.len());
+            assert_eq!(encoded.rev_words(), expected_rev.as_slice(), "rev_words mismatch for len={}", seq.len());
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds fixed encoding capacity")]
+    fn test_encode_rejects_reads_beyond_fixed_capacity() {
+        let read = make_read("too_long", &vec![b'A'; FIXSIZE + 1]);
+        let _ = encode_read(&read);
     }
 }

@@ -30,7 +30,7 @@ pub const MAXGAPS: u32 = 3;
 pub const MAXHITS: usize = 100;
 
 /// Number of reads processed per batch
-pub const BATCH_SIZE: usize = 50_000;
+pub const BATCH_SIZE: usize = 8_192;
 
 /// Reference margin in 64-bit words for concatenated reference
 pub const REF_MARGIN: usize = 400;
@@ -58,6 +58,7 @@ pub type RefLoc = u32;
 // ── Hit Structures ──────────────────────────────────────────────────────────
 
 /// A basic hit: chromosome + position (C++ `Hit`)
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hit {
     pub chr: RefId,
@@ -93,7 +94,8 @@ pub struct GHit {
 /// The total hit count is `n[0] + n[1]`. Forward-chain positions start at
 /// offset 0 and span `n[1]` entries; reverse-chain positions follow
 /// immediately after, spanning `n[0]` entries.
-#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct KmerLoc2 {
     /// `n[0]` = reverse chain hit count, `n[1]` = forward chain hit count.
     pub n: [u32; 2],

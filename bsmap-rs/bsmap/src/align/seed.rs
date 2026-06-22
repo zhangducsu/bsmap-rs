@@ -75,16 +75,16 @@ pub fn extract_seeds(
     _index_interval: u32,
     _profile: &[[u32; 16]],
 ) -> Vec<Vec<u32>> {
-    let read_len = encoded.info.seq.len() as u32;
-    let num_words = encoded.fwd_words.len();
+    let read_len = encoded.read_len();
+    let num_words = encoded.num_words();
     
     let mut all_seeds: Vec<Vec<u32>> = vec![Vec::new(); 2];
 
     for chain in 0..2u32 {
         let words = if chain == 0 {
-            &encoded.fwd_words
+            encoded.fwd_words()
         } else {
-            &encoded.rev_words
+            encoded.rev_words()
         };
 
         let mut seeds = Vec::new();
@@ -142,34 +142,32 @@ pub fn find_best_start_offset(
     map_readlen: u32,
     seed_size: u32,
     index_interval: u32,
+    profile: &[[u32; 16]],
+    num_segments: usize,
     is_rrbs: bool,
 ) -> u32 {
     // C++ 搜索范围：0 到 (map_readlen - index_interval + 1) % seed_size - 1
-    let num_offsets = ((map_readlen - index_interval + 1) % seed_size).max(1).min(index_interval);
+    let num_offsets = (map_readlen - index_interval + 1) % seed_size;
 
     let mut best_offset = 0u32;
     let mut best_candidates = u32::MAX;
 
     for start_offset in 0..num_offsets {
-        let mut total_candidates: u32 = 0;
+        let total_candidates = (0..num_segments).fold(0u32, |total, segment| {
+            total.saturating_add(count_seeds_at_offset(
+                segment,
+                start_offset,
+                chain_seeds,
+                index,
+                seed_size,
+                index_interval,
+                map_readlen,
+                profile,
+                is_rrbs,
+            ))
+        });
 
-        let mut pos = start_offset;
-        let mut seed_idx = start_offset as usize;
-
-        while pos + seed_size <= map_readlen && seed_idx < chain_seeds.len() {
-            let seed_hash = chain_seeds[seed_idx];
-            if is_rrbs {
-                total_candidates += index.lookup_rrbs(seed_hash).len() as u32;
-            } else {
-                let (fwd, rev) = index.lookup_separated(seed_hash);
-                total_candidates += (fwd.len() + rev.len()) as u32;
-            }
-
-            pos += index_interval;
-            seed_idx += index_interval as usize;
-        }
-
-        if total_candidates > 0 && total_candidates < best_candidates {
+        if total_candidates < best_candidates {
             best_candidates = total_candidates;
             best_offset = start_offset;
         }
@@ -226,6 +224,7 @@ pub fn reorder_seeds_for_chain_with_cross_chain(
     // C++ RRBS: cseed_offset = map_readlen % seed_size
     // 用于 read_chain=1 时偏移种子位置，补偿 RC 编码的相位差
     let cseed_offset = if is_rrbs { map_readlen % seed_size } else { 0 };
+    let num_segments = calculate_num_segments(map_readlen, seed_size, index_interval, profile);
 
     // 1. 找到最佳起始偏移（对应 C++ 的 xseed_start_offset[chain]）
     let best_start_offset = if is_rrbs {
@@ -237,12 +236,11 @@ pub fn reorder_seeds_for_chain_with_cross_chain(
             map_readlen,
             seed_size,
             index_interval,
+            profile,
+            num_segments,
             is_rrbs,
         )
     };
-
-    // 2. 计算 segment 数量
-    let num_segments = calculate_num_segments(map_readlen, seed_size, index_interval, profile);
 
     if is_rrbs {
         let mut segments: Vec<SeedSegment> = Vec::with_capacity(num_segments);
@@ -348,24 +346,12 @@ fn calculate_num_segments(
     index_interval: u32,
     profile: &[[u32; 16]],
 ) -> usize {
-    let max_seg = profile.len() as u32;
-
-    let mut count = 0;
-    for seg_idx in 0..max_seg {
-        let start = calculate_segment_start(seg_idx as usize, profile, index_interval);
-        if start + seed_size > map_readlen {
-            break;
-        }
-        count += 1;
-    }
-
-    count.max(1) as usize
-}
-
-/// 计算 segment 起始位置。
-fn calculate_segment_start(seg_idx: usize, profile: &[[u32; 16]], index_interval: u32) -> u32 {
-    let profile_val = profile.get(seg_idx).map(|p| p[0]).unwrap_or(0);
-    (profile_val / index_interval) * index_interval
+    map_readlen
+        .saturating_sub(index_interval - 1)
+        .checked_div(seed_size)
+        .unwrap_or(0)
+        .max(1)
+        .min(profile.len() as u32) as usize
 }
 
 /// 调整 seed segment 起始位置（逐链独立）。
@@ -495,8 +481,7 @@ fn count_seeds_at_offset(
             if is_rrbs {
                 total += index.lookup_rrbs(seed_hash).len() as u32;
             } else {
-                let (fwd, rev) = index.lookup_separated(seed_hash);
-                total += (fwd.len() + rev.len()) as u32;
+                total += index.wgbs_candidate_count(seed_hash);
             }
         }
     }
@@ -553,8 +538,7 @@ pub fn count_seeds_for_chain_with_cross_chain(
             if i < reg_masks.len() && reg_masks[i] == 0 {
                 continue;
             }
-            let (fwd, rev) = index.lookup_separated(seed);
-            total += (fwd.len() + rev.len()) as u32;
+            total += index.wgbs_candidate_count(seed);
         }
     }
 
@@ -574,7 +558,7 @@ pub fn get_seed_at_position(words: &[u64], pos: u32, seed_size: u32) -> u32 {
 pub fn count_n_bases(encoded: &EncodedRead) -> u32 {
     let mut count: u32 = 0;
 
-    for &mask_word in &encoded.fwd_mask {
+    for &mask_word in encoded.fwd_mask() {
         let inverted = !mask_word;
         let mut n_in_word: u32 = 0;
         for i in 0..32 {
@@ -593,7 +577,8 @@ pub fn count_n_bases(encoded: &EncodedRead) -> u32 {
 mod tests {
     use super::*;
     use crate::alphabet::pack_forward;
-    use crate::param::{Hit, KmerLoc2, ReadInf, MAXSNPS, SEGLEN};
+    use crate::param::{Hit, KmerLoc2, ReadInf, MAXSNPS};
+    use crate::reads::encode::encode_read;
 
     fn make_test_read(seq: &[u8]) -> EncodedRead {
         let read = ReadInf {
@@ -604,20 +589,7 @@ mod tests {
             qual: vec![33u8; seq.len()],
         };
 
-        let num_words = (seq.len() + SEGLEN - 1) / SEGLEN;
-        let fwd_words = pack_forward(seq, num_words);
-        let rev_words = pack_forward(seq, num_words);
-
-        let fwd_mask = vec![u64::MAX; num_words];
-        let rev_mask = vec![u64::MAX; num_words];
-
-        EncodedRead {
-            fwd_words,
-            rev_words,
-            fwd_mask,
-            rev_mask,
-            info: read,
-        }
+        encode_read(&read)
     }
 
     fn make_test_profile() -> [[u32; 16]; MAXSNPS as usize + 1] {
@@ -676,6 +648,7 @@ mod tests {
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
             seed_size: 2,
+            mapped: None,
         }
     }
 
@@ -797,6 +770,7 @@ mod tests {
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
             seed_size: 2,
+            mapped: None,
         };
 
         let disabled =
@@ -822,9 +796,37 @@ mod tests {
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
             seed_size: 16,
+            mapped: None,
         };
 
-        let best_offset = find_best_start_offset(&seeds, &index, 48, 8, 4, false);
-        assert!(best_offset < 4, "最佳偏移应该在有效范围内");
+        let mut profile = [[0u32; 16]; MAXSNPS as usize + 1];
+        for (segment, values) in profile.iter_mut().enumerate() {
+            for (interval, value) in values.iter_mut().enumerate().take(4) {
+                *value = (((segment as u32 * 8 + interval as u32) + 3) / 4) * 4;
+            }
+        }
+        let best_offset = find_best_start_offset(&seeds, &index, 48, 8, 4, &profile, 5, false);
+        assert!(best_offset < 5, "最佳偏移应该在有效范围内");
+    }
+
+    #[test]
+    fn wgbs_count_seeds_keeps_filtered_bucket_frequency() {
+        let index = KmerIndex {
+            total_kmers: 1,
+            max_kmer_num: 2,
+            index2: vec![KmerLoc2 { n: [2, 2] }],
+            positions: Vec::new(),
+            start_offsets: vec![0],
+            rrbs_offsets: Vec::new(),
+            rrbs_hits: Vec::new(),
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
+            seed_size: 2,
+            mapped: None,
+        };
+
+        assert_eq!(index.wgbs_candidate_count(0), 4);
+        assert_eq!(index.lookup_separated(0), (&[][..], &[][..]));
+        assert_eq!(count_seeds_for_chain(&[0], &[1], &index, false), 4);
     }
 }

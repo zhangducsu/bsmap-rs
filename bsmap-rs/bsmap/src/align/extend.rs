@@ -23,7 +23,6 @@ use crate::utils::myrand;
 
 const HIT_LEVELS: usize = MAXSNPS as usize + 1;
 
-#[cfg(test)]
 fn circular_bucket_indices(
     bucket_len: usize,
     read_index: u32,
@@ -35,6 +34,22 @@ fn circular_bucket_indices(
         myrand(read_index, randseed, 0) as usize % bucket_len
     };
     (0..bucket_len).map(move |offset| (start + offset) % bucket_len)
+}
+
+fn circular_wgbs_positions<'a>(
+    fwd: &'a [u32],
+    rev: &'a [u32],
+    read_index: u32,
+    randseed: u32,
+) -> impl Iterator<Item = (u8, u32)> + 'a {
+    let fwd_len = fwd.len();
+    circular_bucket_indices(fwd_len + rev.len(), read_index, randseed).map(move |index| {
+        if index < fwd_len {
+            (0, fwd[index])
+        } else {
+            (1, rev[index - fwd_len])
+        }
+    })
 }
 
 #[inline]
@@ -145,16 +160,16 @@ pub fn snp_align_for_chain(
     counts_by_chain[read_chain as usize][..copy_len].copy_from_slice(&level_counts[..copy_len]);
     let mut dedup_no_gap = HashSet::new();
     let mut dedup_gap = HashSet::new();
-    let read_len = encoded.info.seq.len() as u32;
+    let read_len = encoded.read_len();
     let query = if read_chain == 0 {
-        &encoded.fwd_words
+        encoded.fwd_words()
     } else {
-        &encoded.rev_words
+        encoded.rev_words()
     };
     let mask = if read_chain == 0 {
-        &encoded.fwd_mask
+        encoded.fwd_mask()
     } else {
-        &encoded.rev_mask
+        encoded.rev_mask()
     };
     let n_count = count_n_in_mask(mask, read_len);
 
@@ -217,7 +232,7 @@ pub(crate) fn snp_align_segment(
     n_count: u32,
     collector: &mut HitCollector<'_>,
 ) -> bool {
-    let read_len = encoded.info.seq.len() as u32;
+    let read_len = encoded.read_len();
     let fwd_slice = coll.refcat.as_slice();
     let rev_slice = coll.crefcat.as_slice();
 
@@ -233,7 +248,7 @@ pub(crate) fn snp_align_segment(
         };
 
         // ── RRBS mode: positions from flat hit storage ──
-        if !index.rrbs_offsets.is_empty() {
+        if index.has_rrbs_index() {
             let hits = index.lookup_rrbs(seed_hash);
             if !hits.is_empty() {
                 let modeindex = segment.index as u32;
@@ -255,7 +270,7 @@ pub(crate) fn snp_align_segment(
                 if logical_bucket_len == 0 {
                     continue;
                 }
-                let start = myrand(encoded.info.index, randseed, 0) as usize
+                let start = myrand(encoded.index, randseed, 0) as usize
                     % logical_bucket_len;
                 let logical_bucket = hits
                     .iter()
@@ -361,85 +376,78 @@ pub(crate) fn snp_align_segment(
             // ── WGBS mode: existing lookup_separated logic ──
             let (fwd_positions, rev_positions) = index.lookup_separated(seed_hash);
 
-            for ref_chain in 0..2u8 {
-                let positions = if ref_chain == 0 {
-                    fwd_positions
-                } else {
-                    rev_positions
-                };
+            for (ref_chain, flat_pos) in circular_wgbs_positions(
+                fwd_positions,
+                rev_positions,
+                encoded.index,
+                randseed,
+            ) {
                 let ref_seq = if ref_chain == 0 { fwd_slice } else { rev_slice };
-                if positions.is_empty() {
-                    continue;
-                }
                 let strand = (ref_chain << 1) | read_chain;
 
-                for &flat_pos in positions {
-                    let Some(alignment_start) = flat_pos.checked_sub(seed_pos_in_read) else {
+                let Some(alignment_start) = flat_pos.checked_sub(seed_pos_in_read) else {
+                    continue;
+                };
+                let ref_offset = alignment_start as u64 * 2;
+                let (chr, mut loc) = coll.int2hit(alignment_start);
+
+                if ref_chain == 1 {
+                    let rc_offset = coll.total_len_for_chr(chr as usize);
+                    let Some(reverse_loc) = rc_offset
+                        .checked_sub(read_len)
+                        .and_then(|end| end.checked_sub(loc))
+                    else {
                         continue;
                     };
-                    let ref_offset = alignment_start as u64 * 2;
-                    let (chr, mut loc) = coll.int2hit(alignment_start);
+                    loc = reverse_loc;
+                }
 
-                    if ref_chain == 1 {
-                        // WGBS flat reverse positions are already normalized to the true
-                        // chromosome span, unlike RRBS block-local positions.
-                        let chr_len = crate::align::output::get_chromosome_length(chr, coll);
-                        let Some(reverse_loc) = chr_len
-                            .checked_sub(read_len)
-                            .and_then(|end| end.checked_sub(loc))
-                        else {
-                            continue;
-                        };
-                        loc = reverse_loc;
+                if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
+                    continue;
+                }
+
+                let snp_thres = collector.snp_thres();
+                let mm_count =
+                    count_mismatch(query, ref_offset, ref_seq, mask, snp_thres, n_count, nt3);
+
+                if mm_count <= snp_thres {
+                    let hit = GHit {
+                        chr,
+                        loc,
+                        snps: mm_count as u8,
+                        strand,
+                        gap_size: 0,
+                        gap_pos: 0,
+                    };
+                    if collector.try_add_hit(hit, read_chain) {
+                        return true;
                     }
+                }
 
-                    if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
-                        continue;
-                    }
-
-                    let snp_thres = collector.snp_thres();
-                    let mm_count =
-                        count_mismatch(query, ref_offset, ref_seq, mask, snp_thres, n_count, nt3);
-
-                    if mm_count <= snp_thres {
+                let snp_thres = collector.snp_thres();
+                if gap_size > 0 && mm_count > snp_thres && mm_count <= snp_thres + 2 {
+                    if let Some(gap_result) = gap_align(
+                        query,
+                        ref_seq,
+                        alignment_start,
+                        seed_pos_in_read,
+                        8,
+                        snp_thres,
+                        gap_size,
+                        nt3,
+                        read_len,
+                        3,
+                    ) {
                         let hit = GHit {
                             chr,
                             loc,
-                            snps: mm_count as u8,
+                            snps: gap_result.snp_count as u8,
                             strand,
-                            gap_size: 0,
-                            gap_pos: 0,
+                            gap_size: gap_result.gap_size as i16,
+                            gap_pos: gap_result.gap_pos as u16,
                         };
                         if collector.try_add_hit(hit, read_chain) {
                             return true;
-                        }
-                    }
-
-                    let snp_thres = collector.snp_thres();
-                    if gap_size > 0 && mm_count > snp_thres && mm_count <= snp_thres + 2 {
-                        if let Some(gap_result) = gap_align(
-                            query,
-                            ref_seq,
-                            alignment_start,
-                            seed_pos_in_read,
-                            8,
-                            snp_thres,
-                            gap_size,
-                            nt3,
-                            read_len,
-                            3,
-                        ) {
-                            let hit = GHit {
-                                chr,
-                                loc,
-                                snps: gap_result.snp_count as u8,
-                                strand,
-                                gap_size: gap_result.gap_size as i16,
-                                gap_pos: gap_result.gap_pos as u16,
-                            };
-                            if collector.try_add_hit(hit, read_chain) {
-                                return true;
-                            }
                         }
                     }
                 }
@@ -582,6 +590,26 @@ mod tests {
         let mut sorted = order;
         sorted.sort_unstable();
         assert_eq!(sorted, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn wgbs_bucket_rotates_across_the_forward_reverse_boundary() {
+        let fwd = [10, 20];
+        let rev = [30, 40, 50];
+        let combined = [(0, 10), (0, 20), (1, 30), (1, 40), (1, 50)];
+        let start = myrand(100, 42, 0) as usize % combined.len();
+        let expected: Vec<_> = combined
+            .iter()
+            .cycle()
+            .skip(start)
+            .take(combined.len())
+            .copied()
+            .collect();
+
+        assert_eq!(
+            circular_wgbs_positions(&fwd, &rev, 100, 42).collect::<Vec<_>>(),
+            expected
+        );
     }
 
     #[test]

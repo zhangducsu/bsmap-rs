@@ -18,6 +18,7 @@
 //! - `AddHit()` 的早停结果立即结束当前 segment 扩展
 
 use std::collections::HashSet;
+use rayon::prelude::*;
 
 use crate::align::extend::{
     clear_hits, is_unique_hit, select_best_hits, snp_align_segment, HitCollector,
@@ -135,7 +136,7 @@ impl SingleAlign {
         self.clear();
 
         // 获取读段长度
-        let read_len = encoded.info.seq.len() as u32;
+        let read_len = encoded.read_len();
 
         // 如果读段太短，跳过
         if read_len < config.min_read_size {
@@ -145,8 +146,8 @@ impl SingleAlign {
         // C++ xflag_chain: 控制处理哪些链
         //   xflag_chain[0] = chains || (read_set < 2)   → 单端总是 true
         //   xflag_chain[1] = chains || (read_set == 2)  → 单端非 chains 模式为 false
-        let xflag_chain0 = config.chains || encoded.info.read_set < 2;
-        let xflag_chain1 = config.chains || encoded.info.read_set == 2;
+        let xflag_chain0 = config.chains || encoded.read_set < 2;
+        let xflag_chain1 = config.chains || encoded.read_set == 2;
 
         // 提取种子（两条链）
         let seeds = extract_seeds(
@@ -231,14 +232,14 @@ impl SingleAlign {
                 let segment = &chain_segs.unwrap()[seg_idx];
 
                 let query = if read_chain == 0 {
-                    encoded.fwd_words.as_slice()
+                    encoded.fwd_words()
                 } else {
-                    encoded.rev_words.as_slice()
+                    encoded.rev_words()
                 };
                 let mask = if read_chain == 0 {
-                    encoded.fwd_mask.as_slice()
+                    encoded.fwd_mask()
                 } else {
-                    encoded.rev_mask.as_slice()
+                    encoded.rev_mask()
                 };
                 let n_count = crate::align::extend::count_n_in_mask(mask, read_len);
 
@@ -321,7 +322,7 @@ impl SingleAlign {
     /// # 返回值
     /// 如果读段应被过滤返回 true
     pub fn filter_read(encoded: &EncodedRead, config: &AlignConfig) -> bool {
-        let read_len = encoded.info.seq.len() as u32;
+        let read_len = encoded.read_len();
 
         // 检查长度
         if read_len < config.min_read_size {
@@ -340,14 +341,7 @@ impl SingleAlign {
 
         // 检查质量（如果配置了质量阈值）
         if config.qual_threshold > 0 {
-            let low_qual_count = encoded
-                .info
-                .qual
-                .iter()
-                .filter(|&&q| q < config.qual_threshold + config.zero_qual)
-                .count() as u32;
-
-            if low_qual_count > read_len / 2 {
+            if encoded.low_qual_count as u32 > read_len / 2 {
                 return true;
             }
         }
@@ -375,36 +369,25 @@ impl SingleAlign {
         coll: &BinSeqCollection,
         config: &AlignConfig,
     ) -> Vec<AlignmentResult> {
-        let mut results = Vec::with_capacity(reads.len());
+        reads
+            .par_iter()
+            .enumerate()
+            .map_init(SingleAlign::new, |aligner, (idx, encoded)| {
+                if Self::filter_read(encoded, config) {
+                    return AlignmentResult::new(idx as u32, Vec::new(), false, 0);
+                }
 
-        for (idx, encoded) in reads.iter().enumerate() {
-            // 过滤读段
-            if Self::filter_read(encoded, config) {
-                results.push(AlignmentResult::new(idx as u32, Vec::new(), false, 0));
-                continue;
-            }
+                let has_hits = aligner.run_align(encoded, index, coll, config);
+                let (best_hits, best_snp) = if has_hits {
+                    select_best_hits(&aligner.hits)
+                } else {
+                    (Vec::new(), 0)
+                };
+                let is_unique = is_unique_hit(&aligner.hits);
 
-            // 执行比对
-            let has_hits = self.run_align(encoded, index, coll, config);
-
-            // 收集结果
-            let (best_hits, best_snp) = if has_hits {
-                select_best_hits(&self.hits)
-            } else {
-                (Vec::new(), 0)
-            };
-
-            let is_unique = is_unique_hit(&self.hits);
-
-            results.push(AlignmentResult::new(
-                idx as u32,
-                best_hits,
-                is_unique,
-                best_snp,
-            ));
-        }
-
-        results
+                AlignmentResult::new(idx as u32, best_hits, is_unique, best_snp)
+            })
+            .collect()
     }
 
     /// 获取最佳层命中数（对应 C++：第一个非空层的命中数）。
@@ -439,10 +422,10 @@ impl Default for SingleAlign {
 /// 计算读段中 N 碱基的数量。
 fn count_n_bases(encoded: &EncodedRead) -> u32 {
     let mut count: u32 = 0;
-    let total_bases = encoded.info.seq.len();
+    let total_bases = encoded.read_len() as usize;
 
     let mut bases_checked = 0usize;
-    for &mask_word in &encoded.fwd_mask {
+    for &mask_word in encoded.fwd_mask() {
         // 统计掩码中为 0 的位（表示 N）
         let inverted = !mask_word;
         for i in 0..32 {
@@ -533,7 +516,6 @@ impl Default for AlignConfigBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alphabet::pack_forward;
     use crate::param::ReadInf;
     use crate::reads::encode_read;
     use crate::reference::fasta::Reference;

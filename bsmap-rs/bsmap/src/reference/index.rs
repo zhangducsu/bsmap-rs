@@ -25,6 +25,34 @@ pub const RRBS_MODE_SHIFT: u32 = 16;
 /// C++ marker for cross-chain RRBS entries.
 pub const RRBS_BSC_FLAG: u32 = 0x01000000;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct MappedSection {
+    pub offset: usize,
+    pub len: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct MappedKmerIndex {
+    pub mmap: memmap2::Mmap,
+    pub index2: MappedSection,
+    pub positions: MappedSection,
+    pub start_offsets: MappedSection,
+    pub rrbs_offsets: MappedSection,
+    pub rrbs_hits: MappedSection,
+    pub rrbs_site_offsets: MappedSection,
+    pub rrbs_sites: MappedSection,
+}
+
+impl MappedKmerIndex {
+    #[inline]
+    unsafe fn slice<T>(&self, section: MappedSection) -> &[T] {
+        std::slice::from_raw_parts(
+            self.mmap.as_ptr().add(section.offset) as *const T,
+            section.len,
+        )
+    }
+}
+
 /// 安全的种子提取：检查边界，避免越界访问。
 /// 返回 None 如果位置超出 words 数组范围。
 #[inline]
@@ -72,10 +100,13 @@ pub struct KmerIndex {
     /// Per-chromosome boundaries into `rrbs_sites`.
     pub(crate) rrbs_site_offsets: Vec<u32>,
     /// Sorted `(cut_position, reverse_offset)` pairs used for RRBS ZP/ZL.
-    pub(crate) rrbs_sites: Vec<(u32, u32)>,
+    pub(crate) rrbs_sites: Vec<[u32; 2]>,
 
     /// Seed size (k-mer length), required for RRBS position conversion.
     pub seed_size: u32,
+
+    /// v7 raw sections mapped directly from the index file.
+    pub(crate) mapped: Option<MappedKmerIndex>,
 }
 
 /// Incremental RRBS digestion-site collector for streaming FASTA input.
@@ -86,7 +117,7 @@ pub struct RrbsIndexBuilder {
     sites: Vec<DigestionSite>,
     min_insert: u32,
     max_insert: u32,
-    ccgg_index: Vec<Vec<Vec<(u32, u32)>>>,
+    ccgg_index: Vec<Vec<Vec<u32>>>,
     rrbs_site_offsets: Vec<u32>,
     rrbs_sites: Vec<(u32, u32)>,
 }
@@ -118,8 +149,12 @@ impl RrbsIndexBuilder {
     }
 
     pub fn push_reference(&mut self, chromosome_index: usize, reference: &Reference) {
-        if chromosome_index * 2 + 1 >= self.total_blocks {
-            return;
+        let required_blocks = (chromosome_index + 1) * 2;
+        if required_blocks > self.total_blocks {
+            for mode_blocks in &mut self.ccgg_index {
+                mode_blocks.resize_with(required_blocks, Vec::new);
+            }
+            self.total_blocks = required_blocks;
         }
         let chromosome_sites = find_sites(&reference.seq, &self.sites);
         self.rrbs_sites.extend_from_slice(&chromosome_sites);
@@ -142,11 +177,7 @@ impl RrbsIndexBuilder {
             for chain in 0..2usize {
                 let target_block = chromosome_index * 2 + chain;
                 if mode < self.ccgg_index.len() && target_block < self.total_blocks {
-                    self.ccgg_index[mode][target_block].extend(
-                        chains[chain]
-                            .iter()
-                            .map(|&position| (target_block as u32, position)),
-                    );
+                    self.ccgg_index[mode][target_block].extend(chains[chain].iter().copied());
                 }
             }
         }
@@ -161,12 +192,77 @@ impl RrbsIndexBuilder {
             self.total_kmers,
         );
         index.rrbs_site_offsets = self.rrbs_site_offsets;
-        index.rrbs_sites = self.rrbs_sites;
+        index.rrbs_sites = self
+            .rrbs_sites
+            .into_iter()
+            .map(|(position, reverse_offset)| [position, reverse_offset])
+            .collect();
         index
     }
 }
 
 impl KmerIndex {
+    #[inline]
+    pub(crate) fn index2_slice(&self) -> &[KmerLoc2] {
+        match &self.mapped {
+            Some(mapped) => unsafe { mapped.slice(mapped.index2) },
+            None => &self.index2,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn positions_slice(&self) -> &[u32] {
+        match &self.mapped {
+            Some(mapped) => unsafe { mapped.slice(mapped.positions) },
+            None => &self.positions,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn start_offsets_slice(&self) -> &[u32] {
+        match &self.mapped {
+            Some(mapped) => unsafe { mapped.slice(mapped.start_offsets) },
+            None => &self.start_offsets,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn rrbs_offsets_slice(&self) -> &[u32] {
+        match &self.mapped {
+            Some(mapped) => unsafe { mapped.slice(mapped.rrbs_offsets) },
+            None => &self.rrbs_offsets,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn rrbs_hits_slice(&self) -> &[Hit] {
+        match &self.mapped {
+            Some(mapped) => unsafe { mapped.slice(mapped.rrbs_hits) },
+            None => &self.rrbs_hits,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn rrbs_site_offsets_slice(&self) -> &[u32] {
+        match &self.mapped {
+            Some(mapped) => unsafe { mapped.slice(mapped.rrbs_site_offsets) },
+            None => &self.rrbs_site_offsets,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn rrbs_sites_slice(&self) -> &[[u32; 2]] {
+        match &self.mapped {
+            Some(mapped) => unsafe { mapped.slice(mapped.rrbs_sites) },
+            None => &self.rrbs_sites,
+        }
+    }
+
+    #[inline]
+    pub fn has_rrbs_index(&self) -> bool {
+        !self.rrbs_offsets_slice().is_empty()
+    }
+
     /// Build the k-mer index for WGBS mode.
     ///
     /// Three-pass algorithm:
@@ -206,7 +302,7 @@ impl KmerIndex {
         );
 
         // ── Pass 2: Compute cutoff and prefix sums ────────────────────
-        let mut total_counts: Vec<u32> = fwd_counts
+        let total_counts: Vec<u32> = fwd_counts
             .iter()
             .zip(rev_counts.iter())
             .map(|(&f, &r)| f + r)
@@ -227,7 +323,8 @@ impl KmerIndex {
             u32::MAX
         };
 
-        // Build index2 entries: n[1]=fwd count, n[0]=rev count
+        // Keep raw counts for every bucket. C++ CountSeeds uses these counts even
+        // when SnpAlign later skips an over-represented bucket.
         let mut index2: Vec<KmerLoc2> = Vec::with_capacity(total_kmers as usize);
         let mut total_positions: u32 = 0;
 
@@ -237,16 +334,11 @@ impl KmerIndex {
             let fwd = fwd_counts[i];
             let rev = rev_counts[i];
             let total = fwd + rev;
+            index2.push(KmerLoc2 {
+                n: [rev, fwd],
+            });
             if total > 0 && total <= max_kmer_num {
-                // n[1] = forward count, n[0] = reverse count (C++ KmerLoc2 semantics)
-                index2.push(KmerLoc2 {
-                    n: [rev, fwd],
-                });
                 total_positions += fwd + rev;
-            } else {
-                index2.push(KmerLoc2 {
-                    n: [0, 0],
-                });
             }
         }
 
@@ -320,6 +412,7 @@ impl KmerIndex {
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
             seed_size,
+            mapped: None,
         }
     }
 
@@ -353,9 +446,11 @@ impl KmerIndex {
     /// Return C++ `CCGG_seglen()` output `(ZP, ZL)` for an RRBS alignment.
     pub fn rrbs_fragment(&self, chr: u32, pos: u32, read_len: u32) -> Option<(u32, u32)> {
         let chr = chr as usize;
-        let start = *self.rrbs_site_offsets.get(chr)? as usize;
-        let end = *self.rrbs_site_offsets.get(chr + 1)? as usize;
-        let sites = self.rrbs_sites.get(start..end)?;
+        let site_offsets = self.rrbs_site_offsets_slice();
+        let all_sites = self.rrbs_sites_slice();
+        let start = *site_offsets.get(chr)? as usize;
+        let end = *site_offsets.get(chr + 1)? as usize;
+        let sites = all_sites.get(start..end)?;
         if sites.len() < 2 {
             return None;
         }
@@ -364,11 +459,11 @@ impl KmerIndex {
         let mut right = sites.len() - 1;
         while left < right - 1 {
             let mid = (left + right) / 2;
-            if sites[mid].0 == pos {
+            if sites[mid][0] == pos {
                 left = mid;
                 right = mid + 1;
                 break;
-            } else if sites[mid].0 < pos {
+            } else if sites[mid][0] < pos {
                 left = mid;
             } else {
                 right = mid;
@@ -377,9 +472,9 @@ impl KmerIndex {
 
         let target_end = pos.checked_add(read_len)?;
         while right < sites.len() {
-            let site_end = sites[right].0.checked_add(sites[right].1)?;
+            let site_end = sites[right][0].checked_add(sites[right][1])?;
             if site_end >= target_end {
-                let segment_start = sites[left].0;
+                let segment_start = sites[left][0];
                 return Some((segment_start + 1, site_end - segment_start));
             }
             right += 1;
@@ -419,43 +514,56 @@ impl KmerIndex {
     /// reverse positions with `crefcat` for validation.
     #[inline]
     pub fn lookup_separated(&self, seed_hash: u32) -> (&[u32], &[u32]) {
-        if self.index2.is_empty() || self.start_offsets.is_empty() {
+        let index2 = self.index2_slice();
+        let start_offsets = self.start_offsets_slice();
+        let positions = self.positions_slice();
+        if index2.is_empty() || start_offsets.is_empty() {
             return (&[], &[]);
         }
         let idx = seed_hash as usize;
-        if idx >= self.index2.len() {
+        if idx >= index2.len() {
             return (&[], &[]);
         }
-        let entry = &self.index2[idx];
+        let entry = &index2[idx];
         let fwd_count = entry.n[1] as usize;
         let rev_count = entry.n[0] as usize;
 
-        if fwd_count + rev_count == 0 {
+        if fwd_count + rev_count == 0 || fwd_count + rev_count > self.max_kmer_num as usize {
             return (&[], &[]);
         }
 
-        let start = self.start_offsets[idx] as usize;
-        let fwd_slice = &self.positions[start..start + fwd_count];
-        let rev_slice = &self.positions[start + fwd_count..start + fwd_count + rev_count];
+        let start = start_offsets[idx] as usize;
+        let fwd_slice = &positions[start..start + fwd_count];
+        let rev_slice = &positions[start + fwd_count..start + fwd_count + rev_count];
         (fwd_slice, rev_slice)
+    }
+
+    /// Return the raw WGBS bucket size used by C++ `CountSeeds()`.
+    #[inline]
+    pub fn wgbs_candidate_count(&self, seed_hash: u32) -> u32 {
+        self.index2_slice()
+            .get(seed_hash as usize)
+            .map_or(0, |entry| entry.n[0].saturating_add(entry.n[1]))
     }
 
     /// Look up one RRBS k-mer bucket in flat storage.
     #[inline]
     pub fn lookup_rrbs(&self, seed_hash: u32) -> &[Hit] {
+        let rrbs_offsets = self.rrbs_offsets_slice();
+        let rrbs_hits = self.rrbs_hits_slice();
         let idx = seed_hash as usize;
-        if idx + 1 >= self.rrbs_offsets.len() {
+        if idx + 1 >= rrbs_offsets.len() {
             return &[];
         }
-        let start = self.rrbs_offsets[idx] as usize;
-        let end = self.rrbs_offsets[idx + 1] as usize;
-        self.rrbs_hits.get(start..end).unwrap_or(&[])
+        let start = rrbs_offsets[idx] as usize;
+        let end = rrbs_offsets[idx + 1] as usize;
+        rrbs_hits.get(start..end).unwrap_or(&[])
     }
 }
 
 fn visit_rrbs_hits<F>(
     coll: &BinSeqCollection,
-    ccgg_index: &[Vec<Vec<(u32, u32)>>],
+    ccgg_index: &[Vec<Vec<u32>>],
     total_blocks: usize,
     seed_size: u32,
     seed_bits_lz: u32,
@@ -478,7 +586,7 @@ fn visit_rrbs_hits<F>(
             };
             let hit_chr = block_id | ((mode as u32) << RRBS_MODE_SHIFT);
 
-            for &(_, loc) in &mode_blocks[block_id as usize] {
+            for &loc in &mode_blocks[block_id as usize] {
                 if let Some(hash) =
                     try_make_seed(words, (anchor as u64 + loc as u64) * 2, seed_bits_lz)
                 {
@@ -489,7 +597,7 @@ fn visit_rrbs_hits<F>(
             let other_block = (block_id ^ 1) as usize;
             let tmp_offset = rc_offset.saturating_sub(seed_size);
             let cross_hit_chr = hit_chr | RRBS_BSC_FLAG;
-            for &(_, other_pos) in &mode_blocks[other_block] {
+            for &other_pos in &mode_blocks[other_block] {
                 if let Some(loc) = tmp_offset.checked_sub(other_pos) {
                     if let Some(hash) =
                         try_make_seed(words, (anchor as u64 + loc as u64) * 2, seed_bits_lz)
@@ -510,7 +618,7 @@ fn visit_rrbs_hits<F>(
 
 fn build_flat_rrbs_index(
     coll: &BinSeqCollection,
-    ccgg_index: &[Vec<Vec<(u32, u32)>>],
+    ccgg_index: &[Vec<Vec<u32>>],
     total_blocks: usize,
     seed_size: u32,
     total_kmers: u32,
@@ -527,6 +635,7 @@ fn build_flat_rrbs_index(
             rrbs_site_offsets: Vec::new(),
             rrbs_sites: Vec::new(),
             seed_size,
+            mapped: None,
         };
     }
 
@@ -573,6 +682,7 @@ fn build_flat_rrbs_index(
         rrbs_site_offsets: Vec::new(),
         rrbs_sites: Vec::new(),
         seed_size,
+        mapped: None,
     }
 }
 
@@ -797,8 +907,9 @@ mod tests {
             rrbs_offsets: Vec::new(),
             rrbs_hits: Vec::new(),
             rrbs_site_offsets: vec![0, 3],
-            rrbs_sites: vec![(5, 2), (40, 2), (90, 2)],
+            rrbs_sites: vec![[5, 2], [40, 2], [90, 2]],
             seed_size: 12,
+            mapped: None,
         };
 
         assert_eq!(index.rrbs_fragment(0, 10, 20), Some((6, 37)));
