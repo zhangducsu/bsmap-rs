@@ -358,7 +358,10 @@ impl KmerIndex {
     }
 
     #[inline]
-    fn compact_bucket(&self, seed_hash: u32) -> Option<(PackedWgbsBucket, u32, u32)> {
+    pub(crate) fn compact_bucket(
+        &self,
+        seed_hash: u32,
+    ) -> Option<(PackedWgbsBucket, u32, u32)> {
         let hash = seed_hash as usize;
         let occupancy = self.wgbs_occupancy_slice();
         let word_index = hash / 64;

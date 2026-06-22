@@ -748,18 +748,20 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
 
 impl IndexDataV4 {
     fn from_flat(idx: &KmerIndex) -> Self {
-        let rrbs_index = if idx.rrbs_offsets.is_empty() {
+        let rrbs_offsets = idx.rrbs_offsets_slice();
+        let rrbs_hits = idx.rrbs_hits_slice();
+        let rrbs_index = if rrbs_offsets.is_empty() {
             None
         } else {
             Some(
-                idx.rrbs_offsets
+                rrbs_offsets
                     .windows(2)
                     .map(|range| {
                         let start = range[0] as usize;
                         let end = range[1] as usize;
                         IndexKmerLoc {
                             n1: (end - start) as u32,
-                            loc1: idx.rrbs_hits[start..end]
+                            loc1: rrbs_hits[start..end]
                                 .iter()
                                 .map(|hit| IndexHit {
                                     chr: hit.chr,
@@ -771,16 +773,34 @@ impl IndexDataV4 {
                     .collect(),
             )
         };
+        let (index2, start_offsets) = if idx.wgbs_occupancy_slice().is_empty() {
+            (
+                idx.index2
+                    .iter()
+                    .map(|entry| IndexKmerLoc2 { n: entry.n })
+                    .collect(),
+                idx.start_offsets.clone(),
+            )
+        } else {
+            let mut index2 = Vec::with_capacity(idx.total_kmers as usize);
+            let mut start_offsets = Vec::with_capacity(idx.total_kmers as usize);
+            for hash in 0..idx.total_kmers {
+                if let Some((bucket, fwd, rev)) = idx.compact_bucket(hash) {
+                    index2.push(IndexKmerLoc2 { n: [rev, fwd] });
+                    start_offsets.push(bucket.offset);
+                } else {
+                    index2.push(IndexKmerLoc2 { n: [0, 0] });
+                    start_offsets.push(0);
+                }
+            }
+            (index2, start_offsets)
+        };
         Self {
             total_kmers: idx.total_kmers,
             max_kmer_num: idx.max_kmer_num,
-            index2: idx
-                .index2
-                .iter()
-                .map(|entry| IndexKmerLoc2 { n: entry.n })
-                .collect(),
-            positions: idx.positions.clone(),
-            start_offsets: idx.start_offsets.clone(),
+            index2,
+            positions: idx.positions_slice().to_vec(),
+            start_offsets,
             rrbs_index,
         }
     }
@@ -1603,9 +1623,18 @@ mod tests {
         assert_eq!(loaded_index.total_kmers, index.total_kmers);
         assert_eq!(loaded_index.max_kmer_num, index.max_kmer_num);
         assert_eq!(loaded_index.positions, index.positions);
-        assert_eq!(loaded_index.index2.len(), index.index2.len());
-        for (a, b) in loaded_index.index2.iter().zip(index.index2.iter()) {
-            assert_eq!(a.n, b.n);
+        assert_eq!(loaded_index.index2.len(), index.total_kmers as usize);
+        for hash in 0..index.total_kmers {
+            assert_eq!(
+                loaded_index.lookup_separated(hash),
+                index.lookup_separated(hash),
+                "legacy round-trip differs for hash {hash}",
+            );
+            assert_eq!(
+                loaded_index.wgbs_candidate_count(hash),
+                index.wgbs_candidate_count(hash),
+                "legacy raw count differs for hash {hash}",
+            );
         }
     }
 
