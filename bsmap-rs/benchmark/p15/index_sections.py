@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inspect and validate BSMAP v8 raw index sections without loading them."""
+"""Inspect and validate BSMAP v8/v9 raw index sections without loading them."""
 
 import argparse
 import json
@@ -58,12 +58,21 @@ def inspect_index(path):
     errors = []
     if magic != b"BSMAPIDX":
         errors.append("magic 不匹配")
-    if version != 8:
-        errors.append(f"只支持检查 v8 raw index，实际为 v{version}")
+    if version not in (8, 9):
+        errors.append(f"只支持检查 v8/v9 raw index，实际为 v{version}")
     if marker != "RAWSECT2":
         errors.append(f"raw section marker 不是 RAWSECT2：{marker!r}")
     if mode_code not in (0, 1):
         errors.append(f"未知 mode：{mode_code}")
+    elif mode_code == 0 and version != 8:
+        errors.append(f"WGBS raw index 必须为 v8，实际为 v{version}")
+    elif mode_code == 1 and version not in (8, 9):
+        errors.append(f"RRBS raw index 必须为 v8 或 v9，实际为 v{version}")
+
+    refcat_words = unpack(header, 48, "Q")
+    crefcat_words = unpack(header, 56, "Q")
+    if version == 9 and crefcat_words != 0:
+        errors.append("RRBS v9 必须省略 materialized crefcat")
 
     specs = RRBS_SECTIONS if mode_code == 1 else WGBS_SECTIONS
     sections = []
@@ -95,6 +104,11 @@ def inspect_index(path):
             }
         )
 
+    if sections[7]["item_count"] != refcat_words:
+        errors.append("refcat header word 数与 section item_count 不一致")
+    if sections[8]["item_count"] != crefcat_words:
+        errors.append("crefcat header word 数与 section item_count 不一致")
+
     return {
         "schema_version": 1,
         "path": str(path),
@@ -108,8 +122,8 @@ def inspect_index(path):
         "index_interval": unpack(header, 28, "I"),
         "reference_count": unpack(header, 40, "I"),
         "reference_names_bytes": unpack(header, 44, "I"),
-        "refcat_words": unpack(header, 48, "Q"),
-        "crefcat_words": unpack(header, 56, "Q"),
+        "refcat_words": refcat_words,
+        "crefcat_words": crefcat_words,
         "source_size_bytes": unpack(header, 64, "Q"),
         "marker": marker,
         "sections": sections,
@@ -120,7 +134,7 @@ def inspect_index(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="检查 BSMAP v8 索引 section 布局。")
+    parser = argparse.ArgumentParser(description="检查 BSMAP v8/v9 索引 section 布局。")
     parser.add_argument("index")
     parser.add_argument("--output", required=True)
     args = parser.parse_args()

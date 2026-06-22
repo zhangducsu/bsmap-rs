@@ -38,28 +38,32 @@ M  bsmap-rs/bsmap/src/reference/index_io.rs
    - mm10 RRBS PE：4,884 条，SHA256 `7b33a9d894f670e1ec2424430d614d06c2d4d2d48a06fc4880c0568949f39ac6`，三轮 wall 中位 14.70 秒，最坏 RSS 1,401,944 KiB。
 6. 两个不达标实验已完整回退：identity hasher（收益不足 5%）和预计算 N/复用 selection set（example1 回退约 12%）。回退后 binary SHA256 恢复为 Phase 2A 的 `0afc...`。
 
-### 当前 RRBS v9 原型
+### 已验证并保留的 RRBS v9
 
 目标是移除 RRBS 索引中重复保存的约 683 MB reverse reference，改为 single-chain reference + reverse window on demand。
 
 - `reference/binseq.rs`：新增 `fill_reverse_window()`，单测逐 code 对比 materialized `crefcat`，覆盖 padding、正文和染色体边界。
 - `align/extend.rs`：RRBS reverse hit 在 `crefcat` 为空时，用固定栈缓冲生成所需 reverse window；旧索引和 WGBS 路径不变。
 - `reference/index_io.rs`：新增 RRBS v9；RRBS v9 不写 `crefcat` section，旧 RRBS v8 强制重建；WGBS 继续使用 v8。
-- 当前原型已通过：201 个 lib tests、3 个 bin tests、doc tests、`cargo build --release -p bsmap`。
-- 尚未完成：`benchmark/p15/index_sections.py` 仍只接受 v8；v9 小 fixture、mm10 v9 索引构建、RRBS SE/PE SAM parity、性能/RSS/major faults、WGBS 回归均未执行。因此 v9 只能称为“编译与单测通过的原型”，不能称为保留优化或交付结果。
+- 已通过：201 个 lib tests、3 个 bin tests、doc tests、`cargo build --release -p bsmap`。
+- `benchmark/p15/index_sections.py` 已支持 v8/v9、mode/version 配对、header/section count 一致性和 RRBS v9 空 `crefcat` 校验；14 个工具测试通过。
+- 小型 RRBS fixture 使用 `chr22_tail_1M.fa` 和 `ex3_se75_10x.1.fq.gz`：v9 索引有效，9,725 条 Rust/C++ SAM 完整逐行一致。
+- mm10 v9 索引为 1,091,007,832 bytes，较 v8 的 1,773,733,496 bytes 减少 38.49%；`crefcat_words=0`。standalone index 为 46.28 秒、1,911,148 KiB RSS，构建 RSS 和 35 秒目标尚未达标。
+- mm10 RRBS SE 三轮：2,423 条和 SHA256 `420e34a3...` 全部一致；wall 中位 8.61 秒，最坏 RSS 829,560 KiB。另存 raw SAM 与 C++ 2,423/2,423 完整逐行一致。
+- mm10 RRBS PE 三轮：4,884 条和 SHA256 `7b33a9d8...` 全部一致；wall 中位 10.10 秒，最坏 RSS 878,316 KiB。
+- WGBS example1 三轮 wall 中位 0.95 秒、最坏 RSS 23,536 KiB，66,120 条与 C++ 完整逐行一致；example2 p1/p8 完整 SAM SHA256 均为 `e73edc7e...`，p8 三轮 wall 中位 1.46 秒。
+- 结果目录：`D:/BSMAP/benchmark-results/p15/phase34-rrbs-v9-20260623` 和 `D:/BSMAP/benchmark-results/p15/phase34-wgbs-v9-regression`。
 
 ### 恢复后的精确执行顺序
 
-1. 先读取本节并检查当前文件仍在；不要先 fetch/reset。
-2. 修复或绕开 Windows Git object/index ACL，创建本地检查点提交；在 commit 成功前不做破坏性 Git 操作。
-3. 更新 `benchmark/p15/index_sections.py` 及测试，使其接受 RRBS v9、拒绝 WGBS v9，并校验 v9 `crefcat_words == 0`。
-4. 运行 v9 小型 RRBS fixture，确认真正走空 `crefcat` 的 align 路径。
-5. 在新的结果目录构建 mm10 v9 索引；不得覆盖 `D:/BSMAP/benchmark-data/mm10/mm10.fa.bsi`。standalone index 单独计时。
-6. 运行 mm10 RRBS SE/PE 各三轮，分别与上面的完整 SHA256 golden 比较；同时记录 index size、wall/user/sys、CPU、RSS、major faults。
-7. 重跑 WGBS example1/example2，确认完整 SAM 不回归；example1 还必须与 C++ 的 RNAME、POS、FLAG、NM、ZP、ZL 和完整记录 100% 一致。
-8. 若 v9 输出不一致或关键性能无合理收益，则精确回退 v9 文件，不回退 Phase 0/2A。若保留，再创建正式报告并继续后续 Phase 5-8。
+1. 先读取本节并核对 Git HEAD、工作树和上述结果目录。
+2. RRBS v9 已通过保留门槛，不得回退或重复实现；继续时先阅读正式 P15 报告。
+3. Phase 3 仍未完成：RRBS logical bucket、section-scoped mmap 和 major faults 目标仍待优化。
+4. Phase 5-8 仍未完成：bounded pipeline/SAM-BAM writer、PE pairing、mismatch/runtime dispatch、standalone index RSS/wall。
+5. 每个后续优化仍须执行完整 cargo、example1/example2、mm10 SE/PE 回归；standalone index 始终单独计时。
+6. 最后执行 p1/p2/p4/p8/p16、90G WGBS/10G RRBS 常数内存长测、最终报告、completion audit、合并和推送。
 
-结果目录位于 `D:/BSMAP/benchmark-results/p15/`。90G WGBS / 10G RRBS 正式长测、Phase 5-8、最终报告、合并 `main` 和推送远端 `main` 均未完成。
+结果目录位于 `D:/BSMAP/benchmark-results/p15/`。90G WGBS / 10G RRBS 正式长测、Phase 3/5-8、最终报告、合并 `main` 和推送远端 `main` 均未完成。
 
 ## 1. 恢复入口
 

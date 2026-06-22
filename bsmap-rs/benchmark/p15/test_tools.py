@@ -43,18 +43,28 @@ class MetricsTest(unittest.TestCase):
 
 
 class IndexSectionsTest(unittest.TestCase):
-    def make_index(self, root, final_section_count=1):
+    def make_index(
+        self,
+        root,
+        *,
+        version=8,
+        mode=0,
+        refcat_count=0,
+        crefcat_count=1,
+    ):
         header = bytearray(HEADER_SIZE)
         header[:8] = b"BSMAPIDX"
-        struct.pack_into("<I", header, 8, 8)
+        struct.pack_into("<I", header, 8, version)
         struct.pack_into("<I", header, 12, 16)
-        struct.pack_into("<I", header, 16, 0)
+        struct.pack_into("<I", header, 16, mode)
         struct.pack_into("<I", header, 20, 43_046_721)
         struct.pack_into("<I", header, 28, 4)
+        struct.pack_into("<Q", header, 48, refcat_count)
+        struct.pack_into("<Q", header, 56, crefcat_count)
         cursor = HEADER_SIZE
         sizes = (8, 4, 8, 4, 12, 4, 8, 8, 8)
         for index, size in enumerate(sizes):
-            count = final_section_count if index == 8 else 0
+            count = refcat_count if index == 7 else crefcat_count if index == 8 else 0
             struct.pack_into("<QQ", header, 100 + index * 16, cursor, count)
             cursor += count * size
         header[248:256] = b"RAWSECT2"
@@ -71,11 +81,43 @@ class IndexSectionsTest(unittest.TestCase):
 
     def test_detects_section_beyond_eof(self):
         with tempfile.TemporaryDirectory() as temp_dir:
-            path = self.make_index(Path(temp_dir), final_section_count=2)
+            path = self.make_index(Path(temp_dir), crefcat_count=2)
             path.write_bytes(path.read_bytes()[:-1])
             report = inspect_index(path)
         self.assertFalse(report["valid"])
         self.assertTrue(any("文件末尾" in error for error in report["errors"]))
+
+    def test_valid_v9_rrbs_omits_crefcat(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = inspect_index(
+                self.make_index(
+                    Path(temp_dir),
+                    version=9,
+                    mode=1,
+                    refcat_count=1,
+                    crefcat_count=0,
+                )
+            )
+        self.assertTrue(report["valid"])
+        self.assertEqual(report["mode"], "RRBS")
+        self.assertEqual(report["crefcat_words"], 0)
+        self.assertEqual(report["sections"][-1]["byte_length"], 0)
+
+    def test_rejects_v9_wgbs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = inspect_index(
+                self.make_index(Path(temp_dir), version=9, mode=0, crefcat_count=1)
+            )
+        self.assertFalse(report["valid"])
+        self.assertTrue(any("WGBS raw index 必须为 v8" in error for error in report["errors"]))
+
+    def test_rejects_v9_rrbs_with_materialized_crefcat(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report = inspect_index(
+                self.make_index(Path(temp_dir), version=9, mode=1, crefcat_count=1)
+            )
+        self.assertFalse(report["valid"])
+        self.assertTrue(any("省略 materialized crefcat" in error for error in report["errors"]))
 
 
 class StreamFastqTest(unittest.TestCase):
