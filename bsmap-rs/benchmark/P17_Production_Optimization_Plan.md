@@ -1,8 +1,14 @@
 # P17 C++ 等价优先的生产级速度与内存优化计划
 
+## 状态
+
+P17 已于 2026-06-24 停止继续优化并收尾。本文件保留为历史计划、候选清单和收益估算记录，不再作为当前执行计划。
+
+后续若继续追求生产性能，应新开 P18 或新的明确阶段：先建立稳定 A/B benchmark 和 profiler 证据，再选择单个高收益路径重构。不得把 P17 中已撤回或未实作的候选直接视为待合入生产优化。
+
 ## Summary
 
-P17 从 `29daa8f` 开始，目标是在保持 C++ BSMAP 2.90 语义等价的前提下，继续压低 Rust 版的 wall time、RSS 和 CPU 浪费。本轮不跑 WGBS 90G / RRBS 10G 规模测试，只跑 WGBS example1、WGBS example2、mm10 RRBS 10K；大样本收益只写为估算。
+P17 从 `29daa8f` 开始，目标是在保持 C++ BSMAP 2.90 语义等价的前提下，继续压低 Rust 版的 wall time、RSS 和 CPU 浪费。本轮不跑 WGBS 90G / RRBS 10G 规模测试，只跑 WGBS example1、WGBS example2、mm10 RRBS 10K；大样本收益只写为估算。收尾结论是：低风险微优化未产生稳定收益，P17 不再继续执行。
 
 Rust standalone index 是可复用步骤，继续单独计时，不并入 Rust/C++ 单样本 warm align 对比。
 
@@ -17,6 +23,8 @@ Rust standalone index 是可复用步骤，继续单独计时，不并入 Rust/C
 | Phase 5 | mmap/index 低风险审查 | v10 格式默认不改 | 降低 0% 到 5% | 降低 0% 到 8% | 基本不变 | 中低 |
 
 综合收益不得线性相加。P17 已证明 PE/SAM direct writer 在当前短基准下不能作为默认优化保留；完整 PE interleaved pairing 只有在中间 fixture 与短基准都达标后才进入生产代码。
+
+截至收尾，P17 未保留新的生产比对或输出代码优化。保留下来的内容是 benchmark 入口、summary 稳定性检查、test-only 语义护栏、SIMD probe 和评估文档。
 
 ## 验证矩阵
 

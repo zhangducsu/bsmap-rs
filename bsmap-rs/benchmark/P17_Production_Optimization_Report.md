@@ -1,12 +1,18 @@
 # P17 生产级速度与内存优化报告
 
+## 收尾状态
+
+P17 于 2026-06-24 按决策停止继续优化并收尾。本轮不再追加 PE interleaved pairing、pipeline、SIMD 或 mmap/index 生产代码实验；当前分支只保留已验证的测试护栏、benchmark 工具和评估文档。
+
+后续若继续追求极致性能，应新开 P18，并先用稳定 A/B runner 与 profiler 证明单个热点具备足够收益，再进入重构。P17 不再作为继续挖掘低风险微优化的工作分支。
+
 ## 当前结论
 
 P17 已完成一轮生产工程化审查和短基准验证。最终没有保留新的比对或输出代码优化；本轮保留的是 P17 可复现短基准入口、summary 对比工具、计划文档和评估报告。
 
 PE/SAM direct writer 候选已实作并验证，但短基准没有稳定达到保留标准：WGBS PE 与 RRBS PE 没有稳定提速，且 WGBS PE 出现过 4% 到 10% 的 wall time 回退。因此该候选已撤回，避免把噪声或局部收益带入生产分支。
 
-Phase 1 的完整 PE interleaved pairing 仍是下一步最大收益点，但暂未进入生产代码。原因是它需要拆分 `SingleAlign` 内部阶段并建立 C++ `RunAlign/GetPairs` 中间 fixture；在缺少中间等价保护前直接切换风险过高。
+Phase 1 的完整 PE interleaved pairing 仍是未来最大潜在收益点，但不再在 P17 内继续。原因是它需要拆分 `SingleAlign` 内部阶段并建立 C++ `RunAlign/GetPairs` 中间 fixture；在缺少中间等价保护前直接切换风险过高。
 
 ## 保留改动
 
@@ -95,9 +101,16 @@ SIMD mismatch probe 结果：
 
 AVX2 可用，但结果混合：只有 150bp、offset=0 的 full scan 明显受益，75bp 和 offset case 均变慢。因此 P17 不把 `count_mismatch_simd()` 接入默认 `extend.rs` 热路径；后续若要继续，必须先按真实候选分布统计 offset 与 read length 占比。
 
-## 未解决项
+## 收尾后遗留项
 
-- PE interleaved pairing 仍是 P17 后续最大收益点；当前已增加 C++ 调度顺序 test-only 护栏。实测证明，仅把现有全量配对结果改成 C++ pair-level 枚举顺序会改变 PE 输出 SHA 并造成短基准回退，因此完整生产重构必须先拆分 `SingleAlign` 阶段、补齐中间候选 fixture，并同步处理 C++ 早停语义，不能只重排最终配对循环。
+- PE interleaved pairing 仍是后续新阶段的最大潜在收益点；当前已增加 C++ 调度顺序 test-only 护栏。实测证明，仅把现有全量配对结果改成 C++ pair-level 枚举顺序会改变 PE 输出 SHA 并造成短基准回退，因此完整生产重构必须先拆分 `SingleAlign` 阶段、补齐中间候选 fixture，并同步处理 C++ 早停语义，不能只重排最终配对循环。
 - PE/SAM direct writer 在 10K 短基准未达标，暂不保留。若后续要重试，必须先用 profiler 证明输出分配是 PE 主瓶颈，而不是 pairing、I/O 或 batch 调度。
 - SIMD mismatch probe 结果不支持默认接入。下一步应先统计真实 alignment 热路径中 read length、offset 和 early abort 的分布，而不是直接切换实现。
 - 本轮不跑 WGBS 90G / RRBS 10G；报告中的大样本收益均为估算，不作为实测结论。
+
+## 最终决策
+
+- P17 停止继续生产优化，不再追加新的性能实验。
+- 不保留任何已撤回候选的生产代码。
+- 保留 P17 benchmark、summary 稳定性检查、test-only 语义护栏和本报告。
+- 后续优化只有在 profiler 和稳定 A/B benchmark 证明收益足够时，才以 P18 或新的明确阶段继续。
