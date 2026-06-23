@@ -55,6 +55,7 @@ Phase 1 的完整 PE interleaved pairing 仍是下一步最大收益点，但暂
 - 第一版 PE/SAM direct writer：`D:/BSMAP/benchmark-results/p17/pe-sam-direct-20260623T080000Z`
 - 第一版复测：`D:/BSMAP/benchmark-results/p17/pe-sam-direct-20260623T081000Z`
 - 完整 SEQ/QUAL direct writer：`D:/BSMAP/benchmark-results/p17/pe-sam-direct-full-20260623T082000Z`
+- C++ pair-level order 生产候选：`D:/BSMAP/benchmark-results/p17/cpp-pair-order-20260623T093000Z`
 
 正确性结果：
 
@@ -72,6 +73,7 @@ Phase 1 的完整 PE interleaved pairing 仍是下一步最大收益点，但暂
 | PE/SAM direct writer 第一版 | `20260623T080000Z` | +9.83% | -4.69% | WGBS PE 明显回退，不能保留 |
 | PE/SAM direct writer 第一版复测 | `20260623T081000Z` | +1.73% | +1.43% | 无稳定收益 |
 | 完整 SEQ/QUAL direct writer | `20260623T082000Z` | +4.62% | +0.82% | PE 仍无收益，已撤回 |
+| C++ pair-level order 生产候选 | `20260623T093000Z` | +41.62% | +29.80% | 改变 example2/rrbs_pe 记录 SHA 且明显变慢，已撤回 |
 
 上述百分比均相对 P16 baseline `D:/BSMAP/benchmark-results/p16/sam-direct-warm-20260623T072000Z` 的 summary。Rust standalone index 独立计时，不并入 warm align 对比。
 
@@ -88,7 +90,7 @@ AVX2 可用，但结果混合：只有 150bp、offset=0 的 full scan 明显受�
 
 ## 未解决项
 
-- PE interleaved pairing 仍是 P17 后续最大收益点；当前已增加 C++ 调度顺序 test-only 护栏，但完整生产重构仍需要拆分 `SingleAlign` 阶段并补齐中间候选 fixture。
+- PE interleaved pairing 仍是 P17 后续最大收益点；当前已增加 C++ 调度顺序 test-only 护栏。实测证明，仅把现有全量配对结果改成 C++ pair-level 枚举顺序会改变 PE 输出 SHA 并造成短基准回退，因此完整生产重构必须先拆分 `SingleAlign` 阶段、补齐中间候选 fixture，并同步处理 C++ 早停语义，不能只重排最终配对循环。
 - PE/SAM direct writer 在 10K 短基准未达标，暂不保留。若后续要重试，必须先用 profiler 证明输出分配是 PE 主瓶颈，而不是 pairing、I/O 或 batch 调度。
 - SIMD mismatch probe 结果不支持默认接入。下一步应先统计真实 alignment 热路径中 read length、offset 和 early abort 的分布，而不是直接切换实现。
 - 本轮不跑 WGBS 90G / RRBS 10G；报告中的大样本收益均为估算，不作为实测结论。
