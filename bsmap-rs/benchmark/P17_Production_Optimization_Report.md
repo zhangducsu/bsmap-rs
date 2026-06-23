@@ -24,6 +24,10 @@ Phase 1 的完整 PE interleaved pairing 仍是下一步最大收益点，但暂
   - 新增 ignored 的 P17 mismatch scalar/SIMD microbench probe。
   - 默认 `cargo test` 不运行该 probe；只用于手动评估是否值得把 SIMD 接入热路径。
 
+- `bsmap/src/pairs/pair.rs`
+  - 新增 test-only 的 C++ `pairs.cpp::RunAlign()` 配对 mismatch-level 调度顺序护栏。
+  - 当前只锁定 `(i,i)`、`(i,j)`、`(j,i)` 的层级顺序和非对称 read 最大 mismatch 边界；不改变生产 PE 行为。
+
 ## 收益估算
 
 | 优化 | 主要场景 | wall time 估算 | RSS 估算 | CPU 利用率估算 | 置信度 |
@@ -44,6 +48,7 @@ Phase 1 的完整 PE interleaved pairing 仍是下一步最大收益点，但暂
 - `python3 -m py_compile benchmark/p15/*.py benchmark/p17/*.py`
 - `python3 -m unittest benchmark/p15/test_tools.py`
 - `cargo test -p bsmap --lib bench_count_mismatch_scalar_vs_simd_p17_probe --release -- --ignored --nocapture`
+- `cargo test -p bsmap cpp_pair_level_schedule`
 
 短基准结果目录：
 
@@ -83,7 +88,7 @@ AVX2 可用，但结果混合：只有 150bp、offset=0 的 full scan 明显受�
 
 ## 未解决项
 
-- PE interleaved pairing 仍是 P17 后续最大收益点，但必须先增加 test-only C++ 中间结果 fixture。
+- PE interleaved pairing 仍是 P17 后续最大收益点；当前已增加 C++ 调度顺序 test-only 护栏，但完整生产重构仍需要拆分 `SingleAlign` 阶段并补齐中间候选 fixture。
 - PE/SAM direct writer 在 10K 短基准未达标，暂不保留。若后续要重试，必须先用 profiler 证明输出分配是 PE 主瓶颈，而不是 pairing、I/O 或 batch 调度。
 - SIMD mismatch probe 结果不支持默认接入。下一步应先统计真实 alignment 热路径中 read length、offset 和 early abort 的分布，而不是直接切换实现。
 - 本轮不跑 WGBS 90G / RRBS 10G；报告中的大样本收益均为估算，不作为实测结论。

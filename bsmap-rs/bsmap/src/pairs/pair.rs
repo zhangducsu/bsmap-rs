@@ -985,6 +985,51 @@ mod tests {
         (index, coll)
     }
 
+    fn cpp_pair_level_schedule(max_snp_a: usize, max_snp_b: usize) -> Vec<(usize, usize)> {
+        let maxi = max_snp_a.max(max_snp_b);
+        let mut levels = Vec::new();
+        for i in 0..=maxi {
+            if i <= max_snp_a && i <= max_snp_b {
+                levels.push((i, i));
+            }
+            for j in 0..i {
+                if i <= max_snp_a && j <= max_snp_b {
+                    levels.push((i, j));
+                }
+                if j <= max_snp_a && i <= max_snp_b {
+                    levels.push((j, i));
+                }
+            }
+        }
+        levels
+    }
+
+    #[test]
+    fn test_cpp_pair_level_schedule_matches_runalign_order() {
+        assert_eq!(
+            cpp_pair_level_schedule(2, 2),
+            vec![
+                (0, 0),
+                (1, 1),
+                (1, 0),
+                (0, 1),
+                (2, 2),
+                (2, 0),
+                (0, 2),
+                (2, 1),
+                (1, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_cpp_pair_level_schedule_skips_out_of_range_levels() {
+        assert_eq!(
+            cpp_pair_level_schedule(1, 2),
+            vec![(0, 0), (1, 1), (1, 0), (0, 1), (0, 2), (1, 2)]
+        );
+    }
+
     #[test]
     fn test_pair_hit_new() {
         let hit_a = GHit {

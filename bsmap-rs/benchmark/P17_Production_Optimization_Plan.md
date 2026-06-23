@@ -10,7 +10,7 @@ Rust standalone index 是可复用步骤，继续单独计时，不并入 Rust/C
 
 | 阶段 | 内容 | 实施状态 | wall time 估算 | RSS 估算 | CPU 利用率估算 | 置信度 |
 |---|---|---|---:|---:|---:|---|
-| Phase 1 | PE interleaved pairing，对齐 C++ `RunAlign/GetPairs` 调度 | 暂缓，需 test-only fixture 先证明中间语义 | PE 降低 10% 到 30% | 降低 5% 到 15% | 提升 5 到 15 个百分点 | 中高 |
+| Phase 1 | PE interleaved pairing，对齐 C++ `RunAlign/GetPairs` 调度 | 已补 test-only 调度顺序护栏；生产重构暂缓，需中间候选 fixture | PE 降低 10% 到 30% | 降低 5% 到 15% | 提升 5 到 15 个百分点 | 中高 |
 | Phase 2 | PE/SAM direct writer，减少 pair/unpair 输出分配 | 已验证并撤回，短基准未达保留标准 | PE 降低 3% 到 8% | 降低 0% 到 3% | sys time 小幅下降 | 高 |
 | Phase 3 | bounded read-align-write pipeline 原型 | 仅保留为后续候选，本轮不默认启用 | 短基准 0% 到 5%；大样本估算 5% 到 20% | 增加约 1 个 batch | 提升 5 到 25 个百分点 | 中 |
 | Phase 4 | SIMD mismatch runtime dispatch | test-only probe 已完成，结果混合，默认不接入 | SE/RRBS 降低 3% 到 12%；也可能 0% | 基本不变 | 小幅提升或不变 | 中低 |
