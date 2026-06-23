@@ -289,3 +289,10 @@
 - 原因：`status`、`merge`、`add`、`commit` 等命令都可能读写或刷新同一个 worktree index；并行执行会争用 `.git/worktrees/<name>/index.lock`。
 - 规避：同一 worktree 内所有会触碰 index 的 Git 命令必须串行执行。可以并行只读文件读取、`git log`、`git diff` 等不刷新 index 的查询；不确定时按会写 index 处理。
 - 验证：确认没有残留 Git 进程且 lock 自动消失后，串行执行 `git status --short --branch` 再执行 `git merge --ff-only codex/p16-engineering-performance`，main 成功 fast-forward 到 `29daa8f`。
+
+### 32. OneDrive linked worktree 删除可能留下半移除状态
+
+- 现象：`git worktree remove` 对 `.claude/worktrees/<name>` 报 `Permission denied`，随后该 worktree 可能已从 `git worktree list` 消失，但 `.claude/worktrees/<name>` 和 `.git/worktrees/<name>` 目录仍残留。
+- 原因：OneDrive/Windows 文件属性或同步状态会阻止 Git 删除工作区目录和 linked worktree 元数据；Git 命令可能已经完成 unregister，但文件系统删除失败。
+- 规避：先确认目标 worktree 干净且不含用户未跟踪文件，再用 `git worktree list`、`Test-Path` 和 `Resolve-Path` 确认残留目录严格位于当前仓库的 `.claude/worktrees/` 与 `.git/worktrees/` 下。只对确认的单个残留目录使用 PowerShell `Remove-Item -LiteralPath <path> -Recurse -Force`；禁止对 `.claude/worktrees` 或 `.git/worktrees` 做通配递归删除。
+- 验证：P14/P15/P16 baseline/P17/main-work 残留目录按精确路径删除后，`git worktree prune` 和 `git worktree list --porcelain` 只剩主工作区、干净 main 工作区和保留的 P13 工作区。
