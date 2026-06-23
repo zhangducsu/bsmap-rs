@@ -784,6 +784,95 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "P17 manual microbench probe; run with --ignored --nocapture"]
+    fn bench_count_mismatch_scalar_vs_simd_p17_probe() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        let avx2_available = std::is_x86_feature_detected!("avx2");
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        let avx2_available = false;
+
+        let cases = [
+            ("se75_full_scan", 75usize, 100u32, 0u64, 2_000_000usize),
+            ("se75_early_abort", 75usize, 2u32, 0u64, 2_000_000usize),
+            ("pe150_full_scan", 150usize, 100u32, 0u64, 1_000_000usize),
+            ("pe150_offset", 150usize, 100u32, 6u64, 1_000_000usize),
+        ];
+
+        for (name, len, snp_thres, offset, iterations) in cases {
+            let mut query_seq = b"ACGT".repeat((len + 3) / 4);
+            query_seq.truncate(len);
+            let mut ref_seq_bytes = query_seq.clone();
+            for pos in (7..len).step_by(31) {
+                ref_seq_bytes[pos] = match ref_seq_bytes[pos] {
+                    b'A' => b'C',
+                    b'C' => b'G',
+                    b'G' => b'T',
+                    _ => b'A',
+                };
+            }
+
+            let query = pack_forward(&query_seq, 10);
+            let ref_seq = make_ref_seq(&ref_seq_bytes);
+            let mut mask = make_mask(len);
+            mask.resize(query.len(), 0);
+
+            let scalar = count_mismatch(&query, offset, &ref_seq, &mask, snp_thres, 0, false);
+            let simd = count_mismatch_simd(&query, offset, &ref_seq, &mask, snp_thres, 0, false);
+            assert_eq!(scalar, simd);
+
+            let start = Instant::now();
+            let mut scalar_acc = 0u64;
+            for _ in 0..iterations {
+                scalar_acc += black_box(count_mismatch(
+                    black_box(&query),
+                    black_box(offset),
+                    black_box(&ref_seq),
+                    black_box(&mask),
+                    black_box(snp_thres),
+                    0,
+                    false,
+                )) as u64;
+            }
+            let scalar_elapsed = start.elapsed();
+
+            let start = Instant::now();
+            let mut simd_acc = 0u64;
+            for _ in 0..iterations {
+                simd_acc += black_box(count_mismatch_simd(
+                    black_box(&query),
+                    black_box(offset),
+                    black_box(&ref_seq),
+                    black_box(&mask),
+                    black_box(snp_thres),
+                    0,
+                    false,
+                )) as u64;
+            }
+            let simd_elapsed = start.elapsed();
+
+            assert_eq!(scalar_acc, simd_acc);
+
+            let scalar_ns = scalar_elapsed.as_nanos() as f64 / iterations as f64;
+            let simd_ns = simd_elapsed.as_nanos() as f64 / iterations as f64;
+            println!(
+                "p17_mismatch_probe\tcase={}\tlen={}\toffset={}\tthreshold={}\titerations={}\tavx2={}\tscalar_ns_per_iter={:.3}\tsimd_ns_per_iter={:.3}\tratio={:.4}",
+                name,
+                len,
+                offset,
+                snp_thres,
+                iterations,
+                avx2_available,
+                scalar_ns,
+                simd_ns,
+                simd_ns / scalar_ns
+            );
+        }
+    }
+
+    #[test]
     fn test_mismatch_pattern_ct_tolerance() {
         // 测试 mismatch_pattern 也应用 C→T 容忍
         let query_seq = b"ACGTACGTACGTACGT";

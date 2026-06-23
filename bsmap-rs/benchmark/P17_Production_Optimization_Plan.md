@@ -13,7 +13,7 @@ Rust standalone index 是可复用步骤，继续单独计时，不并入 Rust/C
 | Phase 1 | PE interleaved pairing，对齐 C++ `RunAlign/GetPairs` 调度 | 暂缓，需 test-only fixture 先证明中间语义 | PE 降低 10% 到 30% | 降低 5% 到 15% | 提升 5 到 15 个百分点 | 中高 |
 | Phase 2 | PE/SAM direct writer，减少 pair/unpair 输出分配 | 已验证并撤回，短基准未达保留标准 | PE 降低 3% 到 8% | 降低 0% 到 3% | sys time 小幅下降 | 高 |
 | Phase 3 | bounded read-align-write pipeline 原型 | 仅保留为后续候选，本轮不默认启用 | 短基准 0% 到 5%；大样本估算 5% 到 20% | 增加约 1 个 batch | 提升 5 到 25 个百分点 | 中 |
-| Phase 4 | SIMD mismatch runtime dispatch | 先 microbench，未证实前不接入 | SE/RRBS 降低 3% 到 12%；也可能 0% | 基本不变 | 小幅提升或不变 | 中低 |
+| Phase 4 | SIMD mismatch runtime dispatch | test-only probe 已完成，结果混合，默认不接入 | SE/RRBS 降低 3% 到 12%；也可能 0% | 基本不变 | 小幅提升或不变 | 中低 |
 | Phase 5 | mmap/index 低风险审查 | v10 格式默认不改 | 降低 0% 到 5% | 降低 0% 到 8% | 基本不变 | 中低 |
 
 综合收益不得线性相加。P17 已证明 PE/SAM direct writer 在当前短基准下不能作为默认优化保留；完整 PE interleaved pairing 只有在中间 fixture 与短基准都达标后才进入生产代码。
