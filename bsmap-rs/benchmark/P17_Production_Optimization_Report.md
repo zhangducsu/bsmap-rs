@@ -57,6 +57,7 @@ Phase 1 的完整 PE interleaved pairing 仍是下一步最大收益点，但暂
 - 完整 SEQ/QUAL direct writer：`D:/BSMAP/benchmark-results/p17/pe-sam-direct-full-20260623T082000Z`
 - C++ pair-level order 生产候选：`D:/BSMAP/benchmark-results/p17/cpp-pair-order-20260623T093000Z`
 - `group_hits_by_chr` Vec 分组候选：`D:/BSMAP/benchmark-results/p17/group-hits-vec-20260623T101000Z`
+- read-chain split 缓存候选：`D:/BSMAP/benchmark-results/p17/cached-read-chain-splits-20260623T113000Z`
 
 正确性结果：
 
@@ -76,6 +77,7 @@ Phase 1 的完整 PE interleaved pairing 仍是下一步最大收益点，但暂
 | 完整 SEQ/QUAL direct writer | `20260623T082000Z` | +4.62% | +0.82% | PE 仍无收益，已撤回 |
 | C++ pair-level order 生产候选 | `20260623T093000Z` | +41.62% | +29.80% | 改变 example2/rrbs_pe 记录 SHA 且明显变慢，已撤回 |
 | `group_hits_by_chr` Vec 分组候选 | `20260623T101000Z` | +42.77% | +32.35% | PE 记录 SHA 与 P16 一致，但 wall time 明显回退，已撤回 |
+| read-chain split 缓存候选 | `20260623T113000Z` | +41.62% | +31.43% | PE 记录 SHA 与 P16 一致，但 wall time 明显回退，已撤回 |
 
 上述百分比均相对 P16 baseline `D:/BSMAP/benchmark-results/p16/sam-direct-warm-20260623T072000Z` 的 summary。Rust standalone index 独立计时，不并入 warm align 对比。
 
