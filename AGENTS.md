@@ -282,3 +282,10 @@
 - 原因：P16 runner 的第一个参数语义是仓库根目录，不是 `bsmap-rs` crate 目录；PowerShell、`wsl.exe`、Bash 多层参数边界会提前解释或丢失 `$` 变量。
 - 规避：正式运行时从仓库根目录调用：`bash bsmap-rs/benchmark/p16/run_short_validation.sh . <绝对结果目录>`。结果目录使用显式完整路径，不在一行 PowerShell 命令里依赖 `$RUN_ID` 拼接。
 - 验证：显式执行 `bash bsmap-rs/benchmark/p16/run_short_validation.sh . /mnt/d/BSMAP/benchmark-results/p16/sam-direct-warm-20260623T072000Z` 正常完成，example1 与 RRBS SE 均达到 Rust/C++ 完整逐行一致。
+
+### 31. 同一 linked worktree 的 Git index 操作不能并行
+
+- 现象：在同一个 linked worktree 上并行执行 `git status` 和 `git merge --ff-only`，merge 报 `index.lock: File exists`。
+- 原因：`status`、`merge`、`add`、`commit` 等命令都可能读写或刷新同一个 worktree index；并行执行会争用 `.git/worktrees/<name>/index.lock`。
+- 规避：同一 worktree 内所有会触碰 index 的 Git 命令必须串行执行。可以并行只读文件读取、`git log`、`git diff` 等不刷新 index 的查询；不确定时按会写 index 处理。
+- 验证：确认没有残留 Git 进程且 lock 自动消失后，串行执行 `git status --short --branch` 再执行 `git merge --ff-only codex/p16-engineering-performance`，main 成功 fast-forward 到 `29daa8f`。
