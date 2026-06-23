@@ -234,6 +234,13 @@
 - 规避：C++ PE 同时检查 signal 行、stderr、SAM 大小和外层退出码；运行前 `ulimit -c 0`。RSS 报告保留原始 KiB，并用 `KiB / 1,048,576` 给出 GiB。
 - 验证：WGBS example2 C++ PE 记录 signal 6、buffer overflow、0-byte SAM；mm10 C++ PE 记录 signal 6/134，均未伪装成有效对照。
 
+### 25. P16 优化候选必须同环境覆盖 WGBS 与 RRBS
+
+- 现象：ThinLTO、`codegen-units=1`、`panic=abort`、PE 临时对象复用等候选在 WGBS 小样本上看似变快，但同环境 mm10 RRBS SE/PE 会变慢，甚至 PE wall 回退约 9% 到 12%。
+- 原因：BSMAP-rs 的 WGBS 小 reference、RRBS mmap 大索引、PE pairing 和 SAM 输出瓶颈不同；单一 workload 的收益不能代表全局收益。
+- 规避：任何默认性能优化必须用同一脚本、同一机器、同一 binary 构建口径比较 P15/P16，至少覆盖 WGBS example1/example2 和 mm10 RRBS SE/PE 10K。Rust standalone index 必须单独计时，不得混入 align wall time。
+- 验证：P16 保留 `benchmark/p16/run_short_validation.sh`；负收益候选写入 `benchmark/P16_Engineering_Optimization_Report.md`，未达标优化必须撤回，不得只凭直觉保留。
+
 ### 25. 托管沙箱可能隐藏 WSL 发行版
 
 - 现象：托管沙箱内执行 `wsl.exe --list --verbose` 返回“没有已安装发行版”，同一会话在沙箱外执行却能列出 Ubuntu 和 `docker-desktop`，均为 WSL2。

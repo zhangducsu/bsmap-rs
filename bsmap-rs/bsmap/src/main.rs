@@ -10,7 +10,7 @@
 //! 4. `bsmap -a reads.fq -d ref.fa`: 等价于 `bsmap align`（向后兼容）
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -554,7 +554,7 @@ fn run_single_align(
     let mut reader = FastqReader::open(query_path, config.gz_input)?;
 
     // 创建进度条
-    let progress = ProgressBar::new(0);
+    let progress = progress_bar(0);
     progress.set_style(
         ProgressStyle::default_bar()
             .template("{elapsed} {wide_bar} {pos} reads ({per_sec})")?,
@@ -659,7 +659,7 @@ fn run_paired_align(
     let mut reader_b = FastqReader::open(query_b, config.gz_input)?;
 
     // 创建进度条
-    let progress = ProgressBar::new(0);
+    let progress = progress_bar(0);
     progress.set_style(
         ProgressStyle::default_bar()
             .template("{elapsed} {wide_bar} {pos} pairs ({per_sec})")?,
@@ -776,6 +776,14 @@ fn run_paired_align(
     info!("双端比对完成");
 
     Ok(())
+}
+
+fn progress_bar(len: u64) -> ProgressBar {
+    if std::io::stderr().is_terminal() {
+        ProgressBar::new(len)
+    } else {
+        ProgressBar::hidden()
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
