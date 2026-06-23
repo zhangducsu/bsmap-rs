@@ -2,12 +2,12 @@
 
 ## 1. 目的
 
-原有 WGBS example1/example2 使用 1 Mb `chr22_tail_1M.fa`，对 S1 的 pipeline、PE pairing、I/O 和大索引访问优化压力不足。S1 新增基于完整 mm10 reference 的 WGBS 10K fixture，用于后续替代或补充 example1/example2：
+原有 WGBS example1/example2 使用 1 Mb `chr22_tail_1M.fa`，对 S1 的 pipeline、PE pairing、I/O 和完整 mm10 大索引访问优化压力不足。S1 将基于完整 mm10 reference 的 WGBS 10K fixture 作为正式 WGBS 短基准数据：
 
 - mm10 WGBS SE 75 bp，10,000 reads。
 - mm10 WGBS PE 150 bp，10,000 pairs。
 
-生成数据不提交到 Git，固定保存在本机 D 盘 benchmark 数据目录。
+旧 `chr22_tail_1M.fa` example1/example2 只保留为快速 smoke 或历史回归参考，不再作为 S1 的主要 WGBS 验收数据。生成数据不提交到 Git，固定保存在本机 D 盘 benchmark 数据目录。
 
 ## 2. 生成工具
 
@@ -23,7 +23,7 @@
 - SHA256：`db16cb4633191754f1d9cc70e73d2a1f60d03fdf62bcf4902a31a4717a3d2de7`
 - 大小：约 2.6 GB。
 
-## 4. 参数
+## 4. 生成参数
 
 SE：
 
@@ -72,11 +72,16 @@ gzip -cd /mnt/d/BSMAP/benchmark-data/mm10/wgbs_10k/pe150_10k/simulated_2.fastq.g
 
 结果均为 `40000` 行，即每个 FASTQ 文件 10,000 条记录。
 
-## 7. 后续 benchmark 建议
+## 7. S1 benchmark 口径
 
-新增 S1 WGBS mm10 测试项：
+正式 WGBS 短基准：
 
 - mm10 WGBS SE 10K：`-s 16 -v 0.08 -I 4 -p 8 -S 1`
 - mm10 WGBS PE 10K：`-s 16 -v 0.08 -I 4 -p 8 -S 1`
+
+正式 WGBS 长程基准统一改为 5G：
+
+- mm10 WGBS PE 5G：基于 `pe150_10k` fixture 流式 repeat，使用 `TARGET_SOURCE_BYTES=5G`。
+- 若后续增加 WGBS SE 长程基准，也必须使用 5G 数据口径，不再使用 90G。
 
 Rust standalone WGBS index 必须单独计时，不并入 Rust/C++ 单样本 align 时间比较。若 C++ 在完整 mm10 WGBS 10K 上可成功输出，则 S1 后续应增加 Rust/C++ 的 `RNAME/POS/FLAG/NM/ZP/ZL` 与完整记录一致性检查；若 C++ 失败，必须如实记录退出码和 stderr。

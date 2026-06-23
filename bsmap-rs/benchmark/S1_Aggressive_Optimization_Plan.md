@@ -12,11 +12,11 @@ Rust standalone index 仍然单独计时，不并入 Rust/C++ 单样本 align �
 
 ### 2.1 P15/P16 已保留收益
 
-- WGBS v8 succinct index 已将 example1 index 从 519,037,888 bytes 降到 13,691,272 bytes，example1 RSS 从约 509 MiB 降到约 23 MiB。
+- WGBS v8 succinct index 已将旧 example1 index 从 519,037,888 bytes 降到 13,691,272 bytes，旧 example1 RSS 从约 509 MiB 降到约 23 MiB。S1 后续短基准不再只依赖 1 Mb `chr22_tail_1M.fa`，改用完整 mm10 reference 生成的 WGBS 10K fixture。
 - RRBS v10 packed hit + forward-only build 已将 mm10 RRBS index 降到 1,041,871,696 bytes，standalone index wall 降到 33.86 s，RSS 降到 1,278,988 KiB。
 - P16 direct SE SAM formatting 在四个短基准均有小幅收益：WGBS/RRBS wall 降低约 4.67% 到 8.16%。
-- RRBS PE 10G 长测成功，13,560,000 read pairs、10.0G source bytes、wall 1,806.98 s、CPU 1499%、RSS 0.968 GiB，证明 RRBS 大样本已常数内存且能吃满大部分 CPU。
-- WGBS PE 90G 检查中止前已处理约 109 GB 解压 FASTQ，`bsmap` CPU 约 181%、RSS 33,624 KiB，说明 WGBS 大样本内存稳定，但吞吐受 pipeline、输出或调度限制，CPU 未充分利用。
+- RRBS PE 10G 历史长测成功，13,560,000 read pairs、10.0G source bytes、wall 1,806.98 s、CPU 1499%、RSS 0.968 GiB，证明 RRBS 大样本已常数内存且能吃满大部分 CPU。S1 正式长测统一降为 5G，用于缩短迭代周期。
+- WGBS PE 90G 历史检查中止前已处理约 109 GB 解压 FASTQ，`bsmap` CPU 约 181%、RSS 33,624 KiB，说明 WGBS 大样本内存稳定，但吞吐受 pipeline、输出或调度限制，CPU 未充分利用。S1 正式 WGBS 长测统一使用 5G。
 
 ### 2.2 P17 已证伪的低收益方向
 
@@ -39,15 +39,15 @@ Rust standalone index 仍然单独计时，不并入 Rust/C++ 单样本 align �
 
 | 排名 | 优化点 | 主要受益场景 | wall time 估算 | RSS/内存估算 | CPU 利用率估算 | 置信度 | 结论 |
 |---:|---|---|---:|---:|---:|---|---|
-| 1 | bounded streaming pipeline + stage scheduler | WGBS 90G PE、gzip FASTQ、SAM 输出 | 大样本降低 20% 到 45%；短基准 0% 到 10% | 增加 1 到 3 个 batch，可控 | WGBS PE 从约 181% 提升到 400% 到 900% | 中高 | S1 第一主线 |
-| 2 | C++ 等价 PE interleaved pairing | WGBS PE、RRBS PE | PE 降低 15% 到 40%；RRBS PE 10G 降低 10% 到 25% | 临时 pair/hit 分配降低 30% 到 70% | 提升 5 到 20 个百分点 | 中 | S1 第二主线 |
+| 1 | bounded streaming pipeline + stage scheduler | WGBS 5G PE、gzip FASTQ、SAM 输出 | 大样本降低 20% 到 45%；短基准 0% 到 10% | 增加 1 到 3 个 batch，可控 | WGBS PE 从约 181% 提升到 400% 到 900% | 中高 | S1 第一主线 |
+| 2 | C++ 等价 PE interleaved pairing | WGBS PE、RRBS PE | PE 降低 15% 到 40%；RRBS PE 5G 降低 10% 到 25% | 临时 pair/hit 分配降低 30% 到 70% | 提升 5 到 20 个百分点 | 中 | S1 第二主线 |
 | 3 | read arena + fused trim/encode | 所有 FASTQ，尤其大样本 WGBS | WGBS 降低 8% 到 20%；RRBS 降低 3% 到 8% | 每 read heap allocation 降低 60% 到 90% | 小幅提升 | 中高 | 随 pipeline 实施 |
 | 4 | direct ordered pair writer + byte buffer | SAM 输出占比较高的 PE | PE 降低 5% 到 15%；大 SAM 输出可能更高 | 输出临时 String 降低 50% 到 90% | sys time 降低 | 中 | 只有配合 pipeline 才做 |
 | 5 | native BAM/direct BGZF 输出路径 | 生产直接下游 BAM/管道 | 输出字节降低 40% 到 80%；wall 取决于压缩等级 | SAM 中间文本接近 0 | CPU 可能上升 | 中低 | 作为可选生产模式，不影响 SAM parity |
 | 6 | profile-guided mismatch/kernel dispatch | RRBS/PE mismatch 热点 | 3% 到 12%，也可能为 0 | 基本不变 | 小幅提升 | 中低 | 后置，必须 profiler 证明 |
 | 7 | RRBS mmap/index 微调 | RRBS 大索引冷启动 | 0% 到 8% | 0% 到 8% | 基本不变 | 低 | 非主线，避免重复 P15/P17 坑 |
 
-综合收益不能线性相加。S1 的现实目标是：WGBS PE 90G 吞吐提高 25% 到 60%；RRBS PE 10G wall 降低 15% 到 35%；短基准不要求巨大收益，但必须无正确性回归。
+综合收益不能线性相加。S1 的现实目标是：WGBS PE 5G 吞吐提高 25% 到 60%；RRBS PE 5G wall 降低 15% 到 35%；短基准不要求巨大收益，但必须无正确性回归。
 
 ## 4. S1 架构方案
 
@@ -123,8 +123,9 @@ P17 证明“只改 formatter”收益不稳定，因此 S1 只在 pipeline 和 
 目标：先证明最大热点，防止激进重构跑偏。
 
 - 新增 `benchmark/s1/`，复用 P15/P16 runner，但支持同轮 baseline/candidate back-to-back。
-- 固定四个短基准：WGBS example1、WGBS example2、mm10 RRBS SE 10K、mm10 RRBS PE 10K。
-- 固定两个大样本：RRBS PE 10G、WGBS PE 90G 或 10G 快速替代。
+- 固定四个短基准：mm10 WGBS SE 10K、mm10 WGBS PE 10K、mm10 RRBS SE 10K、mm10 RRBS PE 10K。
+- 固定两个长程样本：RRBS PE 5G、WGBS PE 5G，均用 `TARGET_SOURCE_BYTES=5G`。
+- 旧 `chr22_tail_1M.fa` example1/example2 只作为快速 smoke 或历史回归参考，不再作为 S1 主要 WGBS 验收数据。
 - 记录阶段耗时：read/decompress、process/encode、align、format/write、wait/order。
 - 记录 CPU：`/usr/bin/time -v`、perf stat、RSS、major/minor faults、SAM bytes、records、binary/input/index SHA。
 - 增加 allocation counter feature 或 heaptrack/DHAT 脚本，用于证明 arena/direct writer 是否值得。
@@ -143,8 +144,8 @@ P17 证明“只改 formatter”收益不稳定，因此 S1 只在 pipeline 和 
 
 验收：
 
-- example1 完整 SAM 与 C++ 100% 一致。
-- example2、RRBS PE p1/p8 SAM SHA 与 P16 golden 一致。
+- mm10 WGBS SE 10K 完整 SAM 与 C++ 100% 一致；若 C++ 失败，记录退出码和 stderr。
+- mm10 WGBS PE 10K 与 RRBS PE 10K 的 Rust p1/p8 SAM SHA 稳定；C++ PE 若继续失败，按既有限制记录。
 - WGBS 大样本 CPU 利用率明显提升，wall 降低至少 15%，否则不作为默认启用。
 
 ### Phase 2：read arena + fused encode
@@ -159,7 +160,7 @@ P17 证明“只改 formatter”收益不稳定，因此 S1 只在 pipeline 和 
 验收：
 
 - 每 read heap allocation 降低至少 60%。
-- WGBS PE example2 或大样本 wall 降低至少 8%。
+- mm10 WGBS PE 10K 或 WGBS PE 5G wall 降低至少 8%。
 - 所有 SAM parity 不变。
 
 ### Phase 3：PE interleaved pairing
@@ -174,9 +175,9 @@ P17 证明“只改 formatter”收益不稳定，因此 S1 只在 pipeline 和 
 
 验收：
 
-- example2 PE p1/p8 SHA 稳定。
+- mm10 WGBS PE 10K p1/p8 SHA 稳定。
 - RRBS PE 10K 仍为 4,884 records，Top chr1 不异常。
-- PE 短基准 wall 至少降低 10%；RRBS PE 10G wall 至少降低 15%。
+- PE 短基准 wall 至少降低 10%；RRBS PE 5G wall 至少降低 15%。
 
 ### Phase 4：ordered direct writer
 
@@ -230,15 +231,15 @@ git diff --check
 
 短基准正确性：
 
-- WGBS example1：Rust/C++ 非 header SAM 完整逐行 100% 一致；`RNAME/POS/FLAG/NM/ZP/ZL` diff 为 0。
-- WGBS example2：Rust p1/p8 完整 SAM SHA 与 P16 golden 一致；C++ PE 若继续 signal 6，按失败记录。
+- mm10 WGBS SE 10K：Rust/C++ 非 header SAM 完整逐行 100% 一致；`RNAME/POS/FLAG/NM/ZP/ZL` diff 为 0。若 C++ 在完整 mm10 WGBS SE 10K 上失败，必须记录退出码和 stderr，并以 Rust p1/p8 稳定性作为临时回归门槛。
+- mm10 WGBS PE 10K：Rust p1/p8 完整 SAM SHA 一致；若 C++ PE 成功，则增加 Rust/C++ 完整记录和字段 diff；若 C++ PE 失败，按失败记录。
 - mm10 RRBS SE 10K：Rust/C++ 2,423 条完整逐行 100% 一致；字段 diff 为 0。
 - mm10 RRBS PE 10K：Rust 4,884 records；p1/p8 SHA 一致；Top chr1 不异常。
 
 大样本性能：
 
-- RRBS PE 10G：保持常数 RSS，不高于 P15/P16 同口径 1.05 GiB 10%；wall 至少降低 15% 才能宣称 S1 PE 收益。
-- WGBS PE 90G 或 10G 替代：RSS 保持几十 MiB 到可解释 batch 上界；wall 至少降低 20% 或 CPU 利用率至少翻倍，才默认启用 pipeline。
+- RRBS PE 5G：保持常数 RSS，不高于 P15/P16 同口径 1.05 GiB 10%；wall 至少降低 15% 才能宣称 S1 PE 收益。
+- WGBS PE 5G：RSS 保持几十 MiB 到可解释 batch 上界；wall 至少降低 20% 或 CPU 利用率至少翻倍，才默认启用 pipeline。
 
 ## 7. 风险与回退
 
