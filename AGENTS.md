@@ -275,3 +275,10 @@
 - 原因：DrvFS 通过 Windows 文件系统桥接大 mmap/random access，页缓存、缺页和 metadata 行为与原生 Linux ext4 差异很大；这会掩盖 Rust 索引布局本身的真实收益。
 - 规避：正式 Linux/部署性能数字使用 WSL ext4 或服务器 Docker ext4/overlay；D 盘 DrvFS 结果只能作为 Windows 文件系统限制记录。大型输入和结果可留在 D 盘，但会被频繁 mmap 的 `.bsi` 和 reference 应复制/硬链接到 ext4。
 - 验证：v10 forward-only ext4 index SHA 与 DrvFS v10 index SHA 均为 `d7afbc84...`，说明数据等价；性能差异来自文件系统路径而非索引内容。
+
+### 30. P16 runner 的 repo root 与 run-id 参数边界
+
+- 现象：从 `bsmap-rs` 子目录执行 `run_short_validation.sh . ...` 时，脚本会查找 `bsmap-rs/bsmap-rs/target/release/bsmap` 并失败；从 PowerShell 调用 WSL 时使用 Bash 变量 `$RUN_ID` 作为输出目录，变量可能在跨 shell 边界被吃掉，结果写入 `D:/BSMAP/benchmark-results/p16/` 根目录。
+- 原因：P16 runner 的第一个参数语义是仓库根目录，不是 `bsmap-rs` crate 目录；PowerShell、`wsl.exe`、Bash 多层参数边界会提前解释或丢失 `$` 变量。
+- 规避：正式运行时从仓库根目录调用：`bash bsmap-rs/benchmark/p16/run_short_validation.sh . <绝对结果目录>`。结果目录使用显式完整路径，不在一行 PowerShell 命令里依赖 `$RUN_ID` 拼接。
+- 验证：显式执行 `bash bsmap-rs/benchmark/p16/run_short_validation.sh . /mnt/d/BSMAP/benchmark-results/p16/sam-direct-warm-20260623T072000Z` 正常完成，example1 与 RRBS SE 均达到 Rust/C++ 完整逐行一致。

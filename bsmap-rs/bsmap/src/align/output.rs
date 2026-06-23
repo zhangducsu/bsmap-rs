@@ -11,6 +11,7 @@
 use crate::align::Chain;
 use crate::param::{AlignConfig, GHit, ReadInf};
 use crate::reference::binseq::BinSeqCollection;
+use std::fmt::Write as _;
 
 /// 输出格式枚举。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,13 +71,44 @@ pub fn format_sam(
     read: &ReadInf,
     hit: &GHit,
     coll: &BinSeqCollection,
-    config: &AlignConfig,
+    _config: &AlignConfig,
     is_unique: bool,
     total_hits: usize,
     rrbs_fragment: Option<(u32, u32)>,
 ) -> String {
-    let record = build_record(read, hit, coll, config, is_unique, total_hits, rrbs_fragment);
-    format_sam_record(&record)
+    let chain = Chain::from_strand(hit.strand);
+    let flag = calculate_flag(chain, is_unique, total_hits);
+    let mapq = calculate_mapq(hit.snps as u32, is_unique, total_hits);
+    let cigar = make_cigar(
+        read.seq.len() as u32,
+        hit.gap_size as i8,
+        hit.gap_pos as u8,
+    );
+    let rev_seq = !chain.is_ref_forward();
+    let (seq, qual) = select_output_seq(read, rev_seq);
+    let zs = make_zs_tag_str(
+        if chain.is_ref_forward() { 0 } else { 1 },
+        if chain.is_read_forward() { 0 } else { 1 },
+    );
+    let ref_name = get_reference_name_ref(hit.chr, coll);
+    let pos = hit.loc + 1;
+
+    let mut output = String::with_capacity(
+        read.name.len() + ref_name.len() + cigar.len() + seq.len() + qual.len() + 64,
+    );
+    write!(
+        &mut output,
+        "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}\tNM:i:{}",
+        read.name, flag, ref_name, pos, mapq, cigar, seq, qual, hit.snps
+    )
+    .expect("writing to String cannot fail");
+    if let Some((position, length)) = rrbs_fragment {
+        write!(&mut output, "\tZP:i:{}\tZL:i:{}", position, length)
+            .expect("writing to String cannot fail");
+    }
+    output.push_str("\tZS:Z:");
+    output.push_str(zs);
+    output
 }
 
 /// 格式化比对结果为 BSP 记录。
@@ -148,11 +180,12 @@ pub fn format_bsp(
 }
 
 /// 构建比对记录。
+#[cfg(test)]
 fn build_record(
     read: &ReadInf,
     hit: &GHit,
     coll: &BinSeqCollection,
-    config: &AlignConfig,
+    _config: &AlignConfig,
     is_unique: bool,
     total_hits: usize,
     rrbs_fragment: Option<(u32, u32)>,
@@ -209,6 +242,7 @@ fn build_record(
 }
 
 /// 格式化 SAM 记录。
+#[cfg(test)]
 fn format_sam_record(record: &AlignmentRecord) -> String {
     // SAM 格式：
     // QNAME\tFLAG\tRNAME\tPOS\tMAPQ\tCIGAR\tRNEXT\tPNEXT\tTLEN\tSEQ\tQUAL\t[TAG:TYPE:VALUE...]
@@ -282,12 +316,17 @@ pub fn make_cigar(map_readlen: u32, gap_size: i8, gap_pos: u8) -> String {
 /// # 返回值
 /// ZS 标签字符串
 pub fn make_zs_tag(ref_chain: u8, read_chain: u8) -> String {
+    make_zs_tag_str(ref_chain, read_chain).to_string()
+}
+
+/// 生成 ZS 标签静态字符串，供热输出路径避免每条记录分配。
+pub fn make_zs_tag_str(ref_chain: u8, read_chain: u8) -> &'static str {
     match (ref_chain, read_chain) {
-        (0, 0) => "++".to_string(), // BSW++
-        (0, 1) => "+-".to_string(), // BSC+-
-        (1, 0) => "-+".to_string(), // BSW-+
-        (1, 1) => "--".to_string(), // BSC--
-        _ => "++".to_string(),
+        (0, 0) => "++", // BSW++
+        (0, 1) => "+-", // BSC+-
+        (1, 0) => "-+", // BSW-+
+        (1, 1) => "--", // BSC--
+        _ => "++",
     }
 }
 
@@ -374,11 +413,16 @@ fn calculate_mapq(_snps: u32, _is_unique: bool, _total_hits: usize) -> u8 {
 
 /// 获取参考序列名称（P11-8: 返回预计算 accession，零分配）。
 pub fn get_reference_name(chr: u32, coll: &BinSeqCollection) -> String {
+    get_reference_name_ref(chr, coll).to_string()
+}
+
+/// 借用参考序列 accession，供热输出路径避免 per-record String clone。
+pub fn get_reference_name_ref<'a>(chr: u32, coll: &'a BinSeqCollection) -> &'a str {
     let chr_idx = chr as usize;
     if chr_idx < coll.chr_accessions.len() {
-        coll.chr_accessions[chr_idx].clone()
+        &coll.chr_accessions[chr_idx]
     } else {
-        "unknown".to_string()
+        "unknown"
     }
 }
 
@@ -570,6 +614,7 @@ mod tests {
         assert_eq!(make_zs_tag(0, 1), "+-");
         assert_eq!(make_zs_tag(1, 0), "-+");
         assert_eq!(make_zs_tag(1, 1), "--");
+        assert_eq!(make_zs_tag_str(1, 0), "-+");
     }
 
     #[test]
@@ -680,6 +725,27 @@ mod tests {
         assert!(sam.contains("NM:i:0"));
         assert!(sam.contains("\tZP:i:81\tZL:i:120\tZS:Z:++"));
         assert!(sam.contains("ZS:Z:++"));
+    }
+
+    #[test]
+    fn test_format_sam_matches_record_formatter() {
+        let refs = vec![crate::reference::fasta::Reference {
+            name: "chr1 full description".to_string(),
+            seq: b"ACGT".repeat(100).to_vec(),
+            len: 400,
+        }];
+        let coll = crate::reference::binseq::BinSeqCollection::from_references(&refs);
+        let read = make_test_read();
+        let mut hit = make_test_hit();
+        hit.strand = 2;
+        hit.snps = 1;
+        let config = make_test_config();
+        let fragment = Some((81, 120));
+
+        let direct = format_sam(&read, &hit, &coll, &config, false, 2, fragment);
+        let record = build_record(&read, &hit, &coll, &config, false, 2, fragment);
+
+        assert_eq!(direct, format_sam_record(&record));
     }
 
     #[test]
