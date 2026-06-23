@@ -123,6 +123,18 @@ example1 的 `RNAME/POS/FLAG/NM/ZP/ZL` 差异全部为 0；example2 p1/p8 完整
 
 原始结果：`D:/BSMAP/benchmark-results/p15/phase34-wgbs-v9-regression`。
 
+### 5.5 已回退的 section advice 实验
+
+在 v9 上分别测试 `rrbs_hits=MADV_NORMAL` 和 `rrbs_hits=MADV_WILLNEED`，`refcat` 保持 random。两种实现都保持 2,423 条和 SHA `420e34a3...`，但没有达到综合性能门槛：
+
+| 策略 | wall 中位 | 最坏 RSS | major faults 中位 | 结论 |
+|---|---:|---:|---:|---|
+| v9 全 RRBS random 基线 | 8.61 s | 829,560 KiB | 207,813 | 保留 |
+| hits normal | 9.11 s | 927,984 KiB | 149,159 | wall/RSS 回退，撤销 |
+| hits willneed | 9.93 s | 928,144 KiB | 147,022 | wall/RSS 回退，撤销 |
+
+降低 major faults 并未降低端到端 wall，说明 DrvFS 上内核预读把显式 fault 换成了更大的驻留集和 I/O 压力。原始结果位于 `phase3-section-advice` 和 `phase3-willneed`；生产代码已恢复 v9 random 基线。
+
 ## 6. 当前未完成项
 
 1. Phase 3：RRBS logical bucket、共享/section-scoped mmap、major faults 和 sys time 优化。

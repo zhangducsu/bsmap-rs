@@ -247,3 +247,24 @@
 - 原因：`FastqReader` 打开 R1 后会先读取格式字节，再打开 R2，而且后续也可能按 mate 分批读取。单 writer 会阻塞在打开 R2；按 pair 向两个 bounded writer 锁步投递时，R2 管道/队列先填满又会反向阻塞 R1，形成第二种死锁。
 - 规避：R1、R2 必须由两个完全独立的常数内存 producer 流式输出，使用相同 repeat count，结束后核对 records 数。PE 规模测试使用 `TARGET_SOURCE_BYTES` 或 `REPEATS`；不能用需要逐 pair 联动停止的 `TARGET_EMITTED_BYTES`。
 - 验证：POSIX FIFO 单测按“读取完 R1 后才打开并读取 R2”的顺序执行，两个 mate 均完整输出且线程正常退出；example2 smoke run `20260622T145010Z.meNSxk` 在 1.17 秒完成，66,958 条 SAM 的 SHA256 与 P15 Phase 1 完全一致。
+
+### 27. RRBS hit section 预读会用 RSS 和尾延迟换取部分缺页下降
+
+- 现象：RRBS v9 对 `rrbs_hits` 恢复默认 `MADV_NORMAL`，SE major faults 中位从 207,813 降到约 149,159，但 wall 从 8.61 秒退化到 9.11 秒，最坏 RSS 从 829,560 KiB 增至 927,984 KiB；改为 `MADV_WILLNEED` 后 wall 中位进一步退化到 9.93 秒，RSS 仍约 928 MiB。
+- 原因：393 MB hit section 的内核预读减少了显式 major fault 次数，却扩大驻留集并引入额外 I/O/缓存压力；在本机 WSL2 + D 盘 DrvFS 上，缺页计数下降不等于端到端 wall 改善。
+- 规避：RRBS v9 暂时保持全 RRBS mmap 的 `MADV_RANDOM` 基线。任何 section advice 或 readahead 实验必须同时比较三轮中位 wall、最坏 RSS、major faults 和 SAM SHA；不得只因 faults 下降就保留。
+- 验证：`D:/BSMAP/benchmark-results/p15/phase3-section-advice` 与 `phase3-willneed` 均保持 2,423 条和 SHA `420e34a3...`，但性能门槛失败，代码已精确回退。
+
+### 28. PowerShell 到 WSL 的含空格环境变量会被拆分
+
+- 现象：从 PowerShell 调用 WSL 时写 `env THREAD_MATRIX="1 2 4 8 16" bash ...`，脚本没有执行线程矩阵，反而打印了环境变量列表。
+- 原因：PowerShell、`wsl.exe` 和 Bash 的多层参数边界会重新拆分带空格的环境变量值；外层看似已经加引号，进入 Linux 侧后仍可能被拆成多个 argv。
+- 规避：正式 benchmark 不通过一行命令传递带空格的 env 值；优先使用脚本默认矩阵，或在 Bash 脚本内部/临时配置文件中设置。需要传递时用完整单引号 Bash command 并在 Linux 侧 `printf '%q\n' "$THREAD_MATRIX"` 自检。
+- 验证：去掉跨边界的 `THREAD_MATRIX="1 2 4 8 16"` 后，`run_thread_matrix.sh` 默认生成 p1/p2/p4/p8/p16 共 15 个 run，并输出 `thread_matrix.json`。
+
+### 29. DrvFS 会放大 mm10 RRBS 索引与比对的缺页和 wall time
+
+- 现象：同一 v10 mm10 RRBS 索引在 D 盘 DrvFS 构建约 64.00 秒，在 WSL ext4 forward-only 构建约 33.86 秒；RRBS alignment 在 ext4 上 major faults 接近 50 到 60，而 DrvFS v9 约 20 万级。
+- 原因：DrvFS 通过 Windows 文件系统桥接大 mmap/random access，页缓存、缺页和 metadata 行为与原生 Linux ext4 差异很大；这会掩盖 Rust 索引布局本身的真实收益。
+- 规避：正式 Linux/部署性能数字使用 WSL ext4 或服务器 Docker ext4/overlay；D 盘 DrvFS 结果只能作为 Windows 文件系统限制记录。大型输入和结果可留在 D 盘，但会被频繁 mmap 的 `.bsi` 和 reference 应复制/硬链接到 ext4。
+- 验证：v10 forward-only ext4 index SHA 与 DrvFS v10 index SHA 均为 `d7afbc84...`，说明数据等价；性能差异来自文件系统路径而非索引内容。

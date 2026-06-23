@@ -9,6 +9,7 @@
 - `stream_fastq.py`：逐记录解压并重复 FASTQ，直接写入 FIFO；不会生成 90G/10G 中间 FASTQ。
 - `slow_sink.py`：常数内存消费 SAM FIFO，可限速以验证输出背压。
 - `run_stream_scale.sh`：串起 producer、Rust align、sink、GNU time 和 SHA256，生成单轮 `summary.json`。
+- `run_thread_matrix.sh`：对 p1/p2/p4/p8/p16 各运行三轮，并调用 `summarize_matrix.py` 校验 SAM 后汇总扩展曲线。
 
 ## 规模口径
 
@@ -36,6 +37,15 @@ GIT_COMMIT=<sha> TARGET_SOURCE_BYTES=10G THREADS=8 \
 输出背压使用相同输入另跑一轮，例如 `SINK_MIB_PER_SEC=25`。`PAGE_CACHE_STATE` 只记录调用方已建立的 `cold`、`warm` 或 `uncontrolled` 状态；runner 不以 root 权限清理 page cache。正式线程扩展曲线对相同 workload 分别设置 `THREADS=1,2,4,8,16`，每个点至少三轮并报告中位 wall、最坏 RSS 和 page-cache 状态。
 
 每个 run 保存 binary/reference/index/read SHA256、完整命令、参数、producer/sink 统计、退出码、GNU time 原文与 JSON。`summary.json` 只有在 align、producer、sink 都成功且 GNU time 未报告 signal 时才标记 `successful=true`。
+
+线程矩阵示例：
+
+```bash
+GIT_COMMIT=<sha> REPEATS=1 SEED_SIZE=12 DIGESTION_SITE=C-CGG \
+  bash run_thread_matrix.sh REPO_ROOT REFERENCE READ_1 RUNS_ROOT
+```
+
+PE 通过环境变量 `READ_2` 指定 mate。`THREAD_MATRIX` 和 `MATRIX_REPETITIONS` 可覆盖默认值，但正式矩阵使用 `1 2 4 8 16` 和三轮。
 
 ## 正确性工具
 

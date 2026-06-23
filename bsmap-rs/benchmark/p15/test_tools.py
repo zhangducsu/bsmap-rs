@@ -3,16 +3,21 @@
 import json
 import os
 import struct
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
 
 from index_sections import HEADER_SIZE, inspect_index
 from metrics import parse_elapsed, parse_gnu_time
 from slow_sink import consume
 from stream_fastq import FastqError, iter_fastq, parse_size, stream_fastq
 from summarize_scale import summarize
+from summarize_matrix import summarize_matrix
 
 
 FASTQ_1 = b"@read1\nACGT\n+\nIIII\n"
@@ -248,6 +253,36 @@ class SinkAndSummaryTest(unittest.TestCase):
             self.assertTrue(result["successful"])
             self.assertEqual(result["input_throughput_mib_per_sec"], 1.0)
             self.assertEqual(result["max_rss_gib"], 1.0)
+
+    def test_thread_matrix_checks_hash_and_computes_speedup(self):
+        def run(threads, wall, rss):
+            return {
+                "summary_path": f"p{threads}/{wall}.json",
+                "successful": True,
+                "metadata": {"threads": str(threads)},
+                "sink": {"sha256": "abc", "sam_record_lines": 10},
+                "time": {
+                    "elapsed_seconds": wall,
+                    "user_seconds": wall * threads,
+                    "system_seconds": 0.1,
+                    "cpu_percent": threads * 100,
+                    "max_rss_kib": rss,
+                    "major_page_faults": 2,
+                },
+            }
+
+        result = summarize_matrix(
+            [run(1, 8.0, 100), run(1, 10.0, 110), run(2, 5.0, 120), run(2, 4.0, 130)]
+        )
+        self.assertEqual(result["run_count"], 4)
+        self.assertEqual(result["rows"][0]["median_wall_seconds"], 9.0)
+        self.assertEqual(result["rows"][1]["speedup_vs_p1"], 2.0)
+        self.assertEqual(result["rows"][1]["worst_rss_kib"], 130)
+
+        mismatched = [run(1, 8.0, 100), run(2, 4.0, 120)]
+        mismatched[1]["sink"]["sha256"] = "different"
+        with self.assertRaises(ValueError):
+            summarize_matrix(mismatched)
 
 
 if __name__ == "__main__":
