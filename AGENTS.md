@@ -257,10 +257,10 @@
 
 ### 28. PowerShell 到 WSL 的含空格环境变量会被拆分
 
-- 现象：从 PowerShell 调用 WSL 时写 `env THREAD_MATRIX="1 2 4 8 16" bash ...`，脚本没有执行线程矩阵，反而打印了环境变量列表。
-- 原因：PowerShell、`wsl.exe` 和 Bash 的多层参数边界会重新拆分带空格的环境变量值；外层看似已经加引号，进入 Linux 侧后仍可能被拆成多个 argv。
-- 规避：正式 benchmark 不通过一行命令传递带空格的 env 值；优先使用脚本默认矩阵，或在 Bash 脚本内部/临时配置文件中设置。需要传递时用完整单引号 Bash command 并在 Linux 侧 `printf '%q\n' "$THREAD_MATRIX"` 自检。
-- 验证：去掉跨边界的 `THREAD_MATRIX="1 2 4 8 16"` 后，`run_thread_matrix.sh` 默认生成 p1/p2/p4/p8/p16 共 15 个 run，并输出 `thread_matrix.json`。
+- 现象：从 PowerShell 调用 WSL 时写 `env THREAD_MATRIX="1 2 4 8 16" bash ...`，脚本没有执行线程矩阵，反而打印了环境变量列表；跨边界传 `grep -E "a|b"`、Bash here-doc 或嵌套 Python 字符串时也会出现 pattern 被当作管道、变量丢失或引号被吃掉。
+- 原因：PowerShell、`wsl.exe` 和 Bash 的多层参数边界会重新拆分带空格、`|`、`$`、here-doc 和嵌套引号的参数；外层看似已经加引号，进入 Linux 侧后仍可能变成不同 argv 或不同 shell 语法。
+- 规避：正式 benchmark 不通过一行命令传递带空格的 env 值或复杂脚本片段；优先使用仓库脚本、脚本默认矩阵、临时脚本文件或简单 `cat/ps` 轮询。需要传递时用完整单引号 Bash command，并在 Linux 侧用 `printf '%q\n' "$VAR"` 或 `bash -n` 自检。
+- 验证：去掉跨边界的 `THREAD_MATRIX="1 2 4 8 16"` 后，`run_thread_matrix.sh` 默认生成 p1/p2/p4/p8/p16 共 15 个 run，并输出 `thread_matrix.json`；RRBS/WGBS 长测改用简单 `env ... bash run_stream_scale.sh` 后正常启动。
 
 ### 29. DrvFS 会放大 mm10 RRBS 索引与比对的缺页和 wall time
 
