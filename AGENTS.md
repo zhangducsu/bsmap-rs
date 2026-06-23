@@ -282,3 +282,10 @@
 - 原因：P16 runner 的第一个参数语义是仓库根目录，不是 `bsmap-rs` crate 目录；PowerShell、`wsl.exe`、Bash 多层参数边界会提前解释或丢失 `$` 变量。
 - 规避：正式运行时从仓库根目录调用：`bash bsmap-rs/benchmark/p16/run_short_validation.sh . <绝对结果目录>`。结果目录使用显式完整路径，不在一行 PowerShell 命令里依赖 `$RUN_ID` 拼接。
 - 验证：显式执行 `bash bsmap-rs/benchmark/p16/run_short_validation.sh . /mnt/d/BSMAP/benchmark-results/p16/sam-direct-warm-20260623T072000Z` 正常完成，example1 与 RRBS SE 均达到 Rust/C++ 完整逐行一致。
+
+### 31. P17 短基准必须检查 C++ control drift
+
+- 现象：P17 多个候选相对旧 P16 baseline 显示 Rust PE wall time 大幅回退，但同一 run 中 C++ example1、example2 和 RRBS SE control 也同步变慢 15% 到 35%。
+- 原因：短基准使用不同时刻的旧 baseline 时，WSL/DrvFS/系统负载会把环境漂移混入 Rust 候选 delta；只看 Rust 百分比会把机器噪声误判成代码收益或回退。
+- 规避：P17 summary 必须输出 `benchmark_stability`，并用 C++ control 的 `cpp_time.wall_pct` 判断漂移。任一 C++ control 的 wall drift 绝对值超过 10% 时，该 run 的性能百分比只能作为噪声提示，不能单独用于保留或撤回生产代码；关键候选应改用同轮 back-to-back baseline 或多轮中位数。
+- 验证：`cached-read-chain-splits-20260623T113000Z` 重新汇总后 `benchmark_stability.unstable=true`，最大 C++ control drift 为 35.1252%；对应候选虽保持 PE SAM SHA，但性能 delta 不作为独立结论。

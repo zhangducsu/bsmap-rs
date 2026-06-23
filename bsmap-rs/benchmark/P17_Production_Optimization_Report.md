@@ -13,6 +13,7 @@ Phase 1 的完整 PE interleaved pairing 仍是下一步最大收益点，但暂
 - `benchmark/p17/`
   - 新增 P17 短基准入口，复用 P16 的 example1/example2/mm10 RRBS 10K 验证矩阵。
   - 新增 summary 对比工具，明确标记规模收益为估算。
+  - 新增 `benchmark_stability` 字段：用 C++ control 的 wall drift 判断本轮短基准是否受环境噪声污染。
 
 - `benchmark/P17_Production_Optimization_Plan.md`
   - 固定 P17 的候选顺序、收益估算、验证矩阵和保留标准。
@@ -80,6 +81,8 @@ Phase 1 的完整 PE interleaved pairing 仍是下一步最大收益点，但暂
 | read-chain split 缓存候选 | `20260623T113000Z` | +41.62% | +31.43% | PE 记录 SHA 与 P16 一致，但 wall time 明显回退，已撤回 |
 
 上述百分比均相对 P16 baseline `D:/BSMAP/benchmark-results/p16/sam-direct-warm-20260623T072000Z` 的 summary。Rust standalone index 独立计时，不并入 warm align 对比。
+
+P17 summary 现在会输出 `benchmark_stability`。若任一 C++ control 的 `cpp_time.wall_pct` 绝对值超过 10%，该 run 标记为 `unstable=true`，性能百分比只能作为噪声提示，不能单独作为保留或撤回生产代码的证据。对 `cached-read-chain-splits-20260623T113000Z` 重新汇总后，C++ control 最大漂移为 35.13%，说明该 run 的性能 delta 受环境漂移显著影响；代码撤回仍按保守策略处理，但后续 P17 候选应优先采用同轮 back-to-back baseline 或多轮中位数。
 
 SIMD mismatch probe 结果：
 

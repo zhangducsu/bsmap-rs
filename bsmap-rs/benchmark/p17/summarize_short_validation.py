@@ -15,6 +15,7 @@ from typing import Any
 
 SCENARIOS = ("example1", "example2", "rrbs_se", "rrbs_pe")
 METRIC_KEYS = ("rust_time", "cpp_time", "rust_index_time")
+CONTROL_DRIFT_THRESHOLD_PCT = 10.0
 
 
 def parse_elapsed(value: str | None) -> float | None:
@@ -83,6 +84,11 @@ def compare(
         return {
             "scale_tests_enabled": False,
             "large_sample_benefit": "estimated_only",
+            "benchmark_stability": {
+                "baseline_available": False,
+                "control_drift_checked": False,
+                "unstable": None,
+            },
             "candidate": candidate_metrics,
         }
 
@@ -112,7 +118,36 @@ def compare(
     return {
         "scale_tests_enabled": False,
         "large_sample_benefit": "estimated_only",
+        "benchmark_stability": summarize_control_drift(deltas),
         "deltas_vs_baseline": deltas,
+    }
+
+
+def summarize_control_drift(deltas: dict[str, Any]) -> dict[str, Any]:
+    controls: dict[str, Any] = {}
+    max_abs_wall_pct = 0.0
+    for scenario, scenario_delta in deltas.items():
+        cpp_delta = scenario_delta.get("cpp_time")
+        if not isinstance(cpp_delta, dict):
+            continue
+        wall_pct = cpp_delta.get("wall_pct")
+        if wall_pct is None:
+            continue
+        abs_wall_pct = abs(wall_pct)
+        max_abs_wall_pct = max(max_abs_wall_pct, abs_wall_pct)
+        controls[scenario] = {
+            "cpp_wall_pct": wall_pct,
+            "abs_cpp_wall_pct": round(abs_wall_pct, 4),
+        }
+
+    return {
+        "baseline_available": True,
+        "control_drift_checked": bool(controls),
+        "control_metric": "cpp_time.wall_pct",
+        "threshold_pct": CONTROL_DRIFT_THRESHOLD_PCT,
+        "max_abs_control_wall_pct": round(max_abs_wall_pct, 4),
+        "unstable": max_abs_wall_pct > CONTROL_DRIFT_THRESHOLD_PCT,
+        "controls": controls,
     }
 
 

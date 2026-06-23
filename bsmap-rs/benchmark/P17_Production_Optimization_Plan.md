@@ -42,6 +42,7 @@ bash benchmark/p17/run_short_validation.sh . /mnt/d/BSMAP/benchmark-results/p17/
 ## 保留标准
 
 - 所有实测结果必须与 P16 `29daa8f` 在同机器、同路径、同参数下比较。
+- `benchmark/p17/summarize_short_validation.py` 必须检查 `benchmark_stability`；若 C++ control 的 wall drift 超过 10%，该 run 的性能百分比不能单独作为保留或撤回生产代码的依据。
 - 默认保留条件：四个短基准无明确回归，并且至少一个目标 workload wall time 提升不少于 3%，或 RSS/CPU 改善不少于 5%。
 - C++ 等价必需改动可以在性能中性时保留，但必须在报告中说明原因。
 - 不跑 WGBS 90G / RRBS 10G；所有大样本收益只能写为估算。
