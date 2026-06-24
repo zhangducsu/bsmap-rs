@@ -282,3 +282,10 @@
 - 原因：P16 runner 的第一个参数语义是仓库根目录，不是 `bsmap-rs` crate 目录；PowerShell、`wsl.exe`、Bash 多层参数边界会提前解释或丢失 `$` 变量。
 - 规避：正式运行时从仓库根目录调用：`bash bsmap-rs/benchmark/p16/run_short_validation.sh . <绝对结果目录>`。结果目录使用显式完整路径，不在一行 PowerShell 命令里依赖 `$RUN_ID` 拼接。
 - 验证：显式执行 `bash bsmap-rs/benchmark/p16/run_short_validation.sh . /mnt/d/BSMAP/benchmark-results/p16/sam-direct-warm-20260623T072000Z` 正常完成，example1 与 RRBS SE 均达到 Rust/C++ 完整逐行一致。
+
+### 31. 清理仓库根目录私钥副本前必须校验来源和权限
+
+- 现象：仓库根目录出现 `id_rsa_rx2-huqi` 私钥副本，内容与 `C:/Users/zhang_i5edc0/.ssh/id_rsa_rx2-huqi` 完全相同；直接 `Remove-Item -Force` 删除时报 `Access to the path is denied`。
+- 原因：私钥被复制到 OneDrive 项目目录后带有只读 ACL，当前用户只有读权限；这类敏感文件不应放在仓库根目录，也不能直接依赖普通删除命令成功。
+- 规避：先用 SHA256 比对确认仓库副本与正式 `~/.ssh` key 相同，再只删除仓库内副本。若 ACL 阻止删除，先对该精确文件授予当前用户权限，再删除；禁止删除 `~/.ssh` 下正式 key。
+- 验证：仓库根目录私钥副本删除后，`Test-Path C:/Users/zhang_i5edc0/.ssh/id_rsa_rx2-huqi` 仍为真，`git status --short` 不再显示根目录私钥。

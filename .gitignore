@@ -32,14 +32,23 @@ Thumbs.db
 # Misc
 .env
 *.log
+wget-log
+id_rsa*
+.agents/
+.codex/
+.claude/worktrees/
+integration-*-temp/
+*cargo_check_output.txt
 
 # BSMAP index files (large binary, regenerated at runtime)
 *.bsi
+*.b64
 
 # Benchmark data (large files)
 benchmark/data/
 benchmark/logs/
 benchmark/results/
+benchmark/results*/
 benchmark/results_final/
 benchmark/results_p2/
 benchmark/results_p3/
@@ -48,6 +57,9 @@ benchmark/rrbssim/
 benchmark/p13/runs/
 bsmap-rs/benchmark/p13/runs/
 bsmap-rs/benchmark/p15/runs/
+bsmap-rs/benchmark/results*/
+bsmap-rs/benchmark/tmp/
+bsmap-rs/benchmark/**/__pycache__/
 benchmark/tmp/
 
 # Trae documents
