@@ -13,6 +13,7 @@ use std::fs::File;
 use std::io::{BufWriter, IsTerminal, Write};
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +26,7 @@ use bsmap::align::{format_bsp, format_sam, AlignmentResult, SingleAlign};
 use bsmap::cli::{resolve_command, resolve_index_args, AlignArgs, Cli};
 use bsmap::pairs::{format_pair_sam, PairAlign, PairBatchResult};
 use bsmap::param::{AlignConfig, AlignStats, BATCH_SIZE, ReadInf};
-use bsmap::reads::{encode_read_with_quality, process_batch, EncodedRead, FastqReader};
+use bsmap::reads::{encode_read_with_quality, process_batch_reuse, EncodedRead, FastqReader};
 use bsmap::reference::{
     default_index_path, is_index_compatible, load_index_with_mode, save_index_v2,
     BinSeqCollection, BinSeqCollectionBuilder, IndexParameters, KmerIndex, LoadMode,
@@ -539,6 +540,285 @@ fn write_sam_header(
 /// 运行单端比对。
 ///
 /// 流式读取读段，批量处理，输出比对结果。
+struct SinglePreparedBatch {
+    raw_count: usize,
+    reads: Vec<ReadInf>,
+    encoded: Vec<EncodedRead>,
+}
+
+struct PairedPreparedBatch {
+    raw_pairs: usize,
+    reads_a: Vec<ReadInf>,
+    reads_b: Vec<ReadInf>,
+    encoded_a: Vec<EncodedRead>,
+    encoded_b: Vec<EncodedRead>,
+}
+
+fn produce_single_batches(
+    args: &AlignArgs,
+    config: &AlignConfig,
+    sender: SyncSender<Result<SinglePreparedBatch>>,
+) {
+    let result = (|| -> Result<()> {
+        let query_path = args.query_a.as_ref().unwrap();
+        let mut reader = FastqReader::open(query_path, config.gz_input)?;
+        let mut batch_raw = Vec::with_capacity(BATCH_SIZE);
+        let mut read_start = config.read_start;
+        let read_end = config.read_end;
+
+        loop {
+            batch_raw.clear();
+            let n = reader.read_batch(&mut batch_raw, BATCH_SIZE, &mut read_start, read_end)?;
+            if n == 0 {
+                break;
+            }
+
+            let batch_start_index = reader.global_index() - n as u32;
+            let reads = process_batch_reuse(&mut batch_raw, 0, batch_start_index, config);
+            let encoded: Vec<EncodedRead> = reads
+                .iter()
+                .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
+                .collect();
+
+            let batch = SinglePreparedBatch {
+                raw_count: n,
+                reads,
+                encoded,
+            };
+            if sender.send(Ok(batch)).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = sender.send(Err(error));
+    }
+}
+
+fn produce_paired_batches(
+    args: &AlignArgs,
+    config: &AlignConfig,
+    sender: SyncSender<Result<PairedPreparedBatch>>,
+) {
+    let result = (|| -> Result<()> {
+        let query_a = args.query_a.as_ref().unwrap();
+        let query_b = args
+            .query_b
+            .as_ref()
+            .context("双端比对需要提供 -b 参数指定第二个读段文件")?;
+        let mut reader_a = FastqReader::open(query_a, config.gz_input)?;
+        let mut reader_b = FastqReader::open(query_b, config.gz_input)?;
+        let mut batch_a = Vec::with_capacity(BATCH_SIZE);
+        let mut batch_b = Vec::with_capacity(BATCH_SIZE);
+        let mut read_start_a = config.read_start;
+        let mut read_start_b = config.read_start;
+        let read_end = config.read_end;
+
+        loop {
+            batch_a.clear();
+            batch_b.clear();
+
+            let n_a = reader_a.read_batch(&mut batch_a, BATCH_SIZE, &mut read_start_a, read_end)?;
+            let n_b = reader_b.read_batch(&mut batch_b, BATCH_SIZE, &mut read_start_b, read_end)?;
+            if n_a == 0 || n_b == 0 {
+                break;
+            }
+
+            let raw_pairs = n_a.min(n_b);
+            let batch_start_index_a = reader_a.global_index() - n_a as u32;
+            let batch_start_index_b = reader_b.global_index() - n_b as u32;
+            let reads_a = process_batch_reuse(&mut batch_a, 1, batch_start_index_a, config);
+            let reads_b = process_batch_reuse(&mut batch_b, 2, batch_start_index_b, config);
+            let encoded_a: Vec<EncodedRead> = reads_a
+                .iter()
+                .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
+                .collect();
+            let encoded_b: Vec<EncodedRead> = reads_b
+                .iter()
+                .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
+                .collect();
+
+            let batch = PairedPreparedBatch {
+                raw_pairs,
+                reads_a,
+                reads_b,
+                encoded_a,
+                encoded_b,
+            };
+            if sender.send(Ok(batch)).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = sender.send(Err(error));
+    }
+}
+
+fn run_single_align_serial(
+    args: &AlignArgs,
+    config: &AlignConfig,
+    index: &KmerIndex,
+    coll: &BinSeqCollection,
+    output: &mut OutputWriter,
+    stats: &Arc<AlignStats>,
+) -> Result<()> {
+    let query_path = args.query_a.as_ref().unwrap();
+    let mut reader = FastqReader::open(query_path, config.gz_input)?;
+    let progress = progress_bar(0);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("{elapsed} {wide_bar} {pos} reads ({per_sec})")?,
+    );
+    let mut aligner = SingleAlign::new();
+    let mut batch_raw = Vec::with_capacity(BATCH_SIZE);
+    let mut read_start = config.read_start;
+    let read_end = config.read_end;
+    let mut alignment_core = Duration::ZERO;
+
+    loop {
+        batch_raw.clear();
+        let n = reader.read_batch(&mut batch_raw, BATCH_SIZE, &mut read_start, read_end)?;
+        if n == 0 {
+            break;
+        }
+
+        let batch_start_index = reader.global_index() - n as u32;
+        let reads = process_batch_reuse(&mut batch_raw, 0, batch_start_index, config);
+        let encoded: Vec<EncodedRead> = reads
+            .iter()
+            .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
+            .collect();
+
+        let core_start = Instant::now();
+        let results = aligner.do_batch(&encoded, index, coll, config);
+        alignment_core += core_start.elapsed();
+
+        for result in &results {
+            if result.has_hits() {
+                output_alignment(
+                    output,
+                    &reads[result.read_idx as usize],
+                    result,
+                    index,
+                    coll,
+                    config,
+                )?;
+                stats.n_aligned.fetch_add(1, Ordering::Relaxed);
+                if result.is_unique {
+                    stats.n_unique.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    stats.n_multiple.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if config.out_unmap {
+                output_unmapped(output, &reads[result.read_idx as usize], config)?;
+            }
+        }
+
+        progress.inc(n as u64);
+    }
+
+    progress.finish();
+    info!("单端串行批处理比对核心耗时: {:.6}s", alignment_core.as_secs_f64());
+    Ok(())
+}
+
+fn run_paired_align_serial(
+    args: &AlignArgs,
+    config: &AlignConfig,
+    index: &KmerIndex,
+    coll: &BinSeqCollection,
+    output: &mut OutputWriter,
+    stats: &Arc<AlignStats>,
+) -> Result<()> {
+    let query_a = args.query_a.as_ref().unwrap();
+    let query_b = args
+        .query_b
+        .as_ref()
+        .context("双端比对需要提供 -b 参数指定第二个读段文件")?;
+    let mut reader_a = FastqReader::open(query_a, config.gz_input)?;
+    let mut reader_b = FastqReader::open(query_b, config.gz_input)?;
+    let progress = progress_bar(0);
+    progress.set_style(
+        ProgressStyle::default_bar()
+            .template("{elapsed} {wide_bar} {pos} pairs ({per_sec})")?,
+    );
+    let mut pair_aligner = PairAlign::new();
+    let mut batch_a = Vec::with_capacity(BATCH_SIZE);
+    let mut batch_b = Vec::with_capacity(BATCH_SIZE);
+    let mut read_start_a = config.read_start;
+    let mut read_start_b = config.read_start;
+    let read_end = config.read_end;
+    let mut alignment_core = Duration::ZERO;
+
+    loop {
+        batch_a.clear();
+        batch_b.clear();
+        let n_a = reader_a.read_batch(&mut batch_a, BATCH_SIZE, &mut read_start_a, read_end)?;
+        let n_b = reader_b.read_batch(&mut batch_b, BATCH_SIZE, &mut read_start_b, read_end)?;
+        if n_a == 0 || n_b == 0 {
+            break;
+        }
+
+        let n = n_a.min(n_b);
+        let batch_start_index_a = reader_a.global_index() - n_a as u32;
+        let batch_start_index_b = reader_b.global_index() - n_b as u32;
+        let reads_a = process_batch_reuse(&mut batch_a, 1, batch_start_index_a, config);
+        let reads_b = process_batch_reuse(&mut batch_b, 2, batch_start_index_b, config);
+        let encoded_a: Vec<EncodedRead> = reads_a
+            .iter()
+            .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
+            .collect();
+        let encoded_b: Vec<EncodedRead> = reads_b
+            .iter()
+            .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
+            .collect();
+
+        let core_start = Instant::now();
+        let results = pair_aligner.do_pair_batch(&encoded_a, &encoded_b, index, coll, config);
+        alignment_core += core_start.elapsed();
+
+        for result in &results {
+            let idx = result.read_idx as usize;
+            if idx >= reads_a.len() || idx >= reads_b.len() {
+                continue;
+            }
+
+            if result.has_pair() {
+                output_pair_alignment(output, &reads_a[idx], &reads_b[idx], result, coll, config)?;
+                stats.n_aligned_pairs.fetch_add(1, Ordering::Relaxed);
+                if result.is_unique {
+                    stats.n_unique_pairs.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    stats.n_multiple_pairs.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                let has_hit_a = !result.unpair_hits_a.is_empty();
+                let has_hit_b = !result.unpair_hits_b.is_empty();
+                if has_hit_a {
+                    stats.n_aligned_a.fetch_add(1, Ordering::Relaxed);
+                }
+                if has_hit_b {
+                    stats.n_aligned_b.fetch_add(1, Ordering::Relaxed);
+                }
+                if has_hit_a || has_hit_b || config.out_unmap {
+                    output_unpaired(output, &reads_a[idx], &reads_b[idx], result, coll, config)?;
+                }
+            }
+        }
+
+        progress.inc(n as u64);
+    }
+
+    progress.finish();
+    info!("双端串行批处理比对核心耗时: {:.6}s", alignment_core.as_secs_f64());
+    Ok(())
+}
+
 fn run_single_align(
     args: &AlignArgs,
     config: &AlignConfig,
@@ -549,10 +829,13 @@ fn run_single_align(
 ) -> Result<()> {
     info!("开始单端比对...");
 
-    // 创建读段读取器
-    let query_path = args.query_a.as_ref().unwrap();
-    let mut reader = FastqReader::open(query_path, config.gz_input)?;
+    if config.rrbs_flag || config.pipeline_depth <= 1 {
+        run_single_align_serial(args, config, index, coll, output, stats)?;
+        info!("单端比对完成");
+        return Ok(());
+    }
 
+    // 创建读段读取器
     // 创建进度条
     let progress = progress_bar(0);
     progress.set_style(
@@ -564,42 +847,30 @@ fn run_single_align(
     let mut aligner = SingleAlign::new();
 
     // 批量处理
-    let mut batch_raw = Vec::with_capacity(BATCH_SIZE);
-    let mut read_start = config.read_start;
-    let read_end = config.read_end;
     let mut alignment_core = Duration::ZERO;
 
-    loop {
-        batch_raw.clear();
+    let pipeline_depth = config.pipeline_depth.max(1);
+    let (sender, receiver) = sync_channel(pipeline_depth);
+
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || produce_single_batches(args, config, sender));
+
+        for batch in receiver {
+            let batch = batch?;
 
         // 读取一批读段
-        let n = reader.read_batch(&mut batch_raw, BATCH_SIZE, &mut read_start, read_end)?;
-        if n == 0 {
-            break;
-        }
-
-        let batch_start_index = reader.global_index() - n as u32;
-
-        // 处理读段（P11-4: mem::take 代替 clone，消除每批深拷贝）
-        let reads = process_batch(std::mem::take(&mut batch_raw), 0, batch_start_index, config);
-
         // 编码读段
-        let encoded: Vec<EncodedRead> = reads
-            .iter()
-            .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
-            .collect();
-
         // 执行比对
-        let core_start = Instant::now();
-        let results = aligner.do_batch(&encoded, index, coll, config);
-        alignment_core += core_start.elapsed();
+            let core_start = Instant::now();
+            let results = aligner.do_batch(&batch.encoded, index, coll, config);
+            alignment_core += core_start.elapsed();
 
         // 输出结果
-        for result in &results {
+            for result in &results {
             if result.has_hits() {
                 output_alignment(
                     output,
-                    &reads[result.read_idx as usize],
+                    &batch.reads[result.read_idx as usize],
                     result,
                     index,
                     coll,
@@ -615,13 +886,16 @@ fn run_single_align(
                 }
             } else if config.out_unmap {
                 // 输出未比对读段
-                output_unmapped(output, &reads[result.read_idx as usize], config)?;
+                output_unmapped(output, &batch.reads[result.read_idx as usize], config)?;
             }
-        }
+            }
 
         // 更新进度条
-        progress.inc(n as u64);
-    }
+            progress.inc(batch.raw_count as u64);
+        }
+
+        Ok(())
+    })?;
 
     progress.finish();
     info!("单端比对核心耗时: {:.6}s", alignment_core.as_secs_f64());
@@ -647,17 +921,18 @@ fn run_paired_align(
 ) -> Result<()> {
     info!("开始双端比对...");
 
+    if config.rrbs_flag || config.pipeline_depth <= 1 {
+        run_paired_align_serial(args, config, index, coll, output, stats)?;
+        info!("双端比对完成");
+        return Ok(());
+    }
+
     // 检查是否有第二个读段文件
-    let query_a = args.query_a.as_ref().unwrap();
-    let query_b = match &args.query_b {
-        Some(path) => path,
-        None => bail!("双端比对需要提供 -b 参数指定第二个读段文件"),
-    };
+    if args.query_b.is_none() {
+        bail!("双端比对需要提供 -b 参数指定第二个读段文件");
+    }
 
     // 创建两个读段读取器
-    let mut reader_a = FastqReader::open(query_a, config.gz_input)?;
-    let mut reader_b = FastqReader::open(query_b, config.gz_input)?;
-
     // 创建进度条
     let progress = progress_bar(0);
     progress.set_style(
@@ -669,55 +944,32 @@ fn run_paired_align(
     let mut pair_aligner = PairAlign::new();
 
     // 批量处理
-    let mut batch_a = Vec::with_capacity(BATCH_SIZE);
-    let mut batch_b = Vec::with_capacity(BATCH_SIZE);
     // 修复：两个 reader 必须使用独立的 read_start，否则 reader_a 读取后
     // read_start 被更新，导致 reader_b 跳过所有读段
-    let mut read_start_a = config.read_start;
-    let mut read_start_b = config.read_start;
-    let read_end = config.read_end;
     let mut alignment_core = Duration::ZERO;
 
-    loop {
-        batch_a.clear();
-        batch_b.clear();
+    let pipeline_depth = config.pipeline_depth.max(1);
+    let (sender, receiver) = sync_channel(pipeline_depth);
+
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || produce_paired_batches(args, config, sender));
+
+        for batch in receiver {
+            let batch = batch?;
 
         // 读取一批读段
-        let n_a = reader_a.read_batch(&mut batch_a, BATCH_SIZE, &mut read_start_a, read_end)?;
-        let n_b = reader_b.read_batch(&mut batch_b, BATCH_SIZE, &mut read_start_b, read_end)?;
-
-        if n_a == 0 || n_b == 0 {
-            break;
-        }
-
         // 确保两个文件读段数量一致
-        let n = n_a.min(n_b);
-        let batch_start_index_a = reader_a.global_index() - n_a as u32;
-        let batch_start_index_b = reader_b.global_index() - n_b as u32;
-
-        // 处理读段（P11-4: mem::take 代替 clone，消除每批深拷贝）
-        let reads_a = process_batch(std::mem::take(&mut batch_a), 1, batch_start_index_a, config);
-        let reads_b = process_batch(std::mem::take(&mut batch_b), 2, batch_start_index_b, config);
-
         // 编码读段
-        let encoded_a: Vec<EncodedRead> = reads_a
-            .iter()
-            .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
-            .collect();
-        let encoded_b: Vec<EncodedRead> = reads_b
-            .iter()
-            .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
-            .collect();
-
         // 执行配对比对
-        let core_start = Instant::now();
-        let results = pair_aligner.do_pair_batch(&encoded_a, &encoded_b, index, coll, config);
-        alignment_core += core_start.elapsed();
+            let core_start = Instant::now();
+            let results =
+                pair_aligner.do_pair_batch(&batch.encoded_a, &batch.encoded_b, index, coll, config);
+            alignment_core += core_start.elapsed();
 
         // 输出结果
-        for result in &results {
+            for result in &results {
             let idx = result.read_idx as usize;
-            if idx >= reads_a.len() || idx >= reads_b.len() {
+            if idx >= batch.reads_a.len() || idx >= batch.reads_b.len() {
                 continue;
             }
 
@@ -725,8 +977,8 @@ fn run_paired_align(
                 // 输出配对结果
                 output_pair_alignment(
                     output,
-                    &reads_a[idx],
-                    &reads_b[idx],
+                    &batch.reads_a[idx],
+                    &batch.reads_b[idx],
                     result,
                     coll,
                     config,
@@ -757,19 +1009,22 @@ fn run_paired_align(
                 if has_hit_a || has_hit_b || config.out_unmap {
                     output_unpaired(
                         output,
-                        &reads_a[idx],
-                        &reads_b[idx],
+                        &batch.reads_a[idx],
+                        &batch.reads_b[idx],
                         result,
                         coll,
                         config,
                     )?;
                 }
             }
-        }
+            }
 
         // 更新进度条
-        progress.inc(n as u64);
-    }
+            progress.inc(batch.raw_pairs as u64);
+        }
+
+        Ok(())
+    })?;
 
     progress.finish();
     info!("双端比对核心耗时: {:.6}s", alignment_core.as_secs_f64());
@@ -982,7 +1237,7 @@ fn format_unpair_sam_single(
     mate_hit: Option<&bsmap::param::GHit>,
     is_first: bool,
     coll: &bsmap::reference::binseq::BinSeqCollection,
-    config: &bsmap::param::AlignConfig,
+    _config: &bsmap::param::AlignConfig,
 ) -> String {
     use bsmap::align::output::{get_chromosome_length, make_cigar, make_zs_tag, select_output_seq};
 

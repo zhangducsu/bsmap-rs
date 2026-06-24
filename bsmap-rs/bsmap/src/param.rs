@@ -189,6 +189,7 @@ pub struct AlignConfig {
 
     // ── Parallelism ─────────────────────────────────────────────────────
     pub num_threads: usize,
+    pub pipeline_depth: usize,
 
     // ── Input ───────────────────────────────────────────────────────────
     pub gz_input: bool,
@@ -262,6 +263,7 @@ impl Default for AlignConfig {
             verbose_level: 1,
 
             num_threads: num_cpus,
+            pipeline_depth: 1,
 
             gz_input: false,
             gz_ref: false,
@@ -401,6 +403,7 @@ impl From<&AlignArgs> for AlignConfig {
         if let Some(threads) = args.num_threads {
             config.num_threads = threads;
         }
+        config.pipeline_depth = args.pipeline_depth.max(1);
 
         // 其他参数
         config.randseed = args.randseed;
@@ -575,6 +578,7 @@ mod tests {
             align_transition: "TC".to_string(),
             digestion_sites: Vec::new(),
             num_threads: None,
+            pipeline_depth: 1,
             randseed: 0,
             verbose: 1,
         };
@@ -641,6 +645,7 @@ mod tests {
             align_transition: "TC".to_string(),
             digestion_sites: Vec::new(),
             num_threads: None,
+            pipeline_depth: 1,
             randseed: 0,
             verbose: 1,
         };
@@ -686,6 +691,7 @@ mod tests {
             align_transition: "TC".to_string(),
             digestion_sites: vec!["C-CGG".to_string()],
             num_threads: None,
+            pipeline_depth: 1,
             randseed: 0,
             verbose: 1,
         };
@@ -732,6 +738,7 @@ mod tests {
             align_transition: "TC".to_string(),
             digestion_sites: Vec::new(),
             num_threads: None,
+            pipeline_depth: 1,
             randseed: 0,
             verbose: 1,
         };

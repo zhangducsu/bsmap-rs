@@ -30,7 +30,32 @@ pub fn process_batch(
     start_index: u32,
     config: &AlignConfig,
 ) -> Vec<ReadInf> {
-    let mut result = Vec::with_capacity(raw_reads.len());
+    let capacity = raw_reads.len();
+    process_raw_reads(raw_reads, capacity, read_set, start_index, config)
+}
+
+/// Process a batch while preserving the outer RawRead Vec allocation.
+pub fn process_batch_reuse(
+    raw_reads: &mut Vec<RawRead>,
+    read_set: u32,
+    start_index: u32,
+    config: &AlignConfig,
+) -> Vec<ReadInf> {
+    let capacity = raw_reads.len();
+    process_raw_reads(raw_reads.drain(..), capacity, read_set, start_index, config)
+}
+
+fn process_raw_reads<I>(
+    raw_reads: I,
+    capacity: usize,
+    read_set: u32,
+    start_index: u32,
+    config: &AlignConfig,
+) -> Vec<ReadInf>
+where
+    I: IntoIterator<Item = RawRead>,
+{
+    let mut result = Vec::with_capacity(capacity);
 
     for (i, raw) in raw_reads.into_iter().enumerate() {
         // 转换为可变序列
@@ -480,5 +505,29 @@ mod tests {
         let result = process_batch(raw_reads, 0, 100, &config);
         assert_eq!(result[0].index, 100);
         assert_eq!(result[1].index, 101);
+    }
+
+    #[test]
+    fn test_process_batch_reuse_preserves_outer_capacity() {
+        let config = test_config();
+        let mut raw_reads = Vec::with_capacity(8);
+        raw_reads.push(RawRead {
+            name: b"read1".to_vec(),
+            seq: b"ACGTACGT".to_vec(),
+            qual: vec![73u8; 8],
+        });
+        raw_reads.push(RawRead {
+            name: b"read2".to_vec(),
+            seq: b"TGCATGCA".to_vec(),
+            qual: vec![73u8; 8],
+        });
+        let capacity = raw_reads.capacity();
+
+        let result = process_batch_reuse(&mut raw_reads, 0, 10, &config);
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].index, 10);
+        assert!(raw_reads.is_empty());
+        assert_eq!(raw_reads.capacity(), capacity);
     }
 }

@@ -229,6 +229,10 @@ pub enum Commands {
         #[arg(short = 'p', value_name = "INT")]
         num_threads: Option<usize>,
 
+        /// Prepared read batches buffered between reader and aligner. 1 keeps the serial path; >1 enables the pipeline.
+        #[arg(long = "pipeline-depth", value_name = "INT", default_value = "1")]
+        pipeline_depth: usize,
+
         /// Random seed. 0 = system clock.
         #[arg(short = 'S', value_name = "INT", default_value = "0")]
         randseed: u32,
@@ -280,6 +284,7 @@ pub fn resolve_command(cli: &Cli) -> ResolvedCommand {
             align_transition,
             digestion_sites,
             num_threads,
+            pipeline_depth,
             randseed,
             verbose,
         }) => ResolvedCommand::Align(AlignArgs {
@@ -311,6 +316,7 @@ pub fn resolve_command(cli: &Cli) -> ResolvedCommand {
             align_transition: align_transition.clone(),
             digestion_sites: digestion_sites.clone(),
             num_threads: *num_threads,
+            pipeline_depth: *pipeline_depth,
             randseed: *randseed,
             verbose: *verbose,
         }),
@@ -346,6 +352,7 @@ pub fn resolve_command(cli: &Cli) -> ResolvedCommand {
                     align_transition: "TC".to_string(),
                     digestion_sites: Vec::new(),
                     num_threads: None,
+                    pipeline_depth: 1,
                     randseed: 0,
                     verbose: cli.verbose,
                 })
@@ -398,6 +405,7 @@ pub struct AlignArgs {
     pub align_transition: String,
     pub digestion_sites: Vec<String>,
     pub num_threads: Option<usize>,
+    pub pipeline_depth: usize,
     pub randseed: u32,
     pub verbose: u8,
 }
