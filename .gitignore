@@ -48,6 +48,7 @@ benchmark/rrbssim/
 benchmark/p13/runs/
 bsmap-rs/benchmark/p13/runs/
 bsmap-rs/benchmark/p15/runs/
+bsmap-rs/benchmark/ssh1/runs/
 benchmark/tmp/
 
 # Trae documents

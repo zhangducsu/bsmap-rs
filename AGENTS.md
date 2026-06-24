@@ -283,6 +283,13 @@
 - 规避：正式运行时从仓库根目录调用：`bash bsmap-rs/benchmark/p16/run_short_validation.sh . <绝对结果目录>`。结果目录使用显式完整路径，不在一行 PowerShell 命令里依赖 `$RUN_ID` 拼接。
 - 验证：显式执行 `bash bsmap-rs/benchmark/p16/run_short_validation.sh . /mnt/d/BSMAP/benchmark-results/p16/sam-direct-warm-20260623T072000Z` 正常完成，example1 与 RRBS SE 均达到 Rust/C++ 完整逐行一致。
 
+### 31. RRBS 服务器 warm align 不能删除 Rust `.bsi`
+
+- 现象：SSH 服务器复测中，Rust 10K PE wall time 约 49 秒，但日志显示其中包含 v10 RRBS `.bsi` 重建和约 46 秒参考/索引加载；该数字不能作为 Rust/C++ 单样本 align 对比。
+- 原因：旧 Docker runner 在每个 case 前删除临时 reference symlink 对应的 `.bsi`，Rust align 触发自动建索引；同时 C++ 没有等价 standalone index，导致计时口径混乱。
+- 规避：服务器 RRBS warm align runner 必须要求 `REFERENCE.bsi` 预先存在，运行前后记录并校验 index SHA；Rust standalone index 单独计时，绝不混入 align wall。需要强制重建索引时必须作为独立 case 记录。
+- 验证：SSH1 runner 写入 `standalone_index_included=false`，并在结束时比较 `index_sha256_before` 与 `index_sha256_after`；SHA 不一致时 fail-fast。
+
 ### 31. 同一 linked worktree 的 Git index 操作不能并行
 
 - 现象：在同一个 linked worktree 上并行执行 `git status` 和 `git merge --ff-only`，merge 报 `index.lock: File exists`。

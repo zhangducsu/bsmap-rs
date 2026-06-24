@@ -30,6 +30,7 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{bail, Context, Result};
@@ -1067,6 +1068,7 @@ fn load_raw_index(
                     wgbs_overflow: read_raw_vec(&mut reader, sections[SECTION_RRBS_HITS])?,
                     seed_size: meta.seed_size,
                     mapped: None,
+                    rrbs_normal_counts: OnceLock::new(),
                 }
             } else {
                 KmerIndex {
@@ -1098,6 +1100,7 @@ fn load_raw_index(
                 wgbs_overflow: Vec::new(),
                 seed_size: meta.seed_size,
                 mapped: None,
+                rrbs_normal_counts: OnceLock::new(),
                 }
             };
             let refcat_data = read_raw_vec(&mut reader, sections[SECTION_REFCAT])?;
@@ -1147,6 +1150,7 @@ fn load_raw_index(
                     wgbs_buckets,
                     wgbs_overflow,
                 }),
+                rrbs_normal_counts: OnceLock::new(),
             };
             let ref_file = File::open(path)?;
             let ref_mmap = unsafe { memmap2::Mmap::map(&ref_file)? };
@@ -1423,6 +1427,7 @@ fn reconstruct_kmer_index_v6(data: IndexDataV6, seed_size: u32) -> KmerIndex {
         wgbs_overflow: Vec::new(),
         seed_size,
         mapped: None,
+        rrbs_normal_counts: OnceLock::new(),
     }
 }
 
@@ -1449,6 +1454,7 @@ fn reconstruct_kmer_index_v5(data: IndexDataV5, seed_size: u32) -> KmerIndex {
         wgbs_overflow: Vec::new(),
         seed_size,
         mapped: None,
+        rrbs_normal_counts: OnceLock::new(),
     }
 }
 
@@ -1490,6 +1496,7 @@ fn reconstruct_kmer_index_v4(data: IndexDataV4, seed_size: u32) -> KmerIndex {
         wgbs_overflow: Vec::new(),
         seed_size,
         mapped: None,
+        rrbs_normal_counts: OnceLock::new(),
     }
 }
 

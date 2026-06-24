@@ -12,6 +12,7 @@ use crate::param::{Hit, KmerLoc2, SEGLEN};
 use crate::reference::binseq::{BinSeqCollection, Block};
 use crate::reference::fasta::Reference;
 use crate::reference::rrbs::{build_rrbs_index_from_sites, find_sites, DigestionSite};
+use std::sync::OnceLock;
 
 /// Prefetch lookahead for frequency counting.
 const PREFETCH_CAL_UNIT: usize = 8;
@@ -300,6 +301,12 @@ pub struct KmerIndex {
 
     /// v7 raw sections mapped directly from the index file.
     pub(crate) mapped: Option<MappedKmerIndex>,
+
+    /// Runtime-only cache of RRBS bucket sizes after excluding BSC hits.
+    ///
+    /// This is not serialized. v10 stores a reusable superset index, while
+    /// SE CountSeeds needs C++'s non-BSC logical bucket size.
+    pub(crate) rrbs_normal_counts: OnceLock<Vec<u32>>,
 }
 
 /// Incremental RRBS digestion-site collector for streaming FASTA input.
@@ -717,6 +724,7 @@ impl KmerIndex {
             wgbs_overflow,
             seed_size,
             mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
         }
     }
 
@@ -886,6 +894,46 @@ impl KmerIndex {
             .slice(start, end)
             .unwrap_or_else(|| RrbsHitView::unpacked(&[]))
     }
+
+    #[inline]
+    pub fn rrbs_candidate_count(&self, seed_hash: u32, cross_chain_enabled: bool) -> u32 {
+        if cross_chain_enabled {
+            self.lookup_rrbs(seed_hash).len() as u32
+        } else {
+            self.rrbs_normal_candidate_count(seed_hash)
+        }
+    }
+
+    #[inline]
+    pub fn rrbs_normal_candidate_count(&self, seed_hash: u32) -> u32 {
+        self.rrbs_normal_counts
+            .get_or_init(|| self.build_rrbs_normal_counts())
+            .get(seed_hash as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn build_rrbs_normal_counts(&self) -> Vec<u32> {
+        let rrbs_offsets = self.rrbs_offsets_slice();
+        if rrbs_offsets.len() < 2 {
+            return Vec::new();
+        }
+        let rrbs_hits = self.rrbs_hit_view();
+        let mut counts = Vec::with_capacity(rrbs_offsets.len() - 1);
+        for window in rrbs_offsets.windows(2) {
+            let Some(bucket) = rrbs_hits.slice(window[0] as usize, window[1] as usize) else {
+                counts.push(0);
+                continue;
+            };
+            counts.push(
+                bucket
+                    .iter()
+                    .filter(|hit| hit.chr & RRBS_BSC_FLAG == 0)
+                    .count() as u32,
+            );
+        }
+        counts
+    }
 }
 
 fn visit_rrbs_hits<F>(
@@ -995,6 +1043,7 @@ fn build_flat_rrbs_index(
             wgbs_overflow: Vec::new(),
             seed_size,
             mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
         };
     }
 
@@ -1046,6 +1095,7 @@ fn build_flat_rrbs_index(
         wgbs_overflow: Vec::new(),
         seed_size,
         mapped: None,
+        rrbs_normal_counts: OnceLock::new(),
     }
 }
 
@@ -1277,6 +1327,7 @@ mod tests {
             wgbs_overflow: Vec::new(),
             seed_size: 12,
             mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
         };
 
         assert_eq!(index.rrbs_fragment(0, 10, 20), Some((6, 37)));
@@ -1306,6 +1357,43 @@ mod tests {
             loc: 0,
         })
         .is_none());
+    }
+
+    #[test]
+    fn rrbs_normal_candidate_count_excludes_bsc_hits() {
+        let index = KmerIndex {
+            total_kmers: 3,
+            max_kmer_num: u32::MAX,
+            index2: Vec::new(),
+            positions: Vec::new(),
+            start_offsets: Vec::new(),
+            rrbs_offsets: vec![0, 0, 3, 4],
+            rrbs_hits: vec![
+                Hit { chr: 0, loc: 10 },
+                Hit {
+                    chr: RRBS_BSC_FLAG | 1,
+                    loc: 20,
+                },
+                Hit { chr: 2, loc: 30 },
+                Hit {
+                    chr: RRBS_BSC_FLAG | 3,
+                    loc: 40,
+                },
+            ],
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
+            seed_size: 12,
+            mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
+        };
+
+        assert_eq!(index.rrbs_candidate_count(1, true), 3);
+        assert_eq!(index.rrbs_candidate_count(1, false), 2);
+        assert_eq!(index.rrbs_normal_candidate_count(2), 0);
     }
 
     #[test]

@@ -269,10 +269,7 @@ pub(crate) fn snp_align_segment(
                 let logical_bucket_len = if cross_chain_enabled {
                     hits.len()
                 } else {
-                    hits
-                        .iter()
-                        .filter(|hit| rrbs_bucket_hit_is_eligible(hit, false))
-                        .count()
+                    index.rrbs_normal_candidate_count(seed_hash) as usize
                 };
                 if logical_bucket_len == 0 {
                     continue;

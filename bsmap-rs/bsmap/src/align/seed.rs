@@ -24,7 +24,9 @@
 
 use crate::alphabet::xt3;
 use crate::reads::encode::EncodedRead;
-use crate::reference::index::{KmerIndex, RRBS_BSC_FLAG};
+use crate::reference::index::KmerIndex;
+#[cfg(test)]
+use crate::reference::index::RRBS_BSC_FLAG;
 
 const NO_SEED_CANDIDATES: u32 = 9_999_999;
 const MAX_SEGMENT_SEEDS: usize = 16;
@@ -561,7 +563,7 @@ fn count_seeds_at_offset(
         if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
             let seed_hash = chain_seeds[seed_pos as usize];
             if is_rrbs {
-                total += index.lookup_rrbs(seed_hash).len() as u32;
+                total += index.rrbs_candidate_count(seed_hash, true);
             } else {
                 total += index.wgbs_candidate_count(seed_hash);
             }
@@ -605,14 +607,7 @@ pub fn count_seeds_for_chain_with_cross_chain(
             if i < reg_masks.len() && reg_masks[i] == 0 {
                 continue;
             }
-            let hits = index.lookup_rrbs(seed);
-            total += if cross_chain_enabled {
-                hits.len() as u32
-            } else {
-                hits.iter()
-                    .filter(|hit| hit.chr & RRBS_BSC_FLAG == 0)
-                    .count() as u32
-            };
+            total += index.rrbs_candidate_count(seed, cross_chain_enabled);
         }
     } else {
         // Match C++: CountSeeds uses ref.index2[s].n[0] which in C++ is total of both chains
@@ -661,6 +656,7 @@ mod tests {
     use crate::alphabet::pack_forward;
     use crate::param::{Hit, KmerLoc2, ReadInf, MAXSNPS};
     use crate::reads::encode::encode_read;
+    use std::sync::OnceLock;
 
     fn make_test_read(seq: &[u8]) -> EncodedRead {
         let read = ReadInf {
@@ -751,6 +747,7 @@ mod tests {
             wgbs_overflow: Vec::new(),
             seed_size: 2,
             mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
         }
     }
 
@@ -916,6 +913,7 @@ mod tests {
             wgbs_overflow: Vec::new(),
             seed_size: 2,
             mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
         };
 
         let disabled =
@@ -946,6 +944,7 @@ mod tests {
             wgbs_overflow: Vec::new(),
             seed_size: 16,
             mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
         };
 
         let mut profile = [[0u32; 16]; MAXSNPS as usize + 1];
@@ -976,6 +975,7 @@ mod tests {
             wgbs_overflow: Vec::new(),
             seed_size: 2,
             mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
         };
 
         assert_eq!(index.wgbs_candidate_count(0), 4);

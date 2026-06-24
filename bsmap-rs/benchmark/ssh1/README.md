@@ -1,0 +1,28 @@
+# SSH1 RRBS 服务器基准
+
+SSH1 runner 用于重新测量服务器 Docker 内 mm10 RRBS 10K/full 数据。Rust standalone index 必须单独完成，本 runner 只测已有 `.bsi` 的 warm align，并在运行前后校验 index SHA。
+
+默认只跑 10K SE/PE，避免误启动长任务：
+
+```bash
+bash bsmap-rs/benchmark/ssh1/run_server_rrbs.sh \
+  /workspace/02_software/bsmap-rs \
+  /workspace/benchmark_results/ssh1
+```
+
+跑全量时显式指定：
+
+```bash
+SSH1_CASES="full_se full_pe" \
+bash bsmap-rs/benchmark/ssh1/run_server_rrbs.sh \
+  /workspace/02_software/bsmap-rs \
+  /workspace/benchmark_results/ssh1
+```
+
+固定 RRBS 参数：
+
+```text
+-s 12 -v 0.08 -I 4 -D C-CGG -p 8 -S 1
+```
+
+输出包含 `metadata.tsv`、每个 case 的 `time.json`/`sam_stats.json`、Rust/C++ 字段 diff 和总 `summary.json`。
