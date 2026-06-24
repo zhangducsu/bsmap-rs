@@ -296,3 +296,10 @@
 - 原因：OneDrive/Windows 文件属性或同步状态会阻止 Git 删除工作区目录和 linked worktree 元数据；Git 命令可能已经完成 unregister，但文件系统删除失败。
 - 规避：先确认目标 worktree 干净且不含用户未跟踪文件，再用 `git worktree list`、`Test-Path` 和 `Resolve-Path` 确认残留目录严格位于当前仓库的 `.claude/worktrees/` 与 `.git/worktrees/` 下。只对确认的单个残留目录使用 PowerShell `Remove-Item -LiteralPath <path> -Recurse -Force`；禁止对 `.claude/worktrees` 或 `.git/worktrees` 做通配递归删除。
 - 验证：P14/P15/P16 baseline/P17/main-work 残留目录按精确路径删除后，`git worktree prune` 和 `git worktree list --porcelain` 只剩主工作区、干净 main 工作区和保留的 P13 工作区。
+
+### 33. Windows archive/tar 与异常文件名会阻塞基线导出
+
+- 现象：在 Windows/PowerShell 中用 `git archive <commit> | tar -x` 导出 baseline 时，`tar` 报 `Unrecognized archive format`；导出全仓库或整个 `bsmap-rs` 时又可能遇到历史异常文件名导致路径无法创建。
+- 原因：PowerShell/native pipe、Windows `tar` 和 NTFS 路径规则会影响二进制 archive 流和部分 Linux 风格文件名；该问题发生在基线工作区导出阶段，不代表源码或 Cargo 构建失败。
+- 规避：不要在 Windows 上为本仓库做全量 archive 解包。需要构建 Rust baseline 时，只导出构建必需路径，例如 `bsmap-rs/Cargo.toml`、`bsmap-rs/Cargo.lock`、`bsmap-rs/bsmap`、`bsmap-rs/methratio`、`bsmap-rs/bsp2sam`；或在 WSL ext4 中使用干净 clone/sparse checkout。
+- 验证：S1 baseline `9a4f7ca` 使用构建必需路径导出到 `D:/BSMAP/scratch/s1-baseline-9a4f7ca` 后，`cargo build --release -p bsmap` 成功，baseline binary SHA256 为 `96ac6f102b77245444a40a802132a46148a69a90c4030ecf8ea769341c088186`。
