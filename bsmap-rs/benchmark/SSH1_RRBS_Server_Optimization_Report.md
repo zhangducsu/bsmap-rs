@@ -33,6 +33,41 @@ Rust standalone index 不计入与 C++ 单样本 align 时间比较。后续所�
 - 默认只跑 10K；full run 必须显式设置 `SSH1_CASES="full_se full_pe"` 或 `SSH1_CASES=all`。
 - RRBS runtime normal-count 缓存作为第一轮速度优化：不改 `.bsi` 格式，只在内存中缓存每个 RRBS bucket 排除 `RRBS_BSC_FLAG` 后的 normal hit 数，减少 SE seed 计数和 logical bucket 长度计算的重复扫描。
 
+## SSH1 10K 复测结果
+
+运行路径：`/workspace/benchmark_results/ssh1/20260624T071833Z-6712`。
+
+固定参数：`-s 12 -v 0.08 -I 4 -D C-CGG -p 8 -S 1`。
+
+index SHA 前后均为 `1329966ddda5aedd9fc7e13cb84a4e755cd632df3d14a0de32a239a29561e634`，说明 Rust align 未重建或改写 `.bsi`。
+
+| 场景 | exit | wall | CPU | RSS KiB | SAM records | mapped | Top RNAME | 字段 diff |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| Rust 10K SE | 0 | 1.38 s | 641% | 893,176 | 2,423 | 2,423 | chr5 7.0986% | 与 C++ 完全一致 |
+| C++ 10K SE | 0 | 69.68 s | 100% | 2,056,740 | 2,423 | 2,423 | chr5 7.0986% | 基准 |
+| Rust 10K PE | 0 | 2.76 s | 756% | 845,128 | 4,884 | 4,884 | chr1 7.7805% | 与 C++ 不一致 |
+| C++ 10K PE | 0 | 77.03 s | 100% | 2,192,168 | 4,884 | 4,884 | chr5 7.2686% | 基准 |
+
+10K SE 的 `QNAME/RNAME/POS/FLAG/NM/ZP/ZL` diff 全部为 0，满足 SSH1 正确性门槛。
+
+10K PE 的 record 数相同，但字段差异较大：`RNAME=572`、`POS=2774`、`FLAG=987`、`NM=87`、`ZP=4884`、`ZL=4884`。PE 后续必须单独处理，不能用 SE 等价结论外推。
+
+normal-count 缓存在 10K SE 上没有体现明显短测收益；当前 10K wall 主要仍受一次性 index mmap/cache 初始化和 RRBS 扩展热路径影响。该优化是否对 full SE 有摊薄收益，需要以 full SE runner 结果判定。
+
+## SSH1 full SE 进展
+
+运行路径：`/workspace/benchmark_results/ssh1/20260624T073756Z-7884`。
+
+Rust full SE 已完成：
+
+| 场景 | exit | wall | user | sys | CPU | RSS KiB | SAM size | 结论 |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Rust full SE | 0 | 3,778.00 s | 28,436.85 s | 17.63 s | 753% | 913,116 | 3.5G | 比旧 3,975.52 s 约快 5.0%，未达到 30% 目标 |
+
+这个结果说明 runtime normal-count 缓存没有解决 full SE 主瓶颈。RSS 仍稳定在约 0.87 GiB，没有内存回退；CPU 利用率约 7.5 核，说明问题不是线程空转，而是每条 read 的 RRBS candidate / extend / mismatch 热路径工作量过高。
+
+C++ full SE 和 full SE streaming diff 已由同一 runner 继续执行；最终 C++ wall/RSS 和字段 diff 仍待回收后补入。
+
 ## 后续验证命令
 
 本地：
@@ -71,6 +106,5 @@ bash bsmap-rs/benchmark/ssh1/run_server_rrbs.sh \
 
 ## 未完成项
 
-- SSH1 runner 需要在 Docker 内重新跑 10K，确认参数和字段 diff 已固定。
-- full SE 需要用 SSH1 runner 重跑，旧 full SE 只能作为诊断基线。
+- full SE 已在 Docker 后台启动，完成后需要补入最终 wall/RSS/字段 diff；旧 full SE 只能作为诊断基线。
 - 若 normal-count 缓存收益不足，下一步继续定位 mismatch/extend 候选数量、SAM 输出和 gzip/read 阶段耗时。
