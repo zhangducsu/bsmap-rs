@@ -915,7 +915,7 @@ fn run_single_align(
 ) -> Result<()> {
     info!("开始单端比对...");
 
-    if config.rrbs_flag || config.pipeline_depth <= 1 {
+    if config.pipeline_depth <= 1 {
         run_single_align_serial(args, config, index, coll, output, stats)?;
         info!("单端比对完成");
         return Ok(());
@@ -1007,7 +1007,7 @@ fn run_paired_align(
 ) -> Result<()> {
     info!("开始双端比对...");
 
-    if config.rrbs_flag || config.pipeline_depth <= 1 {
+    if config.pipeline_depth <= 1 {
         run_paired_align_serial(args, config, index, coll, output, stats)?;
         info!("双端比对完成");
         return Ok(());
