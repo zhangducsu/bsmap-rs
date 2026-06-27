@@ -141,6 +141,7 @@ SAM 摘要：
 
 - `1ef4aa1 perf: shift query in mismatch hot path` 把 mismatch 热路径改成 query shift，10K/100K 速度变快但 mapped 数回退为 2,746/27,523，破坏 SAM 语义；已用 `b4c082d` 回退。
 - `f43a289 perf: skip duplicate invalid mismatch candidates` 在本地测试通过，服务器 10K/100K SAM 等价，但 Rust 10K/100K wall 从 1.41/10.85 s 退化到 1.51/11.86 s；已用 `6498018` 回退。
+- `039f2c2 perf: unroll scalar mismatch word loop` 在本地 `cargo check/test/build` 通过，服务器 10K/100K/1M SAM 集合与保留版一致；但性能收益不足：10K 从 1.48 s 到 1.37 s，100K 从 11.05 s 到 10.81 s，1M 从 46.09 s 到 46.08 s，属于短样本噪声或无实质收益；为避免增加热路径代码复杂度，已用 `45c6c35` 回退。验证路径：`/workspace/benchmark_results/ssh2/20260627T191911Z-4934/summary.json`、`/workspace/benchmark_results/ssh2/20260627T192523Z-5139/summary.json`。
 
 保留优化：`0781e27 perf: add optional RRBS reverse reference cache`。
 
