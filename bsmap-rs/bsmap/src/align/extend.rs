@@ -685,36 +685,27 @@ pub fn is_unique_hit(hits: &[Vec<GHit>]) -> bool {
 /// # 返回值
 /// (最佳命中列表, 最佳 mismatch 数)
 pub fn select_best_hits(hits: &[Vec<GHit>]) -> (Vec<GHit>, u8) {
-    let mut read_chain_0 = Vec::new();
-    let mut read_chain_1 = Vec::new();
-    let mut best_snp = 0u8;
-
     // 优先选择 mismatch 数少的
     for (snp_level, level) in hits.iter().enumerate() {
         if !level.is_empty() {
-            // 去重
-            use std::collections::HashSet;
-            let mut seen = HashSet::new();
-            for hit in level.iter() {
-                let key = (hit.chr, hit.loc, hit.strand);
-                if seen.insert(key) {
-                    if hit.strand & 1 == 0 {
-                        read_chain_0.push(*hit);
-                    } else {
-                        read_chain_1.push(*hit);
+            let mut result = Vec::with_capacity(level.len());
+            let mut seen = Vec::with_capacity(level.len());
+            for read_chain in [0u8, 1] {
+                for hit in level.iter().filter(|hit| hit.strand & 1 == read_chain) {
+                    let key = (hit.chr, hit.loc, hit.strand);
+                    if !seen.contains(&key) {
+                        seen.push(key);
+                        result.push(*hit);
                     }
                 }
             }
-            if !read_chain_0.is_empty() || !read_chain_1.is_empty() {
-                best_snp = snp_level as u8;
-                break;
+            if !result.is_empty() {
+                return (result, snp_level as u8);
             }
         }
     }
 
-    read_chain_0.extend(read_chain_1);
-    let result = read_chain_0;
-    (result, best_snp)
+    (Vec::new(), 0)
 }
 
 #[cfg(test)]
