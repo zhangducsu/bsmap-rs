@@ -338,3 +338,24 @@
 - 原因：容器到 GitHub 的出站网络可能临时不可达；这与本地 push 成功、代码是否存在于远端无关。
 - 规避：若容器 checkout 已有旧基线提交，可在本地生成只包含增量对象的 bundle，例如 `git bundle create <tmp.bundle> <branch> ^<old_commit>`；用 SSH 将 base64 后的 bundle 流入 Docker 内 `/tmp`，再在容器里执行 `git fetch /tmp/<bundle> <branch>:refs/remotes/origin/<branch>` 和 `git reset --hard origin/<branch>`。bundle 写入、fetch、reset 都发生在 Docker 内；不要把 bundle 写到宿主机项目目录。
 - 验证：`d761fe4` 通过 4 KB bundle 从本地同步到 `/tmp/ssh1_sparse_20260627T153127Z_68025/repo`，容器内 `git rev-parse --short HEAD` 为 `d761fe4`，`git status --porcelain` 行数为 0，随后 `cargo build --release -p bsmap` 通过。
+
+### 38. PowerShell 原始二进制流不能直接当作可靠 SSH 传输
+
+- 现象：用 PowerShell `Get-Content -Encoding Byte | ssh ... docker exec ... cat > /tmp/<bundle>` 传 Git bundle 后，容器内文件大小从本地 3,317 bytes 膨胀到 15,148 bytes，`git bundle verify` 失败；改用 PowerShell 管道传 base64 文本时也出现 `base64: invalid input`。
+- 原因：PowerShell 到 native command 的管道会按对象或文本语义重组数据，不保证原始二进制 byte-for-byte 传输；多层 SSH/Docker 管道还会放大换行和编码问题。
+- 规避：GitHub 可达时优先在 Docker 内直接 `git -c http.version=HTTP/1.1 fetch`。确需离线传 bundle 时，不要用 PowerShell 原始二进制管道；必须在容器内校验文件大小、SHA256 和 `git bundle verify` 成功后，才能 `git fetch /tmp/<bundle>`。
+- 验证：损坏 bundle 被拒绝后，改用 Docker 内直接 `git -c http.version=HTTP/1.1 fetch origin codex/ssh2-rrbs-production-optimization`，成功同步到 `9709b55`。
+
+### 39. Docker 非登录 shell 可能没有 Cargo PATH
+
+- 现象：SSH 进入宿主机后执行 `docker exec -i vscode-ssh2 bash`，在容器内同一 checkout 运行 `cargo build --release -p bsmap` 报 `cargo: command not found`。
+- 原因：非登录、非交互 Bash 不一定加载 `$HOME/.cargo/env`，即使容器内实际安装了 Rust/Cargo。
+- 规避：Docker 内构建脚本开头显式执行 `source "$HOME/.cargo/env" 2>/dev/null || true`，并设置 `export PATH="$HOME/.cargo/bin:$PATH"`；不能把 `cargo: command not found` 误判为项目编译失败。
+- 验证：在 `9709b55` checkout 中加载 Cargo PATH 后，`cargo build --release -p bsmap` 通过，release binary SHA256 为 `cd988290b088fc7e905c620d1a544aba68ddb9b156db366ff906b779111620f2`。
+
+### 40. RRBS seed mask 只影响 CountSeeds 排序，不跳过扩展扫描
+
+- 现象：10K RRBS SE 已完全一致，但 100K 出现 2 条真实 SAM 差异；其中一条 read 在 C++ `-r 2` 下有 100 条 NM0 命中，Rust 旧实现只有 1 条。
+- 原因：Rust 没有保留 C++ `xseedreg_array`/`CountSeeds()` 的 seed mask 权重语义，把含 `N` 的 seed 当成普通 seed 排序；同时扩展阶段错误使用 `reg_mask == 0` 跳过扫描。C++ 只在 CountSeeds 中用 `<< 12` 惩罚含 `N` seed 的 candidate count，`SnpAlign()` 仍扫描这些 seed。
+- 规避：RRBS seed 调度必须从 `EncodedRead` mask 提取 C++ 等价 seed mask，并只用于候选计数排序；扩展阶段不得因为该 mask 跳过 seed。任何相关改动必须同时跑目标 read `-r 2`、10K 和 100K 的 streaming/sorted SAM 对比。
+- 验证：提交 `9709b55` 后，两条目标 read 的默认输出和 `-r 2` sorted multiset 均与 C++ 完全一致；SSH2 100K RRBS SE 达到 streaming diff 0、sorted multiset diff 0。

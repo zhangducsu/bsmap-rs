@@ -65,6 +65,47 @@ bash bsmap-rs/benchmark/ssh2/run_server_rrbs_subset.sh \
 
 这说明 100K 的大面积 streaming diff 主要来自输出顺序不同，但仍有 2 条真实 C++ 语义差异。SSH2 下一步必须先定位这 2 条差异，再继续速度优化。
 
+## seed mask 修复复测
+
+提交：`9709b55 fix: match C++ seed mask ordering for RRBS`
+
+运行命令：
+
+```bash
+CPP_BINARY=/workspace/02_software/bsmap-2.90/bsmap \
+SSH2_LIMITS="10000 100000" SSH2_PROFILE_RRBS=0 \
+bash bsmap-rs/benchmark/ssh2/run_server_rrbs_subset.sh \
+  /tmp/ssh1_sparse_20260627T153127Z_68025/repo \
+  /workspace/benchmark_results/ssh2
+```
+
+运行路径：`/workspace/benchmark_results/ssh2/20260627T171551Z-1352/summary.json`。
+
+Rust binary SHA256：`cd988290b088fc7e905c620d1a544aba68ddb9b156db366ff906b779111620f2`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | Rust/C++ wall | SAM diff | 判定 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 10,000 | 1.41 s | 623% | 893,088 | 67.38 s | 100% | 2,057,224 | 0.021 | streaming diff 0；sorted multiset diff 0 | 通过 |
+| 100,000 | 10.85 s | 730% | 911,576 | 75.72 s | 114% | 2,117,748 | 0.143 | streaming diff 0；sorted multiset diff 0 | 通过 |
+
+SAM 摘要：
+
+| limit | Rust mapped | C++ mapped | Rust SAM SHA256 | C++ SAM SHA256 |
+|---:|---:|---:|---|---|
+| 10,000 | 2,423 | 2,423 | `420e34a3fa39086effbff8341cde5bacf90fde9bf57a32b39e0cb48eeedd9ad0` | `fdc40e1d1ad42b786e1b093cad5efe614b547a5bea0a2630f5e8fae69423a64a` |
+| 100,000 | 24,236 | 24,236 | `f6c9728a8da70785a9ebe98a00d355110a87cc14226af3fe0d29ba322b6177ba` | `6149fecd52e5219befe9a9c028dabbd1afd15b88db98b0707391d600f7dec357` |
+
+修复原因：
+
+- Rust 旧实现没有保留 C++ `xseedreg_array` 等价的 seed mask 排序语义，RRBS seed candidate 计数把含 `N` 的 seed 当成普通 seed。
+- C++ `CountSeeds()` 对含 `N` 的 seed 使用 `<< 12` 权重惩罚，使这类 seed 在排序中后移；但 `SnpAlign()` 并不会因为该 seed mask 跳过后续扫描。
+- `9709b55` 从 `EncodedRead` 提取 seed mask，用 mask 权重参与 RRBS seed 排序，同时移除了扩展阶段对 `reg_mask == 0` 的错误跳过。
+
+针对 baseline 中 2 条真实差异的单 read 诊断也已通过：
+
+- read `LH00128:190:22GYNKLT4:5:1101:3581:29730`：默认输出与 C++ 完全一致；`-r 2` 下 Rust/C++ 均为 100 条，排序 multiset 完全一致。
+- read `LH00128:190:22GYNKLT4:5:1103:50581:11268`：默认输出与 C++ 完全一致；`-r 2` 排序 multiset 完全一致。
+
 ## 优化日志
 
 ### 2026-06-28：SSH2 基线准备
@@ -74,9 +115,16 @@ bash bsmap-rs/benchmark/ssh2/run_server_rrbs_subset.sh \
 - 目标从“改善”提升为明确生产门槛：Rust full SE wall `<= C++ / 2`，且 RSS 不高于或相当于 C++。
 - 服务器 10K/100K subset baseline 已完成。10K 完全一致；100K mapped 数一致但存在 2 条 sorted multiset 差异，correctness gate 尚未通过。
 
+### 2026-06-28：RRBS seed mask 排序修复
+
+- 提交 `9709b55` 对齐 C++ `CountSeeds()` 的 seed mask 权重语义。
+- 本地 `cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 通过。
+- 服务器 Docker 同步到 `9709b55` 后 release build 通过。
+- 10K 与 100K RRBS SE 均达到 `QNAME/RNAME/POS/FLAG/NM/ZP/ZL` streaming diff 0，sorted multiset diff 0。
+- 100K 当前 Rust wall 10.85 s，C++ wall 75.72 s；Rust 约为 C++ 的 14.3%，满足 SSH2 subset 性能门槛。
+
 ## 未解决项
 
-- 100K 中存在 2 条真实记录差异，需定位是随机多重命中、早停、候选 bucket 还是输出选择差异。
-- 尚未重跑 SSH2 1M baseline；应等 100K correctness 清零后再作为性能筛选主基准。
+- 100K correctness gate 已在 `9709b55` 清零；尚未重跑 SSH2 1M baseline。
 - full SE 的 C++ 最新 wall/RSS 仍需 SSH2 runner 复测，不能只沿用旧 `536.04s`。
 - Rust full SE 与 C++ full SE 旧结果存在 `+124` mapped 差异，SSH2 full acceptance 前必须用 streaming diff 复核并解释。
