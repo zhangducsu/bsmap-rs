@@ -234,6 +234,50 @@ impl BinSeqCollection {
         }
     }
 
+    /// Materialize the C++ padded reverse-chain reference from `refcat`.
+    ///
+    /// RRBS v10 indexes store only the forward chain to keep RSS low. Large
+    /// RRBS alignments can opt into this cache so reverse-chain candidates use
+    /// the same fast contiguous lookup path as WGBS without changing `.bsi`.
+    pub fn materialize_reverse_from_forward(&mut self) -> usize {
+        if !self.crefcat.is_empty() {
+            return self.crefcat.len();
+        }
+
+        let forward = self.refcat.as_slice();
+        let mut reverse = vec![0u64; REF_MARGIN];
+        for chr_idx in 0..self.chr_lengths.len() {
+            let anchor = self.ref_anchor[chr_idx];
+            let rc_offset = self.ref_anchor[chr_idx + 1] - anchor;
+            let word_count = rc_offset as usize / SEGLEN;
+            let total_bases = word_count * SEGLEN;
+            let leading_padding = rc_offset.saturating_sub(self.chr_lengths[chr_idx]);
+            let mut words = vec![0u64; word_count];
+
+            for position in 0..total_bases {
+                let reverse_pos = position as u32;
+                let code = if reverse_pos < leading_padding {
+                    3u64
+                } else {
+                    let source_pos = rc_offset - 1 - reverse_pos;
+                    let flat_pos = anchor + source_pos;
+                    let word = forward[flat_pos as usize / SEGLEN];
+                    let bit_offset = (flat_pos as usize % SEGLEN) * 2;
+                    3 - ((word >> (62 - bit_offset)) & 0b11)
+                };
+                let word_index = position / SEGLEN;
+                let bit_offset = (position % SEGLEN) * 2;
+                words[word_index] |= code << (62 - bit_offset);
+            }
+
+            reverse.extend_from_slice(&words);
+        }
+        reverse.resize(reverse.len() + REF_MARGIN, 0);
+        let len = reverse.len();
+        self.crefcat = Box::new(VecStorage::new(reverse));
+        len
+    }
+
     /// 从正向 reference 即时生成 C++ padded reverse-chain 的局部窗口。
     pub fn fill_reverse_window(
         &self,
@@ -547,6 +591,33 @@ mod tests {
         let mut rrbs_builder = BinSeqCollectionBuilder::new_rrbs();
         rrbs_builder.push(&reference);
         assert!(rrbs_builder.finish().crefcat.is_empty());
+    }
+
+    #[test]
+    fn materialized_rrbs_reverse_matches_full_builder() {
+        let refs = vec![
+            Reference {
+                name: "chr1".to_string(),
+                seq: b"ACGTNACGTACGTACGTACGTACGTACGTACGT".to_vec(),
+                len: 34,
+            },
+            Reference {
+                name: "chr2".to_string(),
+                seq: b"TGCAACG".to_vec(),
+                len: 7,
+            },
+        ];
+        let expected = BinSeqCollection::from_references(&refs);
+        let mut rrbs_builder = BinSeqCollectionBuilder::new_rrbs();
+        for reference in &refs {
+            rrbs_builder.push(reference);
+        }
+        let mut rrbs = rrbs_builder.finish();
+        assert!(rrbs.crefcat.is_empty());
+
+        let len = rrbs.materialize_reverse_from_forward();
+        assert_eq!(len, expected.crefcat.len());
+        assert_eq!(rrbs.crefcat.as_slice(), expected.crefcat.as_slice());
     }
 
     #[test]

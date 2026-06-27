@@ -223,13 +223,22 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
     let mut timer = Timer::new();
     info!("加载参考序列...");
     let ref_path = args.reference.as_ref().unwrap();
-    let (index, coll) = if let Some(cached) = load_cached_index(&config, ref_path) {
+    let (index, mut coll) = if let Some(cached) = load_cached_index(&config, ref_path) {
         cached
     } else {
         let coll = load_binseq_collection(ref_path, config.rrbs_flag)?;
         let ref_names = coll.chr_names.clone();
         load_or_build_index(coll, &mut config, ref_path, &ref_names)?
     };
+    if should_materialize_rrbs_reverse(&config) {
+        let reverse_timer = Timer::new();
+        let words = coll.materialize_reverse_from_forward();
+        info!(
+            "RRBS reverse reference cache materialized: {} words, 耗时 {:.2}s",
+            words,
+            reverse_timer.elapsed()
+        );
+    }
     let ref_names = coll.chr_names.clone();
     let ref_lengths = coll.chr_lengths.clone();
     info!(
@@ -288,6 +297,26 @@ fn load_binseq_collection(path: &Path, rrbs: bool) -> Result<BinSeqCollection> {
         builder.push(&reference);
     }
     Ok(builder.finish())
+}
+
+const RRBS_REVERSE_CACHE_AUTO_READS: u32 = 500_000;
+
+fn should_materialize_rrbs_reverse(config: &AlignConfig) -> bool {
+    let env_value = std::env::var("BSMAP_RRBS_MATERIALIZE_REVERSE").ok();
+    should_materialize_rrbs_reverse_for(config.rrbs_flag, config.read_end, env_value.as_deref())
+}
+
+fn should_materialize_rrbs_reverse_for(rrbs: bool, read_end: u32, env_value: Option<&str>) -> bool {
+    if !rrbs {
+        return false;
+    }
+    if let Some(value) = env_value {
+        return !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        );
+    }
+    read_end == u32::MAX || read_end >= RRBS_REVERSE_CACHE_AUTO_READS
 }
 
 fn index_parameters(config: &AlignConfig) -> IndexParameters<'_> {
@@ -1506,5 +1535,16 @@ mod tests {
         assert_eq!(stats.n_aligned.load(Ordering::Relaxed), 100);
         assert_eq!(stats.n_unique.load(Ordering::Relaxed), 60);
         assert_eq!(stats.n_multiple.load(Ordering::Relaxed), 40);
+    }
+
+    #[test]
+    fn rrbs_reverse_cache_auto_policy_targets_large_runs() {
+        assert!(!should_materialize_rrbs_reverse_for(false, u32::MAX, None));
+        assert!(!should_materialize_rrbs_reverse_for(true, 100_000, None));
+        assert!(should_materialize_rrbs_reverse_for(true, 500_000, None));
+        assert!(should_materialize_rrbs_reverse_for(true, u32::MAX, None));
+        assert!(should_materialize_rrbs_reverse_for(true, 10_000, Some("1")));
+        assert!(!should_materialize_rrbs_reverse_for(true, u32::MAX, Some("0")));
+        assert!(!should_materialize_rrbs_reverse_for(true, u32::MAX, Some("off")));
     }
 }
