@@ -78,9 +78,6 @@ const INDEX_VERSION_SINGLE_RRBS_REFERENCE: u32 = 9;
 /// Version 10: RRBS stores each hit in a compact seven-byte representation.
 const INDEX_VERSION_PACKED_RRBS_HITS: u32 = 10;
 
-/// Version 11: RRBS packed hits keep normal hits contiguous before BSC hits per mode.
-const INDEX_VERSION_RRBS_NORMAL_PREFIX: u32 = 11;
-
 /// WGBS alignment mode.
 const MODE_WGBS: u32 = 0;
 
@@ -366,7 +363,7 @@ pub fn save_index_v2(
     let mut header = [0u8; HEADER_SIZE];
     header[0..8].copy_from_slice(INDEX_MAGIC);
     let version = if params.is_rrbs {
-        INDEX_VERSION_RRBS_NORMAL_PREFIX
+        INDEX_VERSION_PACKED_RRBS_HITS
     } else {
         INDEX_VERSION_SUCCINCT_WGBS
     };
@@ -671,10 +668,9 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
         && version != INDEX_VERSION_SUCCINCT_WGBS
         && version != INDEX_VERSION_SINGLE_RRBS_REFERENCE
         && version != INDEX_VERSION_PACKED_RRBS_HITS
-        && version != INDEX_VERSION_RRBS_NORMAL_PREFIX
     {
         bail!(
-            "Unsupported index version {} (expected {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, or {}): {}",
+            "Unsupported index version {} (expected {}, {}, {}, {}, {}, {}, {}, {}, {}, or {}): {}",
             version,
             INDEX_VERSION,
             INDEX_VERSION_V2,
@@ -686,7 +682,6 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
             INDEX_VERSION_SUCCINCT_WGBS,
             INDEX_VERSION_SINGLE_RRBS_REFERENCE,
             INDEX_VERSION_PACKED_RRBS_HITS,
-            INDEX_VERSION_RRBS_NORMAL_PREFIX,
             path.display()
         );
     }
@@ -854,7 +849,6 @@ pub fn load_index(path: &Path) -> Result<(KmerIndex, IndexMeta)> {
         || meta.version == INDEX_VERSION_SUCCINCT_WGBS
         || meta.version == INDEX_VERSION_SINGLE_RRBS_REFERENCE
         || meta.version == INDEX_VERSION_PACKED_RRBS_HITS
-        || meta.version == INDEX_VERSION_RRBS_NORMAL_PREFIX
     {
         let (_coll, index, meta) = load_index_with_mode(path, LoadMode::Memory)?;
         return Ok((index, meta));
@@ -975,7 +969,6 @@ fn load_raw_index(
     let expected_marker = if meta.version == INDEX_VERSION_SUCCINCT_WGBS
         || meta.version == INDEX_VERSION_SINGLE_RRBS_REFERENCE
         || meta.version == INDEX_VERSION_PACKED_RRBS_HITS
-        || meta.version == INDEX_VERSION_RRBS_NORMAL_PREFIX
     {
         RAW_SECTION_MARKER_V2
     } else {
@@ -998,9 +991,7 @@ fn load_raw_index(
     let refcat = checked_mapped_section::<u64>(sections[SECTION_REFCAT], file_size)?;
     let crefcat = checked_mapped_section::<u64>(sections[SECTION_CREFCAT], file_size)?;
     let succinct_wgbs = meta.version == INDEX_VERSION_SUCCINCT_WGBS && !meta.is_rrbs;
-    let packed_rrbs_hits = (meta.version == INDEX_VERSION_PACKED_RRBS_HITS
-        || meta.version == INDEX_VERSION_RRBS_NORMAL_PREFIX)
-        && meta.is_rrbs;
+    let packed_rrbs_hits = meta.version == INDEX_VERSION_PACKED_RRBS_HITS && meta.is_rrbs;
 
     let (index2, start_offsets, rrbs_offsets, rrbs_hits, rrbs_site_offsets, rrbs_sites) =
         if succinct_wgbs {
@@ -1212,7 +1203,6 @@ pub fn load_index_with_mode(
         || version == INDEX_VERSION_SUCCINCT_WGBS
         || version == INDEX_VERSION_SINGLE_RRBS_REFERENCE
         || version == INDEX_VERSION_PACKED_RRBS_HITS
-        || version == INDEX_VERSION_RRBS_NORMAL_PREFIX
     {
         drop(reader);
         return load_raw_index(path, mode, meta, ref_anchor, &header);
@@ -1259,7 +1249,6 @@ pub fn load_index_with_mode(
         && version != INDEX_VERSION_SUCCINCT_WGBS
         && version != INDEX_VERSION_SINGLE_RRBS_REFERENCE
         && version != INDEX_VERSION_PACKED_RRBS_HITS
-        && version != INDEX_VERSION_RRBS_NORMAL_PREFIX
     {
         bail!(
             "Unsupported index version {}: {}",
@@ -1529,7 +1518,7 @@ pub fn is_index_compatible(
 
     let meta = read_index_meta(path)?;
     let expected_version = if params.is_rrbs {
-        INDEX_VERSION_RRBS_NORMAL_PREFIX
+        INDEX_VERSION_PACKED_RRBS_HITS
     } else {
         INDEX_VERSION_SUCCINCT_WGBS
     };
@@ -1805,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v11_rrbs_roundtrip_preserves_packed_hits_and_sites() {
+    fn test_v10_rrbs_roundtrip_preserves_packed_hits_and_sites() {
         let refs = vec![Reference {
             name: "chr1".into(),
             seq: b"ACGTCCGGAAAAAAAAAAAAAAAAAAAAAAACCGGTTTTTTTTTTTTTTTTTTTTTTTTCCGG"
@@ -1841,7 +1830,7 @@ mod tests {
         let (loaded_coll, loaded, meta) =
             load_index_with_mode(tmp.path(), LoadMode::Memory).unwrap();
 
-        assert_eq!(meta.version, INDEX_VERSION_RRBS_NORMAL_PREFIX);
+        assert_eq!(meta.version, INDEX_VERSION_PACKED_RRBS_HITS);
         assert!(meta.is_rrbs);
         assert!(loaded_coll.crefcat.is_empty());
         assert_eq!(loaded.rrbs_offsets, index.rrbs_offsets);
