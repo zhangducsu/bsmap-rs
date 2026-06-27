@@ -61,126 +61,77 @@ pub fn count_mismatch(
     _n_count: u32,
     nt3: bool,
 ) -> u32 {
+    // 计算 word 偏移和位偏移
     let word_offset = (offset / 64) as usize;
     let bit_offset = (offset % 64) as u32;
+
     let mut total_mismatches: u32 = 0;
 
-    macro_rules! add_aligned_word {
-        ($i:expr) => {{
-            let ref_word = ref_seq[word_offset + $i];
-            total_mismatches += mismatch_word(query[$i], ref_word, mask[$i]);
+    // 处理跨 word 边界的情况
+    if bit_offset == 0 {
+        // 简单情况：bit_offset = 0，直接比较
+        for i in 0..query.len() {
+            let ref_word = ref_seq[word_offset + i];
+            let q_word = query[i];
+            let m_word = mask[i];
+
+            // 计算差异
+            let mut diff = q_word ^ ref_word;
+
+            // 应用 C→T 容忍掩码
+            // WGBS 中 C↔T 不算 mismatch（亚硫酸氢盐转换）
+            diff &= xc64(ref_word);
+
+            // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
+            diff &= m_word;
+
+            // 统计 mismatch
+            total_mismatches += xm64(diff);
+
+            // 提前终止检查
             if total_mismatches > snp_thres {
                 return snp_thres + 1;
             }
-        }};
-    }
+        }
+    } else {
+        // 复杂情况：需要处理跨 word 边界
+        // 提取以 bit_offset 开始的 64-bit 窗口（与 make_seed 一致）
+        let shift_left = bit_offset;
+        let shift_right = 64 - bit_offset;
 
-    macro_rules! add_shifted_word {
-        ($i:expr, $shift_left:expr, $shift_right:expr) => {{
-            let ref_low = ref_seq[word_offset + $i] << $shift_left;
-            let ref_high = if word_offset + $i + 1 < ref_seq.len() {
-                ref_seq[word_offset + $i + 1] >> $shift_right
+        for i in 0..query.len() {
+            // 从参考序列提取对齐的 word（与 make_seed 一致的移位方向）
+            let ref_low = ref_seq[word_offset + i] << shift_left;
+            let ref_high = if word_offset + i + 1 < ref_seq.len() {
+                ref_seq[word_offset + i + 1] >> shift_right
             } else {
                 0
             };
             let ref_word = ref_low | ref_high;
-            total_mismatches += mismatch_word(query[$i], ref_word, mask[$i]);
+
+            let q_word = query[i];
+            let m_word = mask[i];
+
+            // 计算差异
+            let mut diff = q_word ^ ref_word;
+
+            // 应用 C→T 容忍掩码
+            diff &= xc64(ref_word);
+
+            // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
+            diff &= m_word;
+
+            // 统计 mismatch
+            total_mismatches += xm64(diff);
+
+            // 提前终止检查
             if total_mismatches > snp_thres {
                 return snp_thres + 1;
-            }
-        }};
-    }
-
-    if bit_offset == 0 {
-        match query.len() {
-            0 => {}
-            1 => add_aligned_word!(0),
-            2 => {
-                add_aligned_word!(0);
-                add_aligned_word!(1);
-            }
-            3 => {
-                add_aligned_word!(0);
-                add_aligned_word!(1);
-                add_aligned_word!(2);
-            }
-            4 => {
-                add_aligned_word!(0);
-                add_aligned_word!(1);
-                add_aligned_word!(2);
-                add_aligned_word!(3);
-            }
-            5 => {
-                add_aligned_word!(0);
-                add_aligned_word!(1);
-                add_aligned_word!(2);
-                add_aligned_word!(3);
-                add_aligned_word!(4);
-            }
-            6 => {
-                add_aligned_word!(0);
-                add_aligned_word!(1);
-                add_aligned_word!(2);
-                add_aligned_word!(3);
-                add_aligned_word!(4);
-                add_aligned_word!(5);
-            }
-            _ => {
-                for i in 0..query.len() {
-                    add_aligned_word!(i);
-                }
-            }
-        }
-    } else {
-        let shift_left = bit_offset;
-        let shift_right = 64 - bit_offset;
-        match query.len() {
-            0 => {}
-            1 => add_shifted_word!(0, shift_left, shift_right),
-            2 => {
-                add_shifted_word!(0, shift_left, shift_right);
-                add_shifted_word!(1, shift_left, shift_right);
-            }
-            3 => {
-                add_shifted_word!(0, shift_left, shift_right);
-                add_shifted_word!(1, shift_left, shift_right);
-                add_shifted_word!(2, shift_left, shift_right);
-            }
-            4 => {
-                add_shifted_word!(0, shift_left, shift_right);
-                add_shifted_word!(1, shift_left, shift_right);
-                add_shifted_word!(2, shift_left, shift_right);
-                add_shifted_word!(3, shift_left, shift_right);
-            }
-            5 => {
-                add_shifted_word!(0, shift_left, shift_right);
-                add_shifted_word!(1, shift_left, shift_right);
-                add_shifted_word!(2, shift_left, shift_right);
-                add_shifted_word!(3, shift_left, shift_right);
-                add_shifted_word!(4, shift_left, shift_right);
-            }
-            6 => {
-                add_shifted_word!(0, shift_left, shift_right);
-                add_shifted_word!(1, shift_left, shift_right);
-                add_shifted_word!(2, shift_left, shift_right);
-                add_shifted_word!(3, shift_left, shift_right);
-                add_shifted_word!(4, shift_left, shift_right);
-                add_shifted_word!(5, shift_left, shift_right);
-            }
-            _ => {
-                for i in 0..query.len() {
-                    add_shifted_word!(i, shift_left, shift_right);
-                }
             }
         }
     }
 
     total_mismatches
-}
-
-#[inline]
-fn mismatch_word(query_word: u64, ref_word: u64, mask_word: u64) -> u32 {
-    xm64((query_word ^ ref_word) & xc64(ref_word) & mask_word)
 }
 
 /// 记录所有 mismatch 位置（无 gap）。
