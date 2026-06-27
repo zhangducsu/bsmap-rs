@@ -123,8 +123,55 @@ SAM 摘要：
 - 10K 与 100K RRBS SE 均达到 `QNAME/RNAME/POS/FLAG/NM/ZP/ZL` streaming diff 0，sorted multiset diff 0。
 - 100K 当前 Rust wall 10.85 s，C++ wall 75.72 s；Rust 约为 C++ 的 14.3%，满足 SSH2 subset 性能门槛。
 
+### 2026-06-28：1M baseline 与 reverse cache 优化
+
+1M baseline 运行路径：`/workspace/benchmark_results/ssh2/20260627T175425Z-2219/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | Rust/C++ wall | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 1,000,000 | 108.50 s | 748% | 912,408 | 99.22 s | 292% | 2,486,844 | 1.094 | sorted multiset 仅 3 条 ZP/ZL 边界差异 |
+
+1M baseline 判定：
+
+- Rust RSS 明显低于 C++，但 wall time 慢于 C++，未达到 `<= C++ / 2` 的 SSH2 目标。
+- SAM mapped 数均为 253,102；FLAG/RNAME/NM/ZP/ZL 统计一致。
+- sorted multiset 仅 3 条真实差异，均为 `chr4_GL456350_random:227672` 上 C++ `CCGG_seglen()` 末端越界式 ZP/ZL 标签：C++ 输出 `ZP=227672,ZL=139496`，Rust 不输出 ZP/ZL；QNAME/RNAME/POS/FLAG/NM 一致。
+
+负收益尝试：
+
+- `1ef4aa1 perf: shift query in mismatch hot path` 把 mismatch 热路径改成 query shift，10K/100K 速度变快但 mapped 数回退为 2,746/27,523，破坏 SAM 语义；已用 `b4c082d` 回退。
+- `f43a289 perf: skip duplicate invalid mismatch candidates` 在本地测试通过，服务器 10K/100K SAM 等价，但 Rust 10K/100K wall 从 1.41/10.85 s 退化到 1.51/11.86 s；已用 `6498018` 回退。
+
+保留优化：`0781e27 perf: add optional RRBS reverse reference cache`。
+
+- RRBS v10 `.bsi` 默认只保存 forward `refcat`，旧热路径遇到反向链候选时通过 `fill_reverse_window()` 逐候选现场生成 reverse 窗口。
+- `0781e27` 新增从 forward `refcat` 一次性 materialize C++ padded reverse `crefcat` 的路径；不改 `.bsi` 格式。
+- 自动策略：RRBS 且 `-E` 未指定或 `-E >= 500000` 时默认启用；小样本默认关闭。`BSMAP_RRBS_MATERIALIZE_REVERSE=1/0` 可强制开关。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 通过；新增单测覆盖 materialized reverse 与 full builder 的 `crefcat` 一致性，以及自动策略阈值。
+
+默认策略 10K/100K 复测路径：`/workspace/benchmark_results/ssh2/20260627T190116Z-4318/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | Rust/C++ wall | reverse cache | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 10,000 | 1.48 s | 622% | 893,076 | 68.24 s | 100% | 2,057,224 | 0.022 | off | streaming diff 0；sorted diff 0 |
+| 100,000 | 11.05 s | 734% | 911,560 | 76.76 s | 115% | 2,117,744 | 0.144 | off | streaming diff 0；sorted diff 0 |
+
+默认策略 1M 复测路径：`/workspace/benchmark_results/ssh2/20260627T190527Z-4476/summary.json`。
+
+Rust binary SHA256：`1b601d5e234aef043faf3d34c581ddacfe6226d7533e74d1a04a0c7e20721870`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | Rust/C++ wall | reverse cache | SAM diff | 判定 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---|
+| 1,000,000 | 46.09 s | 580% | 1,722,940 | 99.83 s | 293% | 2,486,544 | 0.462 | on，8.51 s | sorted multiset 253,099/253,102 完全一致；仅 3 条 C++ ZP/ZL 边界差异 | 达到 SSH2 1M 速度/RSS 门槛 |
+
+SAM 摘要：
+
+| limit | Rust mapped | C++ mapped | Rust SAM SHA256 | C++ SAM SHA256 |
+|---:|---:|---:|---|---|
+| 1,000,000 | 253,102 | 253,102 | `44fcf583903fb063245ecf4dec77843aa20317300d681d5207e46729dfe1f92a` | `f8e5ed0d568313828d7a2fed220ca94cd7a12197409be152fa45c2723e910c34` |
+
 ## 未解决项
 
-- 100K correctness gate 已在 `9709b55` 清零；尚未重跑 SSH2 1M baseline。
-- full SE 的 C++ 最新 wall/RSS 仍需 SSH2 runner 复测，不能只沿用旧 `536.04s`。
-- Rust full SE 与 C++ full SE 旧结果存在 `+124` mapped 差异，SSH2 full acceptance 前必须用 streaming diff 复核并解释。
+- SSH2 1M 默认策略已达速度/RSS 门槛；full SE 本轮尚未重跑，不能把 1M 结果写成 full 已验证结论。
+- 1M sorted multiset 仍有 3 条 `ZP/ZL` 差异；源码证据指向 C++ `CCGG_seglen()` 在最后一个 CCGG site 后的末端 fragment 上先解引用再检查边界。Rust 保持安全行为，不伪造该越界式标签。
+- reverse cache 会把 RRBS 大样本 RSS 从约 0.87 GiB 提高到约 1.64 GiB，但仍低于 C++ 1M 的约 2.37 GiB；若未来在内存更小机器上运行，可用 `BSMAP_RRBS_MATERIALIZE_REVERSE=0` 强制关闭。

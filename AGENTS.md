@@ -366,3 +366,24 @@
 - 原因：该 fetch 形式只保证更新 `FETCH_HEAD`，不一定更新已有的 `refs/remotes/origin/<branch>`；reset remote-tracking ref 时可能使用陈旧引用。
 - 规避：服务器 Docker 同步分支时使用显式 refspec：`git fetch origin <branch>:refs/remotes/origin/<branch>`，然后 reset 到 `refs/remotes/origin/<branch>`；或者直接 `git reset --hard FETCH_HEAD`，但必须先核对 `git rev-parse FETCH_HEAD`。
 - 验证：改用显式 refspec 后，Docker checkout 从 `da926d8` 正确更新到 `ebd6f50`，`git status --porcelain` 为空。
+
+### 42. SSH 到 Docker 的嵌套命令边界
+
+- 现象：直接把带分号、重定向或管道的长命令传给 `ssh "... docker exec ... bash -lc '...'"` 时，外层 host shell 可能提前解释部分片段，导致写入或重定向发生在宿主机而不是 Docker 容器内。
+- 原因：PowerShell、Windows `cmd`、SSH 远端 shell、`docker exec` 和容器内 Bash 之间存在多层引号与重定向边界；某一层引号断裂后，后续 `>`、`;`、`|` 会落到错误执行环境。
+- 规避：服务器写入/删除使用本地 LF 临时脚本，通过 `cmd /c type <script> | ssh ... "docker exec -i vscode-ssh2 bash -s"` 输入容器 Bash；脚本内容只在 Docker 内执行。二进制或 bundle 传输使用 base64 写入容器内临时文件。
+- 验证：SSH2 使用该方式将本地 Git bundle 同步到 Docker，`git bundle verify`、`git reset --hard`、`git status --porcelain` 和 `git rev-parse --short HEAD` 均在容器内完成，未再出现宿主机侧误写。
+
+### 43. Docker reset 后必须强制重建 release binary
+
+- 现象：Docker checkout 已 reset 到新 commit，但 benchmark metadata 中的 Rust binary SHA256 仍是旧实验二进制；10K/100K 结果复现了已回退的 query-shift 错误。
+- 原因：`git reset --hard` 只更新源码，不保证 Cargo 按预期重编 release binary；旧 `target/release/bsmap` 可能因时间戳或构建缓存被复用。
+- 规避：每次服务器同步新 commit 后，benchmark 前执行 `cargo clean -p bsmap` 或至少删除 `bsmap-rs/target/release/bsmap`，再 `cargo build --release -p bsmap`，并记录 binary SHA256。不得只凭 `git rev-parse HEAD` 认定二进制对应当前源码。
+- 验证：SSH2 中旧 SHA `a30f8971...` 导致 10K mapped 2,746；强制重建后 SHA 变为 `18737ff...`，10K/100K 重新达到 Rust/C++ mapped 2,423/24,236 且 sorted diff 0。
+
+### 44. C++ RRBS 末端 ZP/ZL 边界标签
+
+- 现象：mm10 RRBS 1M SE 中 Rust/C++ sorted multiset 只剩 3 条差异，QNAME/RNAME/POS/FLAG/NM 一致，但 C++ 在 `chr4_GL456350_random:227672` 输出 `ZP=227672,ZL=139496`，Rust 不输出 ZP/ZL。
+- 原因：C++ `CCGG_seglen()` 的循环先读取 `sites[right]` 再检查 `right < size`；当命中位于最后一个 CCGG site 之后的 terminal fragment 时，会表现出越界式标签。Rust 保持边界安全，不伪造该标签。
+- 规避：SAM 等价报告中把这 3 条作为已知 C++ 末端标签边界差异单独列出；不要为了 100% 标签一致引入越界读取或硬编码异常。核心比对字段仍按 QNAME/RNAME/POS/FLAG/NM 判断是否一致。
+- 验证：SSH2 1M 默认策略 run `/workspace/benchmark_results/ssh2/20260627T190527Z-4476/summary.json` 中，sorted multiset exact 为 253,099/253,102，expected-only 与 actual-only 样本均为这 3 条记录，差异仅 ZP/ZL。
