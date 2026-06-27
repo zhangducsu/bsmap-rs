@@ -78,8 +78,6 @@ pub struct SingleAlign {
     dedup_no_gap: HashSet<(u32, u32)>,
     /// C++ ghitset: gap 命中去重集。Rust `chr` 已等价于 C++ `chr >> 1`。
     dedup_gap: HashSet<(u32, u32)>,
-    /// 本 read 内已经做过 no-gap mismatch 的候选。
-    tested_no_gap: HashSet<(u32, u32, u8)>,
     /// C++ `x_cur_n_hit[read_chain][snp_level]`，跨 segment 累计。
     level_counts: [[usize; MAXSNPS as usize + 1]; 2],
     /// Worker-local seed hash scratch，跨 read 复用容量。
@@ -104,7 +102,6 @@ impl SingleAlign {
             n_multiple: 0,
             dedup_no_gap: HashSet::new(),
             dedup_gap: HashSet::new(),
-            tested_no_gap: HashSet::new(),
             level_counts: [[0; MAXSNPS as usize + 1]; 2],
             seed_chains: std::array::from_fn(|_| Vec::with_capacity(crate::param::FIXSIZE)),
             seed_reg_masks: std::array::from_fn(|_| Vec::with_capacity(crate::param::FIXSIZE)),
@@ -121,7 +118,6 @@ impl SingleAlign {
         clear_hits(&mut self.hits);
         self.dedup_no_gap.clear();
         self.dedup_gap.clear();
-        self.tested_no_gap.clear();
         self.level_counts.fill([0; MAXSNPS as usize + 1]);
     }
 
@@ -267,7 +263,6 @@ impl SingleAlign {
                     read_len,
                     &mut self.dedup_no_gap,
                     &mut self.dedup_gap,
-                    &mut self.tested_no_gap,
                 );
                 early_stop = snp_align_segment(
                     encoded,

@@ -68,7 +68,6 @@ pub(crate) struct HitCollector<'a> {
     read_len: u32,
     dedup_no_gap: &'a mut HashSet<(u32, u32)>,
     dedup_gap: &'a mut HashSet<(u32, u32)>,
-    tested_no_gap: &'a mut HashSet<(u32, u32, u8)>,
 }
 
 impl<'a> HitCollector<'a> {
@@ -81,7 +80,6 @@ impl<'a> HitCollector<'a> {
         read_len: u32,
         dedup_no_gap: &'a mut HashSet<(u32, u32)>,
         dedup_gap: &'a mut HashSet<(u32, u32)>,
-        tested_no_gap: &'a mut HashSet<(u32, u32, u8)>,
     ) -> Self {
         Self {
             hits,
@@ -92,28 +90,11 @@ impl<'a> HitCollector<'a> {
             read_len,
             dedup_no_gap,
             dedup_gap,
-            tested_no_gap,
         }
     }
 
     fn snp_thres(&self) -> u32 {
         *self.snp_thres
-    }
-
-    #[inline]
-    fn candidate_in_bounds(&self, chr: u32, loc: u32) -> bool {
-        let Some(&chr_len) = self.chr_lengths.get(chr as usize) else {
-            return false;
-        };
-        let Some(hit_end) = loc.checked_add(self.read_len) else {
-            return false;
-        };
-        hit_end <= chr_len
-    }
-
-    #[inline]
-    fn should_evaluate_no_gap(&mut self, chr: u32, loc: u32, strand: u8) -> bool {
-        self.candidate_in_bounds(chr, loc) && self.tested_no_gap.insert((chr, loc, strand))
     }
 
     /// 按 C++ `AddHit()` 顺序接收一个已完成边界检查的命中。
@@ -129,7 +110,13 @@ impl<'a> HitCollector<'a> {
             return false;
         }
 
-        if !self.candidate_in_bounds(hit.chr, hit.loc) {
+        let Some(&chr_len) = self.chr_lengths.get(hit.chr as usize) else {
+            return false;
+        };
+        let Some(hit_end) = hit.loc.checked_add(self.read_len) else {
+            return false;
+        };
+        if hit_end > chr_len {
             return false;
         }
 
@@ -188,7 +175,6 @@ pub fn snp_align_for_chain(
     counts_by_chain[read_chain as usize][..copy_len].copy_from_slice(&level_counts[..copy_len]);
     let mut dedup_no_gap = HashSet::new();
     let mut dedup_gap = HashSet::new();
-    let mut tested_no_gap = HashSet::new();
     let read_len = encoded.read_len();
     let query = if read_chain == 0 {
         encoded.fwd_words()
@@ -212,7 +198,6 @@ pub fn snp_align_for_chain(
             read_len,
             &mut dedup_no_gap,
             &mut dedup_gap,
-            &mut tested_no_gap,
         );
         for segment in segments.iter() {
             if snp_align_segment(
@@ -390,13 +375,6 @@ pub(crate) fn snp_align_segment(
                         local_start
                     };
                     let chr = chr_idx as u32;
-                    if gap_size == 0 {
-                        if !collector.should_evaluate_no_gap(chr, loc, strand) {
-                            continue;
-                        }
-                    } else if !collector.candidate_in_bounds(chr, loc) {
-                        continue;
-                    }
 
                     let snp_thres = collector.snp_thres();
                     let mm_count =
@@ -482,13 +460,6 @@ pub(crate) fn snp_align_segment(
                 }
 
                 if (ref_offset as u64 / 64) as usize + query.len() > ref_seq.len() {
-                    continue;
-                }
-                if gap_size == 0 {
-                    if !collector.should_evaluate_no_gap(chr, loc, strand) {
-                        continue;
-                    }
-                } else if !collector.candidate_in_bounds(chr, loc) {
                     continue;
                 }
 
@@ -762,7 +733,6 @@ mod tests {
         let chr_lengths = [100];
         let mut dedup_no_gap = HashSet::new();
         let mut dedup_gap = HashSet::new();
-        let mut tested_no_gap = HashSet::new();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,
@@ -772,7 +742,6 @@ mod tests {
             10,
             &mut dedup_no_gap,
             &mut dedup_gap,
-            &mut tested_no_gap,
         );
 
         assert!(!collector.try_add_hit(hit(91, 0), 0, None));
@@ -793,7 +762,6 @@ mod tests {
         let chr_lengths = [1_000];
         let mut dedup_no_gap = HashSet::new();
         let mut dedup_gap = HashSet::new();
-        let mut tested_no_gap = HashSet::new();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,
@@ -803,7 +771,6 @@ mod tests {
             10,
             &mut dedup_no_gap,
             &mut dedup_gap,
-            &mut tested_no_gap,
         );
 
         for (loc, read_chain, ref_chain) in
@@ -831,7 +798,6 @@ mod tests {
         let chr_lengths = [1_000];
         let mut dedup_no_gap = HashSet::new();
         let mut dedup_gap = HashSet::new();
-        let mut tested_no_gap = HashSet::new();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,
@@ -841,7 +807,6 @@ mod tests {
             10,
             &mut dedup_no_gap,
             &mut dedup_gap,
-            &mut tested_no_gap,
         );
 
         assert!(!collector.try_add_hit(hit(100, 1), 0, None));
@@ -861,7 +826,6 @@ mod tests {
         let chr_lengths = [1_000];
         let mut dedup_no_gap = HashSet::new();
         let mut dedup_gap = HashSet::new();
-        let mut tested_no_gap = HashSet::new();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,
@@ -871,7 +835,6 @@ mod tests {
             10,
             &mut dedup_no_gap,
             &mut dedup_gap,
-            &mut tested_no_gap,
         );
 
         assert!(!collector.try_add_hit(hit(100, 1), 0, None));
@@ -890,7 +853,6 @@ mod tests {
         let chr_lengths = [1_000];
         let mut dedup_no_gap = HashSet::new();
         let mut dedup_gap = HashSet::new();
-        let mut tested_no_gap = HashSet::new();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,
@@ -900,7 +862,6 @@ mod tests {
             10,
             &mut dedup_no_gap,
             &mut dedup_gap,
-            &mut tested_no_gap,
         );
 
         assert!(!collector.try_add_hit(hit(100, 2), 0, None));
