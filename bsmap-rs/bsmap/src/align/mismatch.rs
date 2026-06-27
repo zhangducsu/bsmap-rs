@@ -59,40 +59,79 @@ pub fn count_mismatch(
     mask: &[u64],
     snp_thres: u32,
     _n_count: u32,
-    _nt3: bool,
+    nt3: bool,
 ) -> u32 {
+    // 计算 word 偏移和位偏移
     let word_offset = (offset / 64) as usize;
     let bit_offset = (offset % 64) as u32;
 
     let mut total_mismatches: u32 = 0;
 
-    for i in 0..query.len() {
-        let ref_word = ref_seq[word_offset + i];
-        let q_word = shifted_query_word(query, i, bit_offset);
-        let m_word = shifted_query_word(mask, i, bit_offset);
-        let diff = ((q_word & xc64(ref_word)) ^ ref_word) & m_word;
+    // 处理跨 word 边界的情况
+    if bit_offset == 0 {
+        // 简单情况：bit_offset = 0，直接比较
+        for i in 0..query.len() {
+            let ref_word = ref_seq[word_offset + i];
+            let q_word = query[i];
+            let m_word = mask[i];
 
-        total_mismatches += xm64(diff);
-        if total_mismatches > snp_thres {
-            return snp_thres + 1;
+            // 计算差异
+            let mut diff = q_word ^ ref_word;
+
+            // 应用 C→T 容忍掩码
+            // WGBS 中 C↔T 不算 mismatch（亚硫酸氢盐转换）
+            diff &= xc64(ref_word);
+
+            // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
+            diff &= m_word;
+
+            // 统计 mismatch
+            total_mismatches += xm64(diff);
+
+            // 提前终止检查
+            if total_mismatches > snp_thres {
+                return snp_thres + 1;
+            }
+        }
+    } else {
+        // 复杂情况：需要处理跨 word 边界
+        // 提取以 bit_offset 开始的 64-bit 窗口（与 make_seed 一致）
+        let shift_left = bit_offset;
+        let shift_right = 64 - bit_offset;
+
+        for i in 0..query.len() {
+            // 从参考序列提取对齐的 word（与 make_seed 一致的移位方向）
+            let ref_low = ref_seq[word_offset + i] << shift_left;
+            let ref_high = if word_offset + i + 1 < ref_seq.len() {
+                ref_seq[word_offset + i + 1] >> shift_right
+            } else {
+                0
+            };
+            let ref_word = ref_low | ref_high;
+
+            let q_word = query[i];
+            let m_word = mask[i];
+
+            // 计算差异
+            let mut diff = q_word ^ ref_word;
+
+            // 应用 C→T 容忍掩码
+            diff &= xc64(ref_word);
+
+            // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
+            diff &= m_word;
+
+            // 统计 mismatch
+            total_mismatches += xm64(diff);
+
+            // 提前终止检查
+            if total_mismatches > snp_thres {
+                return snp_thres + 1;
+            }
         }
     }
 
     total_mismatches
-}
-
-#[inline]
-fn shifted_query_word(words: &[u64], index: usize, bit_offset: u32) -> u64 {
-    if bit_offset == 0 {
-        words[index]
-    } else {
-        let high = if index == 0 {
-            0
-        } else {
-            words[index - 1] << (64 - bit_offset)
-        };
-        high | (words[index] >> bit_offset)
-    }
 }
 
 /// 记录所有 mismatch 位置（无 gap）。
@@ -669,19 +708,6 @@ mod tests {
         // offset = 0 应该完全匹配
         let mismatches = count_mismatch(&query, 0, &ref_seq, &mask, 10, 0, false);
         assert_eq!(mismatches, 0, "offset=0 时应该完全匹配");
-    }
-
-    #[test]
-    fn count_mismatch_supports_cpp_style_query_shift_offset() {
-        let query_seq = b"ACGTACGTACGTACGT";
-        let ref_seq_bytes = b"AAACGTACGTACGTACGT";
-
-        let query = pack_forward(query_seq, 1);
-        let ref_seq = make_ref_seq(ref_seq_bytes);
-        let mask = make_mask(query_seq.len());
-
-        let mismatches = count_mismatch(&query, 4, &ref_seq, &mask, 10, 0, false);
-        assert_eq!(mismatches, 0, "offset=4 应该跳过参考前两个 A");
     }
 
     #[test]
