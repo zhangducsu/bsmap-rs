@@ -113,12 +113,14 @@ bash bsmap-rs/benchmark/ssh1/run_server_rrbs.sh \
 
 本轮新增 opt-in 诊断能力，不改变默认生产行为，也不改变 SAM 语义：
 
-- `bsmap/src/align/profile.rs` 新增 `BSMAP_PROFILE_RRBS=1` 环境变量开关。
+- `bsmap/src/align/profile.rs` 新增 `BSMAP_PROFILE_RRBS` 环境变量开关：`stage` 只输出 read/prepare/align/write 阶段耗时；`1` 输出阶段耗时和详细 RRBS candidate/mismatch/hit 计数。
 - 默认关闭；关闭时仅在 RRBS segment 入口做轻量开关判断，不输出任何 profile 行；WGBS 路径不查询 profile。
-- 开启时统计 read/prepare/align/write 阶段耗时，以及 RRBS segment 调用数、非空 seed bucket、raw/logical candidate 数、mode/read-chain 过滤后进入 mismatch 的候选数、mismatch 调用数、accepted hit、gap attempt 和 early stop。
-- `benchmark/ssh1/run_server_rrbs.sh` 新增 `SSH1_PROFILE_RRBS=1`，只对 Rust case 注入 `BSMAP_PROFILE_RRBS=1`。
+- `BSMAP_PROFILE_RRBS=1` 统计 read/prepare/align/write 阶段耗时，以及 RRBS segment 调用数、非空 seed bucket、raw/logical candidate 数、mode/read-chain 过滤后进入 mismatch 的候选数、mismatch 调用数、accepted hit、gap attempt 和 early stop。
+- `benchmark/ssh1/run_server_rrbs.sh` 新增 `SSH1_PROFILE_RRBS=stage|1`，只对 Rust case 注入 `BSMAP_PROFILE_RRBS`。
 - `benchmark/ssh1/summarize_server_rrbs.py` 会把 stderr 中的 `BSMAP_PROFILE_RRBS key=value` 汇总到 `summary.json` 的 `cases.<case>.rrbs_profile`。
 
-注意：开启 profiling 会引入 atomic 计数开销，不能作为 Rust/C++ 正式 wall time 对比。正式性能表仍必须使用 `SSH1_PROFILE_RRBS=0` 的 warm run；profile run 只用于判断 full SE 慢点到底来自 bucket candidate 数、mode 过滤、mismatch 还是 gap/early-stop 行为。
+注意：`BSMAP_PROFILE_RRBS=1` 会引入 atomic 计数开销，不能作为 Rust/C++ 正式 wall time 对比；full SE 只使用 `stage` 判断 read/prepare/align/write 占比，详细计数只用于 10K 或抽样数据。正式性能表仍必须使用 `SSH1_PROFILE_RRBS=0` 的 warm run。
+
+2026-06-27 服务器 10K SE count-heavy 结果：Rust 与 C++ 均为 2,423 条 mapped，`QNAME/RNAME/POS/FLAG/NM/ZP/ZL` diff 为 0。Rust profile run wall 5.01s、RSS 893,148 KiB；C++ normal invocation wall 65.33s、RSS 2,056,756 KiB。Rust 10K profile 记录 `segment_calls=98263`、`raw_bucket_candidates=103224911`、`logical_bucket_candidates=59676398`、`mode_matched_candidates=20038380`、`mismatch_calls=20038380`、`accepted_hits=132286`、`early_stops=74`，说明 full SE 优化应优先定位候选扫描、mode 过滤后 mismatch 热路径和 AddHit 早停，而不是索引重建或 SAM 字段一致性。
 
 2026-06-27 本地验证：权限恢复后已在 WSL2 Ubuntu 执行 `cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap`，均通过；Windows Python 3.11 下逐个执行 `python -m py_compile benchmark/ssh1/*.py` 通过；`bash -n benchmark/ssh1/run_server_rrbs.sh` 通过。warning 均为既有 unused 项和 workspace manifest warning，未出现 error 或 test failure。

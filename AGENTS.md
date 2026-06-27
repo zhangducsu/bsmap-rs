@@ -317,3 +317,17 @@
 - 原因：Windows Python launcher 可能已安装，但托管 sandbox 的 PATH 中没有真实 Python 解释器；这与 benchmark 脚本语法是否正确无关。
 - 规避：不要把该错误写成脚本回归。优先在 WSL2 登录 shell 或服务器 Docker 内执行 `python3 -m py_compile benchmark/ssh1/*.py`；本地 sandbox 只能记录为环境限制。
 - 验证：先用 `Get-Command python,python3,py -ErrorAction SilentlyContinue` 区分 launcher 与解释器，再在可用 Linux 环境中补跑 py_compile。
+
+### 35. PowerShell here-string 通过 SSH 传 Bash 脚本会污染换行
+
+- 现象：从 PowerShell 用 here-string 直接管道到 `ssh ... docker exec -i ... bash -s` 后，容器内 `cargo build --release -p bsmap` 报 `invalid character '\r' in package name: bsmap\r`；检查仓库 `Cargo.toml` 没有 CR 字符。
+- 原因：PowerShell here-string/native pipe 会把 CRLF 作为脚本换行传给 Bash；Bash 不把 `\r` 当作行结束的一部分剥离，导致行尾参数变成 `bsmap\r`。
+- 规避：跨 PowerShell -> SSH -> Docker 传复杂脚本时，先把脚本文本转换成 LF，再 base64 编码，通过远端 `printf '%s' <base64> | base64 -d | docker exec -i <container> bash` 执行。简单命令可用单层明确引号；避免在多层 shell 间直接传 here-doc、未转义 `$`、管道和带空格 env。
+- 验证：用 base64/LF 方式重新执行同一容器 checkout 的 `cargo build --release -p bsmap`，构建通过；错误未再出现。
+
+### 36. RRBS count-heavy profiling 不能直接跑 full 数据
+
+- 现象：`BSMAP_PROFILE_RRBS=1` 的 10K SE 可完成并输出候选计数，但同样设置跑 full SE 时，任务明显被 atomic 热路径计数放大，约 1 分 40 秒仅写出约 23 MB SAM，无法作为正式性能基线。
+- 原因：`BSMAP_PROFILE_RRBS=1` 会在 RRBS segment、candidate、mismatch 和 accepted hit 热路径上做 atomic 计数；10K 诊断中已记录约 1.03 亿 raw candidates 和 2,003 万 mismatch 调用，full 数据会把该开销线性放大。
+- 规避：full run 只使用 `BSMAP_PROFILE_RRBS=stage` 或 `SSH1_PROFILE_RRBS=stage` 输出 read/prepare/align/write 阶段耗时；详细 candidate/mismatch/hit 计数只在 10K 或抽样数据上启用。正式 Rust/C++ wall time 对比必须使用 `SSH1_PROFILE_RRBS=0` 的 warm run。
+- 验证：10K `SSH1_PROFILE_RRBS=1` 保持 Rust/C++ 2,423 条记录完全一致并输出完整 profile；full `BSMAP_PROFILE_RRBS=1` 中止后不纳入报告，改由 stage-only 方案继续定位。

@@ -1,10 +1,18 @@
-//! Opt-in profiling counters for RRBS server benchmarks.
+//! Opt-in profiling support for RRBS server benchmarks.
 
+use std::ffi::OsStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RrbsProfileMode {
+    Off,
+    Stage,
+    Counts,
+}
+
 pub struct RrbsProfile {
-    enabled: bool,
+    mode: RrbsProfileMode,
     pub segment_calls: AtomicU64,
     pub nonempty_seed_buckets: AtomicU64,
     pub raw_bucket_candidates: AtomicU64,
@@ -18,9 +26,9 @@ pub struct RrbsProfile {
 }
 
 impl RrbsProfile {
-    fn new(enabled: bool) -> Self {
+    fn new(mode: RrbsProfileMode) -> Self {
         Self {
-            enabled,
+            mode,
             segment_calls: AtomicU64::new(0),
             nonempty_seed_buckets: AtomicU64::new(0),
             raw_bucket_candidates: AtomicU64::new(0),
@@ -36,7 +44,7 @@ impl RrbsProfile {
 
     #[cfg(test)]
     fn new_enabled_for_test() -> Self {
-        Self::new(true)
+        Self::new(RrbsProfileMode::Counts)
     }
 
     #[inline]
@@ -80,14 +88,34 @@ pub struct RrbsProfileSnapshot {
 
 static RRBS_PROFILE: OnceLock<RrbsProfile> = OnceLock::new();
 
+fn parse_rrbs_profile_mode(value: Option<&OsStr>) -> RrbsProfileMode {
+    let Some(value) = value else {
+        return RrbsProfileMode::Off;
+    };
+    let Some(value) = value.to_str() else {
+        return RrbsProfileMode::Off;
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "off" | "none" => RrbsProfileMode::Off,
+        "stage" | "stages" | "timing" | "timings" => RrbsProfileMode::Stage,
+        _ => RrbsProfileMode::Counts,
+    }
+}
+
+fn rrbs_profile_state() -> &'static RrbsProfile {
+    RRBS_PROFILE.get_or_init(|| {
+        let mode = parse_rrbs_profile_mode(std::env::var_os("BSMAP_PROFILE_RRBS").as_deref());
+        RrbsProfile::new(mode)
+    })
+}
+
+pub fn rrbs_stage_profile_enabled() -> bool {
+    !matches!(rrbs_profile_state().mode, RrbsProfileMode::Off)
+}
+
 pub fn rrbs_profile() -> Option<&'static RrbsProfile> {
-    let profile = RRBS_PROFILE.get_or_init(|| {
-        let enabled = std::env::var_os("BSMAP_PROFILE_RRBS")
-            .map(|value| value != "0" && !value.is_empty())
-            .unwrap_or(false);
-        RrbsProfile::new(enabled)
-    });
-    profile.enabled.then_some(profile)
+    let profile = rrbs_profile_state();
+    matches!(profile.mode, RrbsProfileMode::Counts).then_some(profile)
 }
 
 pub fn print_rrbs_profile_if_enabled() {
@@ -139,5 +167,28 @@ mod tests {
         assert_eq!(snapshot.mismatch_calls, 7);
         assert_eq!(snapshot.accepted_hits, 3);
         assert_eq!(snapshot.raw_bucket_candidates, 0);
+    }
+
+    #[test]
+    fn profile_mode_parsing_separates_stage_from_counts() {
+        assert_eq!(parse_rrbs_profile_mode(None), RrbsProfileMode::Off);
+        assert_eq!(parse_rrbs_profile_mode(Some(OsStr::new(""))), RrbsProfileMode::Off);
+        assert_eq!(parse_rrbs_profile_mode(Some(OsStr::new("0"))), RrbsProfileMode::Off);
+        assert_eq!(
+            parse_rrbs_profile_mode(Some(OsStr::new("stage"))),
+            RrbsProfileMode::Stage
+        );
+        assert_eq!(
+            parse_rrbs_profile_mode(Some(OsStr::new("timing"))),
+            RrbsProfileMode::Stage
+        );
+        assert_eq!(
+            parse_rrbs_profile_mode(Some(OsStr::new("1"))),
+            RrbsProfileMode::Counts
+        );
+        assert_eq!(
+            parse_rrbs_profile_mode(Some(OsStr::new("counts"))),
+            RrbsProfileMode::Counts
+        );
     }
 }

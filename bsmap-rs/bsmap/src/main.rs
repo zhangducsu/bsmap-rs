@@ -680,7 +680,7 @@ fn run_single_align_serial(
     let mut read_start = config.read_start;
     let read_end = config.read_end;
     let mut alignment_core = Duration::ZERO;
-    let profile_stages = config.rrbs_flag && bsmap::align::profile::rrbs_profile().is_some();
+    let profile_stages = config.rrbs_flag && bsmap::align::profile::rrbs_stage_profile_enabled();
     let mut read_time = Duration::ZERO;
     let mut prepare_time = Duration::ZERO;
     let mut write_time = Duration::ZERO;
@@ -783,7 +783,7 @@ fn run_paired_align_serial(
     let mut read_start_b = config.read_start;
     let read_end = config.read_end;
     let mut alignment_core = Duration::ZERO;
-    let profile_stages = config.rrbs_flag && bsmap::align::profile::rrbs_profile().is_some();
+    let profile_stages = config.rrbs_flag && bsmap::align::profile::rrbs_stage_profile_enabled();
     let mut read_time = Duration::ZERO;
     let mut prepare_time = Duration::ZERO;
     let mut write_time = Duration::ZERO;

@@ -16,7 +16,8 @@ Environment:
   READ_1_FULL=/workspace/00_data/rrbs/Ctrl_R1.fq.gz
   READ_2_FULL=/workspace/00_data/rrbs/Ctrl_R2.fq.gz
   RUST_BINARY, CPP_BINARY, THREADS, RANDOM_SEED
-  SSH1_PROFILE_RRBS=1 enables Rust-only RRBS hot-path counters in stderr.
+  SSH1_PROFILE_RRBS=stage enables Rust-only RRBS stage timings in stderr.
+  SSH1_PROFILE_RRBS=1 enables Rust-only RRBS hot-path counters plus stage timings.
 
 Rust alignment timing requires REFERENCE.bsi to already exist. The index SHA is
 checked before and after the run; standalone index time is intentionally excluded.
@@ -148,7 +149,7 @@ run_case() {
   local -a command=("$@")
   local -a env_args=()
   if [[ "$case_name" == rust_* && "$PROFILE_RRBS" != "0" ]]; then
-    env_args=(env BSMAP_PROFILE_RRBS=1)
+    env_args=(env "BSMAP_PROFILE_RRBS=$PROFILE_RRBS")
   fi
   mkdir -p "$case_dir"
   : > "$sam_path"
