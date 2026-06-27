@@ -263,13 +263,8 @@ pub(crate) fn snp_align_segment(
     }
 
     let seeds = segment.seeds();
-    let reg_masks = segment.reg_masks();
     let seed_positions = segment.seed_positions();
     for (seed_idx, &seed_hash) in seeds.iter().enumerate() {
-        if seed_idx < reg_masks.len() && reg_masks[seed_idx] == 0 {
-            continue;
-        }
-
         let seed_pos_in_read = if seed_idx < seed_positions.len() {
             seed_positions[seed_idx]
         } else {

@@ -24,7 +24,7 @@ use crate::align::extend::{
     clear_hits, is_unique_hit, select_best_hits, snp_align_segment, HitCollector,
 };
 use crate::align::seed::{
-    extract_seeds_into, reorder_seeds_for_chain_with_cross_chain_into, SeedSegment,
+    extract_seeds_and_masks_into, reorder_seeds_for_chain_with_masks_into, SeedSegment,
 };
 use crate::param::{AlignConfig, GHit, MAXSNPS};
 use crate::reads::encode::EncodedRead;
@@ -82,6 +82,7 @@ pub struct SingleAlign {
     level_counts: [[usize; MAXSNPS as usize + 1]; 2],
     /// Worker-local seed hash scratch，跨 read 复用容量。
     seed_chains: [Vec<u32>; 2],
+    seed_reg_masks: [Vec<u32>; 2],
     /// Worker-local segment scratch，跨 read 复用容量。
     seed_segments: [Vec<SeedSegment>; 2],
 }
@@ -103,6 +104,7 @@ impl SingleAlign {
             dedup_gap: HashSet::new(),
             level_counts: [[0; MAXSNPS as usize + 1]; 2],
             seed_chains: std::array::from_fn(|_| Vec::with_capacity(crate::param::FIXSIZE)),
+            seed_reg_masks: std::array::from_fn(|_| Vec::with_capacity(crate::param::FIXSIZE)),
             seed_segments: std::array::from_fn(|_| {
                 Vec::with_capacity(MAXSNPS as usize + 1)
             }),
@@ -160,7 +162,12 @@ impl SingleAlign {
         let xflag_chain1 = config.chains || encoded.read_set == 2;
 
         // 提取种子（两条链）
-        extract_seeds_into(encoded, config.seed_size, &mut self.seed_chains);
+        extract_seeds_and_masks_into(
+            encoded,
+            config.seed_size,
+            &mut self.seed_chains,
+            &mut self.seed_reg_masks,
+        );
 
         // 计算最大允许的 mismatch 数（C++ 动态阈值：在处理过程中会被降低）
         let max_snp = if config.max_snp_num >= 100 {
@@ -175,8 +182,9 @@ impl SingleAlign {
         let cross_chain_enabled = config.paired_end || config.chains;
         self.seed_segments[0].clear();
         if xflag_chain0 && !self.seed_chains[0].is_empty() {
-            reorder_seeds_for_chain_with_cross_chain_into(
+            reorder_seeds_for_chain_with_masks_into(
                 &self.seed_chains[0],
+                &self.seed_reg_masks[0],
                 index,
                 config.seed_size,
                 config.index_interval,
@@ -190,8 +198,9 @@ impl SingleAlign {
         }
         self.seed_segments[1].clear();
         if xflag_chain1 && !self.seed_chains[1].is_empty() {
-            reorder_seeds_for_chain_with_cross_chain_into(
+            reorder_seeds_for_chain_with_masks_into(
                 &self.seed_chains[1],
+                &self.seed_reg_masks[1],
                 index,
                 config.seed_size,
                 config.index_interval,

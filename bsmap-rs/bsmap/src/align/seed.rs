@@ -134,6 +134,16 @@ pub(crate) fn extract_seeds_into(
     seed_size: u32,
     all_seeds: &mut [Vec<u32>; 2],
 ) {
+    let mut unused_masks = [Vec::new(), Vec::new()];
+    extract_seeds_and_masks_into(encoded, seed_size, all_seeds, &mut unused_masks);
+}
+
+pub(crate) fn extract_seeds_and_masks_into(
+    encoded: &EncodedRead,
+    seed_size: u32,
+    all_seeds: &mut [Vec<u32>; 2],
+    all_reg_masks: &mut [Vec<u32>; 2],
+) {
     let read_len = encoded.read_len();
     let num_words = encoded.num_words();
     let seed_count = if read_len >= seed_size {
@@ -148,11 +158,21 @@ pub(crate) fn extract_seeds_into(
         } else {
             encoded.rev_words()
         };
+        let mask_words = if chain == 0 {
+            encoded.fwd_mask()
+        } else {
+            encoded.rev_mask()
+        };
 
         let seeds = &mut all_seeds[chain as usize];
+        let reg_masks = &mut all_reg_masks[chain as usize];
         seeds.clear();
+        reg_masks.clear();
         if seeds.capacity() < seed_count {
             seeds.reserve(seed_count);
+        }
+        if reg_masks.capacity() < seed_count {
+            reg_masks.reserve(seed_count);
         }
 
         // 提取所有位置的种子（每个位置都提取）
@@ -161,6 +181,7 @@ pub(crate) fn extract_seeds_into(
         while pos + seed_size <= read_len {
             let seed = extract_seed_at_pos(words, pos, seed_size, num_words);
             seeds.push(seed);
+            reg_masks.push(extract_seed_reg_mask_at_pos(mask_words, pos, seed_size));
             pos += 1;
         }
 
@@ -193,6 +214,34 @@ fn extract_seed_at_pos(words: &[u64], pos: u32, seed_size: u32, _num_words: usiz
     result
 }
 
+#[inline]
+fn extract_seed_reg_mask_at_pos(mask_words: &[u64], pos: u32, seed_size: u32) -> u32 {
+    let bit_pos = pos * 2;
+    let seed_bits_lz = (32 - seed_size) * 2;
+
+    let word_idx = (bit_pos / 64) as usize;
+    let bit_offset = (bit_pos % 64) as u32;
+
+    if word_idx >= mask_words.len() {
+        return 0;
+    }
+
+    let straddle = if bit_offset == 0 {
+        mask_words[word_idx]
+    } else if word_idx + 1 < mask_words.len() {
+        (mask_words[word_idx] << bit_offset) | (mask_words[word_idx + 1] >> (64 - bit_offset))
+    } else {
+        mask_words[word_idx] << bit_offset
+    };
+    let mask_bits = (straddle >> seed_bits_lz) as u32;
+    let seed_bits = if seed_size >= 16 {
+        u32::MAX
+    } else {
+        (1u32 << (seed_size * 2)) - 1
+    };
+    (!mask_bits) & seed_bits
+}
+
 /// 计算最佳 seed_start_offset（逐链独立）。
 ///
 /// 对应 C++ `GetTotalSeedLoc()`。通过尝试不同的起始偏移，
@@ -201,6 +250,31 @@ fn extract_seed_at_pos(words: &[u64], pos: u32, seed_size: u32, _num_words: usiz
 /// 注意：C++ 选择候选数最少的偏移以优化比对速度。
 pub fn find_best_start_offset(
     chain_seeds: &[u32],
+    index: &KmerIndex,
+    map_readlen: u32,
+    seed_size: u32,
+    index_interval: u32,
+    profile: &[[u32; 16]],
+    num_segments: usize,
+    is_rrbs: bool,
+) -> u32 {
+    let zero_masks = vec![0u32; chain_seeds.len()];
+    find_best_start_offset_with_masks(
+        chain_seeds,
+        &zero_masks,
+        index,
+        map_readlen,
+        seed_size,
+        index_interval,
+        profile,
+        num_segments,
+        is_rrbs,
+    )
+}
+
+fn find_best_start_offset_with_masks(
+    chain_seeds: &[u32],
+    chain_reg_masks: &[u32],
     index: &KmerIndex,
     map_readlen: u32,
     seed_size: u32,
@@ -221,6 +295,7 @@ pub fn find_best_start_offset(
                 segment,
                 start_offset,
                 chain_seeds,
+                chain_reg_masks,
                 index,
                 seed_size,
                 index_interval,
@@ -314,6 +389,36 @@ pub(crate) fn reorder_seeds_for_chain_with_cross_chain_into(
     cross_chain_enabled: bool,
     segments: &mut Vec<SeedSegment>,
 ) {
+    let zero_masks = vec![0u32; chain_seeds.len()];
+    reorder_seeds_for_chain_with_masks_into(
+        chain_seeds,
+        &zero_masks,
+        index,
+        seed_size,
+        index_interval,
+        profile,
+        map_readlen,
+        is_rrbs,
+        read_chain,
+        cross_chain_enabled,
+        segments,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reorder_seeds_for_chain_with_masks_into(
+    chain_seeds: &[u32],
+    chain_reg_masks: &[u32],
+    index: &KmerIndex,
+    seed_size: u32,
+    index_interval: u32,
+    profile: &[[u32; 16]],
+    map_readlen: u32,
+    is_rrbs: bool,
+    read_chain: u8,
+    cross_chain_enabled: bool,
+    segments: &mut Vec<SeedSegment>,
+) {
     // C++ RRBS: cseed_offset = map_readlen % seed_size
     // 用于 read_chain=1 时偏移种子位置，补偿 RC 编码的相位差
     let cseed_offset = if is_rrbs { map_readlen % seed_size } else { 0 };
@@ -323,8 +428,9 @@ pub(crate) fn reorder_seeds_for_chain_with_cross_chain_into(
     let best_start_offset = if is_rrbs {
         0
     } else {
-        find_best_start_offset(
+        find_best_start_offset_with_masks(
             chain_seeds,
+            chain_reg_masks,
             index,
             map_readlen,
             seed_size,
@@ -350,7 +456,9 @@ pub(crate) fn reorder_seeds_for_chain_with_cross_chain_into(
             let seed_pos = profile_val + cseed_offset * read_chain as u32;
             let mut segment = SeedSegment::new(seg_idx, 0);
             if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
-                segment.push_seed(chain_seeds[seed_pos as usize], 1, seed_pos);
+                let seed_index = seed_pos as usize;
+                let reg_mask = chain_reg_masks.get(seed_index).copied().unwrap_or(0);
+                segment.push_seed(chain_seeds[seed_index], reg_mask, seed_pos);
             }
             segment.candidates = count_seeds_for_chain_with_cross_chain(
                 segment.seeds(),
@@ -384,7 +492,9 @@ pub(crate) fn reorder_seeds_for_chain_with_cross_chain_into(
             }
 
             if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
-                segment.push_seed(chain_seeds[seed_pos as usize], 1, seed_pos);
+                let seed_index = seed_pos as usize;
+                let reg_mask = chain_reg_masks.get(seed_index).copied().unwrap_or(0);
+                segment.push_seed(chain_seeds[seed_index], reg_mask, seed_pos);
             }
         }
 
@@ -403,6 +513,7 @@ pub(crate) fn reorder_seeds_for_chain_with_cross_chain_into(
         index_interval,
         map_readlen,
         chain_seeds,
+        chain_reg_masks,
         profile,
         is_rrbs,
     );
@@ -452,6 +563,7 @@ fn adjust_seed_starts_for_chain(
     index_interval: u32,
     map_readlen: u32,
     chain_seeds: &[u32],
+    chain_reg_masks: &[u32],
     profile: &[[u32; 16]],
     is_rrbs: bool,
 ) {
@@ -495,7 +607,7 @@ fn adjust_seed_starts_for_chain(
 
         // 在 [start_bound, end_bound] 范围内找使该 segment 候选数最小的 start
         for start in start_bound..=end_bound {
-            let candidates = count_seeds_at_offset(ptr, start, chain_seeds, index, seed_size, index_interval, map_readlen, profile, is_rrbs);
+            let candidates = count_seeds_at_offset(ptr, start, chain_seeds, chain_reg_masks, index, seed_size, index_interval, map_readlen, profile, is_rrbs);
             if candidates < min_candidates {
                 min_candidates = candidates;
                 best_start = start;
@@ -526,12 +638,14 @@ fn adjust_seed_starts_for_chain(
             let seed_pos = (profile_val + new_start).saturating_sub(ii as u32);
 
             if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
-                segment.push_seed(chain_seeds[seed_pos as usize], 1, seed_pos);
+                let seed_index = seed_pos as usize;
+                let reg_mask = chain_reg_masks.get(seed_index).copied().unwrap_or(0);
+                segment.push_seed(chain_seeds[seed_index], reg_mask, seed_pos);
             }
         }
 
         // Update candidate count
-        segment.candidates = count_seeds_at_offset(i, new_start, chain_seeds, index, seed_size, index_interval, map_readlen, profile, is_rrbs);
+        segment.candidates = count_seeds_at_offset(i, new_start, chain_seeds, chain_reg_masks, index, seed_size, index_interval, map_readlen, profile, is_rrbs);
     }
 }
 
@@ -542,6 +656,7 @@ fn count_seeds_at_offset(
     seg_idx: usize,
     start_offset: u32,
     chain_seeds: &[u32],
+    chain_reg_masks: &[u32],
     index: &KmerIndex,
     seed_size: u32,
     index_interval: u32,
@@ -561,12 +676,15 @@ fn count_seeds_at_offset(
         let seed_pos = (profile_val + start_offset).saturating_sub(ii as u32);
 
         if seed_pos < chain_seeds.len() as u32 && seed_pos + seed_size <= map_readlen {
-            let seed_hash = chain_seeds[seed_pos as usize];
-            if is_rrbs {
-                total += index.rrbs_candidate_count(seed_hash, true);
+            let seed_index = seed_pos as usize;
+            let seed_hash = chain_seeds[seed_index];
+            let reg_mask = chain_reg_masks.get(seed_index).copied().unwrap_or(0);
+            let count = if is_rrbs {
+                index.rrbs_candidate_count(seed_hash, true)
             } else {
-                total += index.wgbs_candidate_count(seed_hash);
-            }
+                index.wgbs_candidate_count(seed_hash)
+            };
+            total = total.saturating_add(weight_seed_count(count, reg_mask));
         }
     }
 
@@ -604,18 +722,16 @@ pub fn count_seeds_for_chain_with_cross_chain(
 
     if is_rrbs {
         for (i, &seed) in seeds.iter().enumerate() {
-            if i < reg_masks.len() && reg_masks[i] == 0 {
-                continue;
-            }
-            total += index.rrbs_candidate_count(seed, cross_chain_enabled);
+            let reg_mask = reg_masks.get(i).copied().unwrap_or(0);
+            let count = index.rrbs_candidate_count(seed, cross_chain_enabled);
+            total = total.saturating_add(weight_seed_count(count, reg_mask));
         }
     } else {
         // Match C++: CountSeeds uses ref.index2[s].n[0] which in C++ is total of both chains
         for (i, &seed) in seeds.iter().enumerate() {
-            if i < reg_masks.len() && reg_masks[i] == 0 {
-                continue;
-            }
-            total += index.wgbs_candidate_count(seed);
+            let reg_mask = reg_masks.get(i).copied().unwrap_or(0);
+            let count = index.wgbs_candidate_count(seed);
+            total = total.saturating_add(weight_seed_count(count, reg_mask));
         }
     }
 
@@ -623,6 +739,15 @@ pub fn count_seeds_for_chain_with_cross_chain(
         NO_SEED_CANDIDATES
     } else {
         total
+    }
+}
+
+#[inline]
+fn weight_seed_count(count: u32, reg_mask: u32) -> u32 {
+    if reg_mask == 0 {
+        count
+    } else {
+        count.saturating_mul(1 << 12)
     }
 }
 
@@ -768,14 +893,23 @@ mod tests {
         let index = make_rrbs_count_index(vec![Vec::new(), bucket]);
 
         assert_eq!(
-            count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, true, false),
+            count_seeds_for_chain_with_cross_chain(&[1], &[0], &index, true, false),
             2,
             "SE 默认模式只统计 normal RRBS hit"
         );
         assert_eq!(
-            count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, true, true),
+            count_seeds_for_chain_with_cross_chain(&[1], &[0], &index, true, true),
             4,
             "PE 或 -n 1 模式统计 normal 与 BSC hit"
+        );
+    }
+
+    #[test]
+    fn rrbs_count_seeds_penalizes_n_seed_like_cpp() {
+        let index = make_rrbs_count_index(vec![Vec::new(), vec![Hit { chr: 0, loc: 10 }]]);
+        assert_eq!(
+            count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, true, false),
+            1 << 12
         );
     }
 
@@ -917,9 +1051,9 @@ mod tests {
         };
 
         let disabled =
-            count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, false, false);
+            count_seeds_for_chain_with_cross_chain(&[1], &[0], &index, false, false);
         let enabled =
-            count_seeds_for_chain_with_cross_chain(&[1], &[1], &index, false, true);
+            count_seeds_for_chain_with_cross_chain(&[1], &[0], &index, false, true);
         assert_eq!(disabled, 3);
         assert_eq!(enabled, disabled);
     }
@@ -980,6 +1114,6 @@ mod tests {
 
         assert_eq!(index.wgbs_candidate_count(0), 4);
         assert_eq!(index.lookup_separated(0), (&[][..], &[][..]));
-        assert_eq!(count_seeds_for_chain(&[0], &[1], &index, false), 4);
+        assert_eq!(count_seeds_for_chain(&[0], &[0], &index, false), 4);
     }
 }
