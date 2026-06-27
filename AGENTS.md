@@ -331,3 +331,10 @@
 - 原因：`BSMAP_PROFILE_RRBS=1` 会在 RRBS segment、candidate、mismatch 和 accepted hit 热路径上做 atomic 计数；10K 诊断中已记录约 1.03 亿 raw candidates 和 2,003 万 mismatch 调用，full 数据会把该开销线性放大。
 - 规避：full run 只使用 `BSMAP_PROFILE_RRBS=stage` 或 `SSH1_PROFILE_RRBS=stage` 输出 read/prepare/align/write 阶段耗时；详细 candidate/mismatch/hit 计数只在 10K 或抽样数据上启用。正式 Rust/C++ wall time 对比必须使用 `SSH1_PROFILE_RRBS=0` 的 warm run。
 - 验证：10K `SSH1_PROFILE_RRBS=1` 保持 Rust/C++ 2,423 条记录完全一致并输出完整 profile；full `BSMAP_PROFILE_RRBS=1` 中止后不纳入报告，改由 stage-only 方案继续定位。
+
+### 37. Docker 内 GitHub fetch 超时时可用 Git bundle 增量同步
+
+- 现象：本地已成功 push 到 GitHub，但 Docker 内 `git -c http.version=HTTP/1.1 fetch origin <branch>` 仍可能报 `curl 28 Failed to connect to github.com port 443`，导致 sparse checkout 无法更新。
+- 原因：容器到 GitHub 的出站网络可能临时不可达；这与本地 push 成功、代码是否存在于远端无关。
+- 规避：若容器 checkout 已有旧基线提交，可在本地生成只包含增量对象的 bundle，例如 `git bundle create <tmp.bundle> <branch> ^<old_commit>`；用 SSH 将 base64 后的 bundle 流入 Docker 内 `/tmp`，再在容器里执行 `git fetch /tmp/<bundle> <branch>:refs/remotes/origin/<branch>` 和 `git reset --hard origin/<branch>`。bundle 写入、fetch、reset 都发生在 Docker 内；不要把 bundle 写到宿主机项目目录。
+- 验证：`d761fe4` 通过 4 KB bundle 从本地同步到 `/tmp/ssh1_sparse_20260627T153127Z_68025/repo`，容器内 `git rev-parse --short HEAD` 为 `d761fe4`，`git status --porcelain` 行数为 0，随后 `cargo build --release -p bsmap` 通过。
