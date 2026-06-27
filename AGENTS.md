@@ -401,3 +401,17 @@
 - 原因：仓库里保留了大量历史 benchmark 结果和 SAM/diff 文本；这些文件内容可能包含源码关键字、read 名称或完整 SAM 记录，普通递归搜索不会自动区分源码与结果。
 - 规避：源码搜索固定限制目录或排除大结果目录，例如 `rg <pattern> bsmap-rs/bsmap/src bsmap-original/bsmap-2.90 -g '!**/benchmark/results*/**' -g '!**/*.sam' -g '!**/*.diff'`。服务器结果目录只搜索 `metadata.tsv`、`summary.json`、`stderr.txt` 等小文件，禁止对整个 run 目录做宽 `grep -R`。
 - 验证：SSH2 中误开的 `grep -R BSMAP_PROFILE_RRBS /workspace/benchmark_results/ssh2` 被终止后，改用 `find ... -path '*/stderr.txt' | xargs grep` 只读取小日志文件，未再影响正在运行的 full benchmark。
+
+### 47. RRBS profiling 计数不能当作性能结果
+
+- 现象：`BSMAP_PROFILE_RRBS=1` 的 1M RRBS SE run wall 从默认生产路径约 35.77 秒膨胀到 197.48 秒，但 mapped 和 sorted diff 口径不变。
+- 原因：counts profile 在候选热路径上为 `segment_calls`、`mode_matched_candidates`、`mismatch_calls` 等计数执行大量 atomic fetch-add；该开销会严重污染 wall/user time。
+- 规避：`BSMAP_PROFILE_RRBS=1` 只用于判断候选规模和热点方向，不用于 Rust/C++ 性能对比。正式性能表必须使用 `SSH2_PROFILE_RRBS=0` 或未开启 profile 的 binary/run；若需要阶段耗时，优先使用低频 stage 日志或外部采样。
+- 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260627T223922Z-10085/summary.json` 中，1M counts profile 记录 `mismatch_calls=1967547050`，但 Rust wall 为 197.48 秒；同 commit 默认 run `/workspace/benchmark_results/ssh2/20260627T223149Z-9798/summary.json` 的 1M Rust wall 为 35.77 秒。
+
+### 48. RRBS hit 顺序优化必须检查 streaming SAM
+
+- 现象：尝试把 RRBS v11 hit layout 改为每个 mode 先 normal 再 BSC 后，1M Rust wall 仅从 35.77 秒降到 35.21 秒；100K sorted multiset diff 为 0，但 streaming compare 从 record 1 起出现大面积 QNAME/RNAME/POS 顺序差异。
+- 原因：RRBS hit 存储顺序参与 C++ 风格随机 bucket 起点、环形遍历和输出顺序；即使最终记录集合相同，改变 hit 顺序也可能破坏与 C++ 的 streaming SAM 对齐。
+- 规避：任何 RRBS index hit 重排、normal-only slice、compact bucket 或随机遍历优化，必须同时检查 streaming diff 和 sorted multiset diff。若收益小且 streaming 顺序变动，应撤回；不得只用 sorted diff 0 判定可保留。
+- 验证：SSH2 v11 run `/workspace/benchmark_results/ssh2/20260627T234727Z-12600/summary.json` 显示 100K sorted exact 24,236/24,236 但 streaming exact 0/24,236；候选提交 `ee524cf` 已由 `4804347` revert。

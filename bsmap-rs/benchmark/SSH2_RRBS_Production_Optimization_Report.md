@@ -240,3 +240,46 @@ mode range full 结论：
 - reverse cache 会把 RRBS 大样本 RSS 从约 0.87 GiB 提高到约 1.64 GiB，但仍低于 C++ 1M 的约 2.37 GiB；若未来在内存更小机器上运行，可用 `BSMAP_RRBS_MATERIALIZE_REVERSE=0` 强制关闭。
 - full 主要瓶颈在 align core。下一步优先评估非 64-bit 对齐 offset 的 mismatch kernel、RRBS SE normal-only index/view、读写与 align pipeline，以及 C++ AddHit 早停触发频率是否完全等价；SAM 语义必须先保持 QNAME/RNAME/POS/FLAG/NM 对齐。
 - 现有 `count_mismatch_simd` 未接入 `extend.rs` 热路径，且仅优化 `bit_offset == 0`；直接接入可能收益有限，真正值得评估的是非对齐 offset 的 SIMD 或专用 kernel。
+
+## 2026-06-28：RRBS SE pipeline 默认化与 normal-prefix 回退
+
+保留优化：`8a354d4 perf: enable RRBS SE pipeline by default`。
+
+- 行为：RRBS SE 在未显式增加额外参数时内部使用 depth=2 的 producer/align pipeline；WGBS 与 PE 默认路径不变。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 通过。
+- Docker binary SHA256：`48199b5d47ba278e9fa9885798bd083e70e1235c4e6b9ab6578a2c0f6a331afb`。
+
+默认参数 10K/100K/1M 验证路径：`/workspace/benchmark_results/ssh2/20260627T223149Z-9798/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | Rust/C++ wall | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.96 s | 473% | 1,002,924 | 65.94 s | 100% | 2,057,236 | 0.030 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.64 s | 718% | 1,036,792 | 77.03 s | 115% | 2,117,744 | 0.138 | streaming diff 0；sorted diff 0 |
+| 1,000,000 | 35.77 s | 579% | 1,856,048 | 97.63 s | 298% | 2,486,212 | 0.366 | sorted multiset 253,099/253,102；仍为 3 条 C++ terminal ZP/ZL 边界差异 |
+
+full opt-in 验证路径：`/workspace/benchmark_results/ssh2/pipeline-full-20260627T220442Z/summary.json`。
+
+| case | wall | user | sys | CPU | RSS KiB | mapped | SAM diff |
+|---|---:|---:|---:|---:|---:|---:|---|
+| Rust full SE pipeline depth 2 | 926.23 s | 6768.29 s | 157.71 s | 747% | 1,858,392 | 8,873,078 | 与 Rust serial sorted multiset 8,873,078/8,873,078；与 C++ sorted multiset 8,873,043/8,873,078，35 条仍为已知 terminal ZP/ZL 边界差异 |
+| Rust full SE serial/mode-range baseline | 1134.39 s | 7536.25 s | 154.93 s | 678% | 1,831,660 | 8,873,078 | baseline |
+| C++ full SE | 1050.84 s | 7682.63 s | 218.65 s | 751% | 2,539,832 | 8,873,078 | baseline |
+
+pipeline 结论：
+
+- full wall 从 1134.39 s 降到 926.23 s，提升约 18.3%；RSS 增加约 26,732 KiB，仍明显低于 C++。
+- SAM 与 Rust serial 完全一致；与 C++ 的差异未扩大。
+- 该优化值得保留，但仍未达到 SSH2 full 目标：当前 C++ full 为 1050.84 s，目标应为 Rust `<= 525.42 s`。
+
+诊断 profiling：
+
+- 运行路径：`/workspace/benchmark_results/ssh2/20260627T223922Z-10085/summary.json`。
+- `BSMAP_PROFILE_RRBS=1` 会为每个候选做 atomic 计数，1M wall 从生产路径的 35.77 s 膨胀到 197.48 s；该 run 只用于候选规模诊断，不用于性能对比。
+- 1M 计数：`segment_calls=9,713,520`，`raw_bucket_candidates=11,391,198,972`，`logical_bucket_candidates=6,432,817,120`，`mode_matched_candidates=1,989,892,588`，`mismatch_calls=1,967,547,050`，说明 full 主要瓶颈仍是 mismatch 前后候选规模和 mismatch kernel。
+
+撤回候选：`ee524cf perf: keep RRBS normal hits contiguous`，已由 `4804347 Revert "perf: keep RRBS normal hits contiguous"` 撤回。
+
+- v11 index 构建路径：`/workspace/benchmark_results/ssh2/v11-normal-prefix-20260627T234627Z-12557`；standalone index 用时 37.21 s，SHA256 `b1b8a20c90ddb04b95fbd6367698f0e8e04876f840780e0eab694b2f4a495c91`。
+- v11 10K/100K/1M 验证路径：`/workspace/benchmark_results/ssh2/20260627T234727Z-12600/summary.json`。
+- 1M Rust wall 35.21 s，相对默认 pipeline 35.77 s 仅提升约 1.6%；100K sorted multiset diff 0，但 streaming diff 从 record 1 起发生大面积顺序差异。
+- 判定：收益不足且改变 streaming SAM 顺序，不符合 SSH2 对 C++ SAM 对齐的优先级，已撤回。
