@@ -37,19 +37,33 @@ SSH2 不再接受 10K 单次噪声作为性能结论；新增 100K/1M 中等抽�
 
 ## Baseline 结果
 
-待跑：
+运行命令：
 
 ```bash
 SSH2_LIMITS="10000 100000" \
 bash bsmap-rs/benchmark/ssh2/run_server_rrbs_subset.sh \
-  /tmp/ssh2_codex/repo \
+  /tmp/ssh1_sparse_20260627T153127Z_68025/repo \
   /workspace/benchmark_results/ssh2
 ```
 
+运行路径：`/workspace/benchmark_results/ssh2/20260627T164000Z-73428/summary.json`。
+
 | limit | Rust wall | Rust RSS KiB | C++ wall | C++ RSS KiB | Rust/C++ wall | SAM diff | 判定 |
 |---:|---:|---:|---:|---:|---:|---|---|
-| 10,000 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 |
-| 100,000 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 | 待补 |
+| 10,000 | 1.41 s | 893,488 | 65.93 s | 2,057,220 | 0.021 | streaming diff 0 | 通过 |
+| 100,000 | 10.44 s | 911,620 | 76.20 s | 2,117,748 | 0.137 | streaming diff 受输出顺序影响；sorted multiset 仅 2 条真实差异 | 未通过 correctness gate |
+
+100K 进一步用排序后的 `QNAME/RNAME/POS/FLAG/NM/ZP/ZL` multiset 比较：
+
+- C++ records：24,236
+- Rust records：24,236
+- exact multiset records：24,234
+- C++ only records：2
+- Rust only records：2
+- C++ only QNAME：0
+- Rust only QNAME：0
+
+这说明 100K 的大面积 streaming diff 主要来自输出顺序不同，但仍有 2 条真实 C++ 语义差异。SSH2 下一步必须先定位这 2 条差异，再继续速度优化。
 
 ## 优化日志
 
@@ -58,9 +72,11 @@ bash bsmap-rs/benchmark/ssh2/run_server_rrbs_subset.sh \
 - 从 SSH1 `d7373f8` 新建 SSH2 分支。
 - 新增 SSH2 计划文档和 subset runner。
 - 目标从“改善”提升为明确生产门槛：Rust full SE wall `<= C++ / 2`，且 RSS 不高于或相当于 C++。
+- 服务器 10K/100K subset baseline 已完成。10K 完全一致；100K mapped 数一致但存在 2 条 sorted multiset 差异，correctness gate 尚未通过。
 
 ## 未解决项
 
-- 尚未重跑 SSH2 100K/1M baseline。
+- 100K 中存在 2 条真实记录差异，需定位是随机多重命中、早停、候选 bucket 还是输出选择差异。
+- 尚未重跑 SSH2 1M baseline；应等 100K correctness 清零后再作为性能筛选主基准。
 - full SE 的 C++ 最新 wall/RSS 仍需 SSH2 runner 复测，不能只沿用旧 `536.04s`。
 - Rust full SE 与 C++ full SE 旧结果存在 `+124` mapped 差异，SSH2 full acceptance 前必须用 streaming diff 复核并解释。

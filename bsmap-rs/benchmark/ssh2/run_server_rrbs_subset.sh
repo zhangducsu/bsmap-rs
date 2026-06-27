@@ -34,6 +34,7 @@ fi
 readonly REPO_ROOT="$(cd "$1" && pwd)"
 readonly RUNS_ROOT="$2"
 readonly TOOL_DIR="$REPO_ROOT/bsmap-rs/benchmark/ssh1"
+readonly SSH2_DIR="$REPO_ROOT/bsmap-rs/benchmark/ssh2"
 readonly REFERENCE="${REFERENCE:-/workspace/00_data/reference/mm10.fa}"
 readonly INDEX_PATH="${INDEX_PATH:-$REFERENCE.bsi}"
 readonly READ_1_FULL="${READ_1_FULL:-/workspace/00_data/rrbs/Ctrl_R1.fq.gz}"
@@ -55,6 +56,7 @@ done
 for script in parse_time.py sam_stats.py sam_compare_stream.py summarize_server_rrbs.py; do
   [[ -f "$TOOL_DIR/$script" ]] || fail "missing script: $TOOL_DIR/$script"
 done
+[[ -f "$SSH2_DIR/sam_compare_sorted.py" ]] || fail "missing script: $SSH2_DIR/sam_compare_sorted.py"
 
 read -r -a LIMITS <<< "$LIMIT_SPEC"
 if (( ${#LIMITS[@]} == 0 )); then
@@ -165,6 +167,16 @@ run_compare() {
   set -e
   printf '%s\n' "$status" > "$RUN_DIR/comparisons/$label.exit_code.txt"
   printf 'compare %-12s exit=%s\n' "$label" "$status"
+
+  set +e
+  python3 "$SSH2_DIR/sam_compare_sorted.py" "$expected" "$actual" \
+    --summary "$RUN_DIR/comparisons/$label.sorted_multiset.json" \
+    > "$RUN_DIR/comparisons/$label.sorted_multiset.stdout" \
+    2> "$RUN_DIR/comparisons/$label.sorted_multiset.stderr"
+  status=$?
+  set -e
+  printf '%s\n' "$status" > "$RUN_DIR/comparisons/$label.sorted_multiset.exit_code.txt"
+  printf 'sorted  %-12s exit=%s\n' "$label" "$status"
 }
 
 for limit in "${LIMITS[@]}"; do

@@ -30,7 +30,8 @@ SSH2 使用三层验证，避免 10K 噪声和 full 长任务互相误导：
 2. **100K/1M screening gate**
    - 使用 `benchmark/ssh2/run_server_rrbs_subset.sh`，对 full R1 执行 `-E 100000`、`-E 1000000`。
    - 每个候选优化至少比较 Rust A/B 三轮；保留门槛为目标 workload wall time 提升 `>=10%`，或为 full 速度目标提供明确候选数量/mismatch 调用下降证据。
-   - 仍需与 C++ 字段 diff 为 0。
+   - correctness 使用排序后的 `QNAME/RNAME/POS/FLAG/NM/ZP/ZL` multiset 比较；streaming compare 只用于诊断输出顺序是否与 C++ 一致。
+   - sorted multiset diff 必须为 0。若 streaming diff 非 0 但 sorted multiset 为 0，记录为输出顺序差异，不阻塞性能筛选。
 
 3. **full SE acceptance gate**
    - Rust warm index align 与 C++ normal invocation 同机同参数比较。
