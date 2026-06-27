@@ -157,6 +157,39 @@ impl Iterator for RrbsHitIter<'_> {
 
 impl ExactSizeIterator for RrbsHitIter<'_> {}
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RrbsModeRange {
+    pub raw_start: u32,
+    pub raw_end: u32,
+    pub normal_prefix: u32,
+    pub normal_count: u32,
+}
+
+pub(crate) struct RrbsModeRanges {
+    max_modes: usize,
+    ranges: Vec<RrbsModeRange>,
+}
+
+pub(crate) struct RrbsModeBucket<'a> {
+    pub hits: RrbsHitView<'a>,
+    pub normal_prefix: u32,
+    pub normal_count: u32,
+    pub logical_len: u32,
+}
+
+impl RrbsModeRanges {
+    #[inline]
+    fn get(&self, seed_hash: u32, mode: u32, total_kmers: u32) -> Option<RrbsModeRange> {
+        let mode = mode as usize;
+        if mode >= self.max_modes || seed_hash >= total_kmers {
+            return None;
+        }
+        self.ranges
+            .get(seed_hash as usize * self.max_modes + mode)
+            .copied()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct MappedSection {
     pub offset: usize,
@@ -307,6 +340,13 @@ pub struct KmerIndex {
     /// This is not serialized. v10 stores a reusable superset index, while
     /// SE CountSeeds needs C++'s non-BSC logical bucket size.
     pub(crate) rrbs_normal_counts: OnceLock<Vec<u32>>,
+    /// Runtime-only per-kmer/per-mode RRBS spans.
+    ///
+    /// v10 keeps bucket hits in C++ fill order. For SE, most runtime scanning
+    /// is spent skipping hits from other RRBS seed modes. This side table lets
+    /// the hot path jump to the target mode while preserving C++ circular
+    /// randomization over the non-BSC logical bucket.
+    pub(crate) rrbs_mode_ranges: OnceLock<RrbsModeRanges>,
 }
 
 /// Incremental RRBS digestion-site collector for streaming FASTA input.
@@ -725,6 +765,7 @@ impl KmerIndex {
             seed_size,
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
+            rrbs_mode_ranges: OnceLock::new(),
         }
     }
 
@@ -913,6 +954,30 @@ impl KmerIndex {
             .unwrap_or(0)
     }
 
+    pub(crate) fn lookup_rrbs_normal_mode(
+        &self,
+        seed_hash: u32,
+        mode: u32,
+    ) -> Option<RrbsModeBucket<'_>> {
+        let ranges = self
+            .rrbs_mode_ranges
+            .get_or_init(|| self.build_rrbs_mode_ranges());
+        let range = ranges.get(seed_hash, mode, self.total_kmers)?;
+        if range.normal_count == 0 {
+            return None;
+        }
+        let hits = self
+            .rrbs_hit_view()
+            .slice(range.raw_start as usize, range.raw_end as usize)?;
+        let logical_len = self.rrbs_normal_candidate_count(seed_hash);
+        Some(RrbsModeBucket {
+            hits,
+            normal_prefix: range.normal_prefix,
+            normal_count: range.normal_count,
+            logical_len,
+        })
+    }
+
     fn build_rrbs_normal_counts(&self) -> Vec<u32> {
         let rrbs_offsets = self.rrbs_offsets_slice();
         if rrbs_offsets.len() < 2 {
@@ -933,6 +998,64 @@ impl KmerIndex {
             );
         }
         counts
+    }
+
+    fn build_rrbs_mode_ranges(&self) -> RrbsModeRanges {
+        let rrbs_offsets = self.rrbs_offsets_slice();
+        if rrbs_offsets.len() < 2 {
+            return RrbsModeRanges {
+                max_modes: 0,
+                ranges: Vec::new(),
+            };
+        }
+        let rrbs_hits = self.rrbs_hit_view();
+        let mut max_mode = 0usize;
+        for window in rrbs_offsets.windows(2) {
+            for index in window[0] as usize..window[1] as usize {
+                if let Some(hit) = rrbs_hits.get(index) {
+                    let mode = ((hit.chr >> RRBS_MODE_SHIFT) & 0x7f) as usize;
+                    max_mode = max_mode.max(mode + 1);
+                }
+            }
+        }
+        if max_mode == 0 {
+            return RrbsModeRanges {
+                max_modes: 0,
+                ranges: Vec::new(),
+            };
+        }
+
+        let mut ranges = vec![RrbsModeRange::default(); (rrbs_offsets.len() - 1) * max_mode];
+        let mut scratch = vec![RrbsModeRange::default(); max_mode];
+        for (hash, window) in rrbs_offsets.windows(2).enumerate() {
+            for item in &mut scratch {
+                *item = RrbsModeRange::default();
+            }
+            for index in window[0] as usize..window[1] as usize {
+                let Some(hit) = rrbs_hits.get(index) else {
+                    continue;
+                };
+                let mode = ((hit.chr >> RRBS_MODE_SHIFT) & 0x7f) as usize;
+                let range = &mut scratch[mode];
+                if range.raw_start == 0 && range.raw_end == 0 {
+                    range.raw_start = index as u32;
+                }
+                range.raw_end = index as u32 + 1;
+                if hit.chr & RRBS_BSC_FLAG == 0 {
+                    range.normal_count += 1;
+                }
+            }
+
+            let mut normal_prefix = 0u32;
+            let output_start = hash * max_mode;
+            for (mode, range) in scratch.iter_mut().enumerate() {
+                range.normal_prefix = normal_prefix;
+                normal_prefix = normal_prefix.saturating_add(range.normal_count);
+                ranges[output_start + mode] = *range;
+            }
+        }
+
+        RrbsModeRanges { max_modes: max_mode, ranges }
     }
 }
 
@@ -1044,6 +1167,7 @@ fn build_flat_rrbs_index(
             seed_size,
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
+            rrbs_mode_ranges: OnceLock::new(),
         };
     }
 
@@ -1096,6 +1220,7 @@ fn build_flat_rrbs_index(
         seed_size,
         mapped: None,
         rrbs_normal_counts: OnceLock::new(),
+        rrbs_mode_ranges: OnceLock::new(),
     }
 }
 
@@ -1328,6 +1453,7 @@ mod tests {
             seed_size: 12,
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
+            rrbs_mode_ranges: OnceLock::new(),
         };
 
         assert_eq!(index.rrbs_fragment(0, 10, 20), Some((6, 37)));
@@ -1389,11 +1515,71 @@ mod tests {
             seed_size: 12,
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
+            rrbs_mode_ranges: OnceLock::new(),
         };
 
         assert_eq!(index.rrbs_candidate_count(1, true), 3);
         assert_eq!(index.rrbs_candidate_count(1, false), 2);
         assert_eq!(index.rrbs_normal_candidate_count(2), 0);
+    }
+
+    #[test]
+    fn rrbs_mode_ranges_preserve_normal_prefixes() {
+        let index = KmerIndex {
+            total_kmers: 2,
+            max_kmer_num: u32::MAX,
+            index2: Vec::new(),
+            positions: Vec::new(),
+            start_offsets: Vec::new(),
+            rrbs_offsets: vec![0, 6, 6],
+            rrbs_hits: vec![
+                Hit { chr: 0, loc: 10 },
+                Hit {
+                    chr: RRBS_BSC_FLAG | 0,
+                    loc: 11,
+                },
+                Hit {
+                    chr: 1 | (1 << RRBS_MODE_SHIFT),
+                    loc: 20,
+                },
+                Hit {
+                    chr: RRBS_BSC_FLAG | 1 | (1 << RRBS_MODE_SHIFT),
+                    loc: 21,
+                },
+                Hit {
+                    chr: 2 | (1 << RRBS_MODE_SHIFT),
+                    loc: 22,
+                },
+                Hit {
+                    chr: 3 | (2 << RRBS_MODE_SHIFT),
+                    loc: 30,
+                },
+            ],
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
+            seed_size: 12,
+            mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
+            rrbs_mode_ranges: OnceLock::new(),
+        };
+
+        let mode1 = index.lookup_rrbs_normal_mode(0, 1).unwrap();
+        assert_eq!(mode1.normal_prefix, 1);
+        assert_eq!(mode1.normal_count, 2);
+        assert_eq!(mode1.logical_len, 4);
+        assert_eq!(mode1.hits.len(), 3);
+
+        let mode2 = index.lookup_rrbs_normal_mode(0, 2).unwrap();
+        assert_eq!(mode2.normal_prefix, 3);
+        assert_eq!(mode2.normal_count, 1);
+        assert_eq!(mode2.logical_len, 4);
+
+        assert!(index.lookup_rrbs_normal_mode(0, 3).is_none());
+        assert!(index.lookup_rrbs_normal_mode(1, 0).is_none());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::align::gap::gap_align;
 use crate::align::mismatch::count_mismatch;
 use crate::align::profile::RrbsProfile;
 use crate::align::seed::SeedSegment;
-use crate::param::{GHit, FIXELEMENT, MAXSNPS};
+use crate::param::{GHit, Hit, FIXELEMENT, MAXSNPS};
 use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
 use crate::reference::index::{KmerIndex, RRBS_BSC_FLAG, RRBS_CHR_MASK};
@@ -224,6 +224,129 @@ pub fn snp_align_for_chain(
     hits_by_level.into_iter().flatten().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn try_process_rrbs_hit(
+    hit: Hit,
+    coll: &BinSeqCollection,
+    fwd_slice: &[u64],
+    rev_slice: &[u64],
+    read_len: u32,
+    seed_pos_in_read: u32,
+    read_chain: u8,
+    gap_size: u32,
+    nt3: bool,
+    query: &[u64],
+    mask: &[u64],
+    n_count: u32,
+    collector: &mut HitCollector<'_>,
+    profile: Option<&RrbsProfile>,
+) -> bool {
+    let block_id = hit.chr & RRBS_CHR_MASK;
+    let ref_chain = (block_id & 1) as u8;
+    let chr_idx = (block_id / 2) as usize;
+    let anchor = if chr_idx < coll.ref_anchor.len() {
+        coll.ref_anchor[chr_idx]
+    } else {
+        return false;
+    };
+    let rc_offset = if chr_idx + 1 < coll.ref_anchor.len() {
+        coll.ref_anchor[chr_idx + 1] - coll.ref_anchor[chr_idx]
+    } else {
+        return false;
+    };
+
+    let Some(local_start) = hit.loc.checked_sub(seed_pos_in_read) else {
+        return false;
+    };
+
+    let Some(alignment_start) = anchor.checked_add(local_start) else {
+        return false;
+    };
+    let mut generated_reverse = [0u64; FIXELEMENT];
+    let (ref_seq, reference_start) = if ref_chain == 0 {
+        (fwd_slice, alignment_start)
+    } else if !rev_slice.is_empty() {
+        (rev_slice, alignment_start)
+    } else {
+        let window_len = read_len.saturating_add(gap_size);
+        if !coll.fill_reverse_window(chr_idx, local_start, window_len, &mut generated_reverse) {
+            return false;
+        }
+        (&generated_reverse[..], 0)
+    };
+    let ref_offset = reference_start as u64 * 2;
+    if (ref_offset / 64) as usize + query.len() > ref_seq.len() {
+        return false;
+    }
+
+    let strand = (ref_chain << 1) | read_chain;
+    let loc = if ref_chain == 1 {
+        let Some(loc) = rc_offset
+            .checked_sub(read_len)
+            .and_then(|end| end.checked_sub(local_start))
+        else {
+            return false;
+        };
+        loc
+    } else {
+        local_start
+    };
+    let chr = chr_idx as u32;
+
+    let snp_thres = collector.snp_thres();
+    let mm_count = count_mismatch(query, ref_offset, ref_seq, mask, snp_thres, n_count, nt3);
+    if let Some(profile) = profile {
+        profile.add(&profile.mismatch_calls, 1);
+    }
+
+    if mm_count <= snp_thres {
+        let hit = GHit {
+            chr,
+            loc,
+            snps: mm_count as u8,
+            strand,
+            gap_size: 0,
+            gap_pos: 0,
+        };
+        if collector.try_add_hit(hit, read_chain, profile) {
+            return true;
+        }
+    }
+
+    let snp_thres = collector.snp_thres();
+    if gap_size > 0 && mm_count > snp_thres && mm_count <= snp_thres + 2 {
+        if let Some(profile) = profile {
+            profile.add(&profile.gap_attempts, 1);
+        }
+        if let Some(gap_result) = gap_align(
+            query,
+            ref_seq,
+            reference_start,
+            seed_pos_in_read,
+            8,
+            snp_thres,
+            gap_size,
+            nt3,
+            read_len,
+            3,
+        ) {
+            let hit = GHit {
+                chr,
+                loc,
+                snps: gap_result.snp_count as u8,
+                strand,
+                gap_size: gap_result.gap_size as i16,
+                gap_pos: gap_result.gap_pos as u16,
+            };
+            if collector.try_add_hit(hit, read_chain, profile) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// 对单个 segment 执行种子扩展比对。
 ///
 /// 对应 C++ `SnpAlign()` 的单 segment 处理体。
@@ -304,6 +427,66 @@ pub(crate) fn snp_align_segment(
                 }
                 let start = myrand(encoded.index, randseed, 0) as usize
                     % logical_bucket_len;
+
+                if !cross_chain_enabled {
+                    if let Some(mode_bucket) = index.lookup_rrbs_normal_mode(seed_hash, cmodeindex) {
+                        debug_assert_eq!(mode_bucket.logical_len as usize, logical_bucket_len);
+                        if let Some(profile) = profile {
+                            profile.add(
+                                &profile.mode_matched_candidates,
+                                mode_bucket.normal_count as u64,
+                            );
+                        }
+                        let mode_start = mode_bucket.normal_prefix as usize;
+                        let mode_end = mode_start + mode_bucket.normal_count as usize;
+                        let rotation = if start >= mode_start && start < mode_end {
+                            start - mode_start
+                        } else {
+                            0
+                        };
+                        let passes = if rotation == 0 { 1 } else { 2 };
+
+                        for pass in 0..passes {
+                            let mut normal_index = 0usize;
+                            for hit in mode_bucket.hits.iter() {
+                                if hit.chr & RRBS_BSC_FLAG != 0 {
+                                    continue;
+                                }
+                                let emit = if rotation == 0 {
+                                    true
+                                } else if pass == 0 {
+                                    normal_index >= rotation
+                                } else {
+                                    normal_index < rotation
+                                };
+                                normal_index += 1;
+                                if !emit {
+                                    continue;
+                                }
+                                if try_process_rrbs_hit(
+                                    hit,
+                                    coll,
+                                    fwd_slice,
+                                    rev_slice,
+                                    read_len,
+                                    seed_pos_in_read,
+                                    read_chain,
+                                    gap_size,
+                                    nt3,
+                                    query,
+                                    mask,
+                                    n_count,
+                                    collector,
+                                    profile,
+                                ) {
+                                    return true;
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
+
                 let logical_bucket = hits
                     .iter()
                     .filter(|hit| rrbs_bucket_hit_is_eligible(hit, cross_chain_enabled))
@@ -319,113 +502,23 @@ pub(crate) fn snp_align_segment(
                         profile.add(&profile.mode_matched_candidates, 1);
                     }
 
-                    let block_id = hit.chr & RRBS_CHR_MASK;
-                    let ref_chain = (block_id & 1) as u8;
-                    let chr_idx = (block_id / 2) as usize;
-                    let anchor = if chr_idx < coll.ref_anchor.len() {
-                        coll.ref_anchor[chr_idx]
-                    } else {
-                        continue;
-                    };
-                    let rc_offset = if chr_idx + 1 < coll.ref_anchor.len() {
-                        coll.ref_anchor[chr_idx + 1] - coll.ref_anchor[chr_idx]
-                    } else {
-                        continue;
-                    };
-
-                    let Some(local_start) = hit.loc.checked_sub(seed_pos_in_read) else {
-                        continue;
-                    };
-
-                    let Some(alignment_start) = anchor.checked_add(local_start) else {
-                        continue;
-                    };
-                    let mut generated_reverse = [0u64; FIXELEMENT];
-                    let (ref_seq, reference_start) = if ref_chain == 0 {
-                        (fwd_slice, alignment_start)
-                    } else if !rev_slice.is_empty() {
-                        (rev_slice, alignment_start)
-                    } else {
-                        let window_len = read_len.saturating_add(gap_size);
-                        if !coll.fill_reverse_window(
-                            chr_idx,
-                            local_start,
-                            window_len,
-                            &mut generated_reverse,
-                        ) {
-                            continue;
-                        }
-                        (&generated_reverse[..], 0)
-                    };
-                    let ref_offset = reference_start as u64 * 2;
-                    if (ref_offset / 64) as usize + query.len() > ref_seq.len() {
-                        continue;
-                    }
-
-                    let strand = (ref_chain << 1) | read_chain;
-                    let loc = if ref_chain == 1 {
-                        let Some(loc) = rc_offset
-                            .checked_sub(read_len)
-                            .and_then(|end| end.checked_sub(local_start))
-                        else {
-                            continue;
-                        };
-                        loc
-                    } else {
-                        local_start
-                    };
-                    let chr = chr_idx as u32;
-
-                    let snp_thres = collector.snp_thres();
-                    let mm_count =
-                        count_mismatch(query, ref_offset, ref_seq, mask, snp_thres, n_count, nt3);
-                    if let Some(profile) = profile {
-                        profile.add(&profile.mismatch_calls, 1);
-                    }
-
-                    if mm_count <= snp_thres {
-                        let hit = GHit {
-                            chr,
-                            loc,
-                            snps: mm_count as u8,
-                            strand,
-                            gap_size: 0,
-                            gap_pos: 0,
-                        };
-                        if collector.try_add_hit(hit, read_chain, profile) {
-                            return true;
-                        }
-                    }
-
-                    let snp_thres = collector.snp_thres();
-                    if gap_size > 0 && mm_count > snp_thres && mm_count <= snp_thres + 2 {
-                        if let Some(profile) = profile {
-                            profile.add(&profile.gap_attempts, 1);
-                        }
-                        if let Some(gap_result) = gap_align(
-                            query,
-                            ref_seq,
-                            reference_start,
-                            seed_pos_in_read,
-                            8,
-                            snp_thres,
-                            gap_size,
-                            nt3,
-                            read_len,
-                            3,
-                        ) {
-                            let hit = GHit {
-                                chr,
-                                loc,
-                                snps: gap_result.snp_count as u8,
-                                strand,
-                                gap_size: gap_result.gap_size as i16,
-                                gap_pos: gap_result.gap_pos as u16,
-                            };
-                            if collector.try_add_hit(hit, read_chain, profile) {
-                                return true;
-                            }
-                        }
+                    if try_process_rrbs_hit(
+                        hit,
+                        coll,
+                        fwd_slice,
+                        rev_slice,
+                        read_len,
+                        seed_pos_in_read,
+                        read_chain,
+                        gap_size,
+                        nt3,
+                        query,
+                        mask,
+                        n_count,
+                        collector,
+                        profile,
+                    ) {
+                        return true;
                     }
                 }
             }
