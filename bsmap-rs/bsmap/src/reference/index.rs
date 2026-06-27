@@ -163,6 +163,7 @@ pub(crate) struct RrbsModeRange {
     pub raw_end: u32,
     pub normal_prefix: u32,
     pub normal_count: u32,
+    pub normal_is_prefix: bool,
 }
 
 pub(crate) struct RrbsModeRanges {
@@ -175,6 +176,7 @@ pub(crate) struct RrbsModeBucket<'a> {
     pub normal_prefix: u32,
     pub normal_count: u32,
     pub logical_len: u32,
+    pub normal_only: bool,
 }
 
 impl RrbsModeRanges {
@@ -966,15 +968,21 @@ impl KmerIndex {
         if range.normal_count == 0 {
             return None;
         }
+        let slice_end = if range.normal_is_prefix {
+            range.raw_start.saturating_add(range.normal_count)
+        } else {
+            range.raw_end
+        };
         let hits = self
             .rrbs_hit_view()
-            .slice(range.raw_start as usize, range.raw_end as usize)?;
+            .slice(range.raw_start as usize, slice_end as usize)?;
         let logical_len = self.rrbs_normal_candidate_count(seed_hash);
         Some(RrbsModeBucket {
             hits,
             normal_prefix: range.normal_prefix,
             normal_count: range.normal_count,
             logical_len,
+            normal_only: range.normal_is_prefix,
         })
     }
 
@@ -1027,10 +1035,12 @@ impl KmerIndex {
 
         let mut ranges = vec![RrbsModeRange::default(); (rrbs_offsets.len() - 1) * max_mode];
         let mut scratch = vec![RrbsModeRange::default(); max_mode];
+        let mut seen_bsc = vec![false; max_mode];
         for (hash, window) in rrbs_offsets.windows(2).enumerate() {
             for item in &mut scratch {
                 *item = RrbsModeRange::default();
             }
+            seen_bsc.fill(false);
             for index in window[0] as usize..window[1] as usize {
                 let Some(hit) = rrbs_hits.get(index) else {
                     continue;
@@ -1039,10 +1049,16 @@ impl KmerIndex {
                 let range = &mut scratch[mode];
                 if range.raw_start == 0 && range.raw_end == 0 {
                     range.raw_start = index as u32;
+                    range.normal_is_prefix = true;
                 }
                 range.raw_end = index as u32 + 1;
                 if hit.chr & RRBS_BSC_FLAG == 0 {
+                    if seen_bsc[mode] {
+                        range.normal_is_prefix = false;
+                    }
                     range.normal_count += 1;
+                } else {
+                    seen_bsc[mode] = true;
                 }
             }
 
@@ -1076,7 +1092,6 @@ fn visit_rrbs_hits<F>(
                 continue;
             }
             let anchor = coll.ref_anchor[chr_idx];
-            let rc_offset = coll.ref_anchor[chr_idx + 1] - anchor;
             let hit_chr = block_id | ((mode as u32) << RRBS_MODE_SHIFT);
 
             for &loc in &mode_blocks[block_id as usize] {
@@ -1092,7 +1107,16 @@ fn visit_rrbs_hits<F>(
                     visit(hash as usize, Hit { chr: hit_chr, loc });
                 }
             }
+        }
 
+        for block_id in 0..total_blocks as u32 {
+            let chr_idx = (block_id / 2) as usize;
+            if chr_idx + 1 >= coll.ref_anchor.len() {
+                continue;
+            }
+            let anchor = coll.ref_anchor[chr_idx];
+            let rc_offset = coll.ref_anchor[chr_idx + 1] - anchor;
+            let hit_chr = block_id | ((mode as u32) << RRBS_MODE_SHIFT);
             let other_block = (block_id ^ 1) as usize;
             let tmp_offset = rc_offset.saturating_sub(seed_size);
             let cross_hit_chr = hit_chr | RRBS_BSC_FLAG;
@@ -1572,14 +1596,63 @@ mod tests {
         assert_eq!(mode1.normal_count, 2);
         assert_eq!(mode1.logical_len, 4);
         assert_eq!(mode1.hits.len(), 3);
+        assert!(!mode1.normal_only);
 
         let mode2 = index.lookup_rrbs_normal_mode(0, 2).unwrap();
         assert_eq!(mode2.normal_prefix, 3);
         assert_eq!(mode2.normal_count, 1);
         assert_eq!(mode2.logical_len, 4);
+        assert_eq!(mode2.hits.len(), 1);
+        assert!(mode2.normal_only);
 
         assert!(index.lookup_rrbs_normal_mode(0, 3).is_none());
         assert!(index.lookup_rrbs_normal_mode(1, 0).is_none());
+    }
+
+    #[test]
+    fn rrbs_mode_ranges_use_normal_prefix_when_contiguous() {
+        let index = KmerIndex {
+            total_kmers: 1,
+            max_kmer_num: u32::MAX,
+            index2: Vec::new(),
+            positions: Vec::new(),
+            start_offsets: Vec::new(),
+            rrbs_offsets: vec![0, 4],
+            rrbs_hits: vec![
+                Hit {
+                    chr: 1 << RRBS_MODE_SHIFT,
+                    loc: 20,
+                },
+                Hit {
+                    chr: 2 | (1 << RRBS_MODE_SHIFT),
+                    loc: 22,
+                },
+                Hit {
+                    chr: RRBS_BSC_FLAG | 1 | (1 << RRBS_MODE_SHIFT),
+                    loc: 21,
+                },
+                Hit {
+                    chr: 3 | (2 << RRBS_MODE_SHIFT),
+                    loc: 30,
+                },
+            ],
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
+            seed_size: 12,
+            mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
+            rrbs_mode_ranges: OnceLock::new(),
+        };
+
+        let mode1 = index.lookup_rrbs_normal_mode(0, 1).unwrap();
+        assert!(mode1.normal_only);
+        assert_eq!(mode1.normal_count, 2);
+        assert_eq!(mode1.hits.len(), 2);
+        assert!(mode1.hits.iter().all(|hit| hit.chr & RRBS_BSC_FLAG == 0));
     }
 
     #[test]

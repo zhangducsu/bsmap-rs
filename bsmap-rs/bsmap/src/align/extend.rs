@@ -446,40 +446,75 @@ pub(crate) fn snp_align_segment(
                         };
                         let passes = if rotation == 0 { 1 } else { 2 };
 
-                        for pass in 0..passes {
-                            let mut normal_index = 0usize;
-                            for hit in mode_bucket.hits.iter() {
-                                if hit.chr & RRBS_BSC_FLAG != 0 {
-                                    continue;
+                        if mode_bucket.normal_only {
+                            for pass in 0..passes {
+                                for (normal_index, hit) in mode_bucket.hits.iter().enumerate() {
+                                    let emit = if rotation == 0 {
+                                        true
+                                    } else if pass == 0 {
+                                        normal_index >= rotation
+                                    } else {
+                                        normal_index < rotation
+                                    };
+                                    if !emit {
+                                        continue;
+                                    }
+                                    if try_process_rrbs_hit(
+                                        hit,
+                                        coll,
+                                        fwd_slice,
+                                        rev_slice,
+                                        read_len,
+                                        seed_pos_in_read,
+                                        read_chain,
+                                        gap_size,
+                                        nt3,
+                                        query,
+                                        mask,
+                                        n_count,
+                                        collector,
+                                        profile,
+                                    ) {
+                                        return true;
+                                    }
                                 }
-                                let emit = if rotation == 0 {
-                                    true
-                                } else if pass == 0 {
-                                    normal_index >= rotation
-                                } else {
-                                    normal_index < rotation
-                                };
-                                normal_index += 1;
-                                if !emit {
-                                    continue;
-                                }
-                                if try_process_rrbs_hit(
-                                    hit,
-                                    coll,
-                                    fwd_slice,
-                                    rev_slice,
-                                    read_len,
-                                    seed_pos_in_read,
-                                    read_chain,
-                                    gap_size,
-                                    nt3,
-                                    query,
-                                    mask,
-                                    n_count,
-                                    collector,
-                                    profile,
-                                ) {
-                                    return true;
+                            }
+                        } else {
+                            for pass in 0..passes {
+                                let mut normal_index = 0usize;
+                                for hit in mode_bucket.hits.iter() {
+                                    if hit.chr & RRBS_BSC_FLAG != 0 {
+                                        continue;
+                                    }
+                                    let emit = if rotation == 0 {
+                                        true
+                                    } else if pass == 0 {
+                                        normal_index >= rotation
+                                    } else {
+                                        normal_index < rotation
+                                    };
+                                    normal_index += 1;
+                                    if !emit {
+                                        continue;
+                                    }
+                                    if try_process_rrbs_hit(
+                                        hit,
+                                        coll,
+                                        fwd_slice,
+                                        rev_slice,
+                                        read_len,
+                                        seed_pos_in_read,
+                                        read_chain,
+                                        gap_size,
+                                        nt3,
+                                        query,
+                                        mask,
+                                        n_count,
+                                        collector,
+                                        profile,
+                                    ) {
+                                        return true;
+                                    }
                                 }
                             }
                         }
