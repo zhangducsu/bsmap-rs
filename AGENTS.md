@@ -387,3 +387,17 @@
 - 原因：C++ `CCGG_seglen()` 的循环先读取 `sites[right]` 再检查 `right < size`；当命中位于最后一个 CCGG site 之后的 terminal fragment 时，会表现出越界式标签。Rust 保持边界安全，不伪造该标签。
 - 规避：SAM 等价报告中把这 3 条作为已知 C++ 末端标签边界差异单独列出；不要为了 100% 标签一致引入越界读取或硬编码异常。核心比对字段仍按 QNAME/RNAME/POS/FLAG/NM 判断是否一致。
 - 验证：SSH2 1M 默认策略 run `/workspace/benchmark_results/ssh2/20260627T190527Z-4476/summary.json` 中，sorted multiset exact 为 253,099/253,102，expected-only 与 actual-only 样本均为这 3 条记录，差异仅 ZP/ZL。
+
+### 45. PowerShell 管道会破坏 Git patch 文本边界
+
+- 现象：本地用 PowerShell 管道把 `git format-patch` 输出传到 SSH/Docker 后，容器内 `git am` 报类似 `Applying: ﻿From ...`、`fatal: empty ident name`，失败后还可能残留 `.git/rebase-apply`。
+- 原因：PowerShell/native pipe 会按文本对象语义重编码，可能插入 BOM、改写换行或拆分 mbox 头；`git am` 需要 byte-for-byte 的邮件补丁格式，不能容忍这类转换。
+- 规避：需要跨 SSH 同步 patch/bundle 时，先在本地用 `cmd /c git ... > <file>` 生成真实文件，再对文件做 base64 文本传输；容器内校验大小、SHA256、`git am --show-current-patch` 或 `git bundle verify` 后再应用。`git am` 失败后，只有确认没有 `git am/rebase` 进程且仓库路径正确时，才在 Docker 内精确清理该仓库的 `.git/rebase-apply`。
+- 验证：SSH2 中改用文件加 base64 方式后，Docker checkout 成功应用 `fe3f84a` 和 `d406835` 对应补丁，`git status --porcelain` 为空并能构建 release binary。
+
+### 46. 源码搜索必须排除 benchmark 大结果目录
+
+- 现象：在仓库根或 worktree 内直接 `rg` / `grep -R` 搜索 `RunAlign`、`BSMAP_PROFILE_RRBS` 等关键字，会扫到 `benchmark/results*`、历史 SAM、diff 和 comparison 文件，输出数万行甚至拖慢服务器 I/O。
+- 原因：仓库里保留了大量历史 benchmark 结果和 SAM/diff 文本；这些文件内容可能包含源码关键字、read 名称或完整 SAM 记录，普通递归搜索不会自动区分源码与结果。
+- 规避：源码搜索固定限制目录或排除大结果目录，例如 `rg <pattern> bsmap-rs/bsmap/src bsmap-original/bsmap-2.90 -g '!**/benchmark/results*/**' -g '!**/*.sam' -g '!**/*.diff'`。服务器结果目录只搜索 `metadata.tsv`、`summary.json`、`stderr.txt` 等小文件，禁止对整个 run 目录做宽 `grep -R`。
+- 验证：SSH2 中误开的 `grep -R BSMAP_PROFILE_RRBS /workspace/benchmark_results/ssh2` 被终止后，改用 `find ... -path '*/stderr.txt' | xargs grep` 只读取小日志文件，未再影响正在运行的 full benchmark。

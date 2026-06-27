@@ -171,8 +171,72 @@ SAM 摘要：
 |---:|---:|---:|---|---|
 | 1,000,000 | 253,102 | 253,102 | `44fcf583903fb063245ecf4dec77843aa20317300d681d5207e46729dfe1f92a` | `f8e5ed0d568313828d7a2fed220ca94cd7a12197409be152fa45c2723e910c34` |
 
+full SE 复测支持：`fe3f84a bench: allow full SSH2 RRBS SE runs`。
+
+- `SSH2_LIMITS=full` 时 runner 不再传 `-E`，用于验证真实 full RRBS SE。
+- 运行路径：`/workspace/benchmark_results/ssh2/20260627T194342Z-5737/summary.json`。
+- Docker commit：`6aa44ef193cbe36d0e0f4eb8a9875278ad1eeca4`，对应本地提交 `fe3f84a`。
+- Rust binary SHA256：`1b601d5e234aef043faf3d34c581ddacfe6226d7533e74d1a04a0c7e20721870`。
+- C++ binary SHA256：`d74f45b109c3229a11b453bb65d57659dbfbdfc0fc40a92937fa9c54d24191a6`。
+
+| case | wall | user | sys | CPU | RSS KiB | mapped | SAM diff | 判定 |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| Rust full SE | 1286.32 s | 8819.69 s | 163.49 s | 698% | 1,723,652 | 8,873,078 | sorted multiset 8,873,043/8,873,078；35 条仅 C++ terminal ZP/ZL 边界标签差异 | RSS 低于 C++，wall 慢于 C++，未达 SSH2 |
+| C++ full SE | 1041.84 s | 7674.27 s | 164.52 s | 752% | 2,538,788 | 8,873,078 | baseline | 当前同 runner 同参数 C++ full 基线 |
+
+full 结论：
+
+- Rust mapped、Top RNAME 分布与 C++ 对齐，不再有 SSH1 full mapped 多 124 条的问题。
+- Rust RSS 约 1.64 GiB，低于 C++ 约 2.42 GiB。
+- Rust wall 仍为 C++ 的 1.235 倍，距离 `<= C++ / 2` 差距很大；SSH2 不能用 1M 抽样替代 full 结论。
+- Rust stderr 中核心比对耗时为 1117.572323 s，总耗时为 1286.16 s，瓶颈主要在 align core，不是 standalone index 或报告口径。
+
+保留优化：`d406835 perf: add RRBS mode range lookup`。
+
+- 新增运行时 RRBS mode side table，SE 默认关闭 cross-chain 时按 `(seed_hash, cmodeindex)` 直接定位 mode bucket。
+- 保留 C++ 随机起点对 non-BSC logical bucket 的取模语义；PE 或 `-n 1` 仍走原完整 bucket 路径。
+- 目标是减少扫描非目标 mode 的 bucket 成本；不改变进入 mismatch 的语义条件。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 通过。
+
+mode range 10K/100K 复测路径：`/workspace/benchmark_results/ssh2/20260627T204859Z-6991/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | Rust/C++ wall | SAM diff | 判定 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 10,000 | 1.94 s | 494% | 1,002,120 | 66.10 s | 100% | 2,057,220 | 0.029 | streaming diff 0；sorted diff 0 | side table 首次构建成本压过小样本收益 |
+| 100,000 | 10.80 s | 709% | 1,019,656 | 78.00 s | 115% | 2,117,744 | 0.138 | streaming diff 0；sorted diff 0 | 相对 reverse-cache 默认 11.05 s 小幅改善 |
+
+mode range 1M 复测路径：`/workspace/benchmark_results/ssh2/20260627T205310Z-7153/summary.json`。
+
+Rust binary SHA256：`1148a530288ae4e9453e503a0092a0cbc8e44205db9f27c4f92dbca75f7920e3`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | Rust/C++ wall | SAM diff | 判定 |
+|---:|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 1,000,000 | 42.35 s | 551% | 1,830,968 | 100.01 s | 296% | 2,487,628 | 0.423 | sorted multiset 253,099/253,102；仍仅 3 条 C++ terminal ZP/ZL 边界标签差异 | 相对 reverse-cache 默认 46.09 s 改善约 8.1%，RSS 增加约 108 MiB |
+
+mode range full 复测路径：`/workspace/benchmark_results/ssh2/20260627T205842Z-7339/summary.json`。
+
+- Docker commit：`1cda4fb6fd28b6db5038e86fa8b955ceffd93ba4`，对应本地提交 `d406835`。
+- Rust binary SHA256：`1148a530288ae4e9453e503a0092a0cbc8e44205db9f27c4f92dbca75f7920e3`。
+- C++ binary SHA256：`d74f45b109c3229a11b453bb65d57659dbfbdfc0fc40a92937fa9c54d24191a6`。
+- Reference SHA256：`db16cb4633191754f1d9cc70e73d2a1f60d03fdf62bcf4902a31a4717a3d2de7`。
+- Rust warm align 不包含 standalone index；run 前后 index SHA256 均为 `1329966ddda5aedd9fc7e13cb84a4e755cd632df3d14a0de32a239a29561e634`。
+
+| case | wall | user | sys | CPU | RSS KiB | mapped | FLAG 分布 | Top RNAME | SAM diff | 判定 |
+|---|---:|---:|---:|---:|---:|---:|---|---|---|---|
+| Rust full SE | 1134.39 s | 7536.25 s | 154.93 s | 678% | 1,831,660 | 8,873,078 | 0:3,540,475；16:3,572,901；256:880,617；272:879,085 | chr1 6.6778% | sorted multiset 8,873,043/8,873,078；35 条仅 C++ terminal ZP/ZL 边界标签差异 | 相对旧 Rust full 1286.32 s 改善约 11.8%；RSS 仍低于 C++ |
+| C++ full SE | 1050.84 s | 7682.63 s | 218.65 s | 751% | 2,539,832 | 8,873,078 | 0:3,540,475；16:3,572,901；256:880,617；272:879,085 | chr1 6.6778% | baseline | 当前同 runner 同参数 C++ full 基线 |
+
+mode range full 结论：
+
+- 该优化值得保留：full wall 从 1286.32 s 降到 1134.39 s，user time 从 8819.69 s 降到 7536.25 s；SAM mapped、FLAG 分布、Top RNAME 和 sorted multiset 维持原有等价水平。
+- 该优化没有达成 SSH2 目标：Rust full 仍为 C++ full 的 1.080 倍，而目标是 `<= C++ / 2`，即本轮 C++ 1050.84 s 下应 `<= 525.42 s`。
+- Rust full RSS 为 1,831,660 KiB，低于 C++ 2,539,832 KiB，内存目标方向正确。
+- Rust stderr 中核心比对耗时为 956.821642 s，总耗时为 1134.21 s；继续优化必须优先压缩 align core 或提高与读写阶段的重叠，单纯减少 SAM 格式化无法达到 SSH2 目标。
+
 ## 未解决项
 
-- SSH2 1M 默认策略已达速度/RSS 门槛；full SE 本轮尚未重跑，不能把 1M 结果写成 full 已验证结论。
-- 1M sorted multiset 仍有 3 条 `ZP/ZL` 差异；源码证据指向 C++ `CCGG_seglen()` 在最后一个 CCGG site 后的末端 fragment 上先解引用再检查边界。Rust 保持安全行为，不伪造该越界式标签。
+- SSH2 1M 默认策略与 mode-range 策略均已达速度/RSS 门槛；full SE 证明 mode-range 有收益但未达 SSH2 速度目标。
+- 1M sorted multiset 仍有 3 条 `ZP/ZL` 差异，full sorted multiset 仍有 35 条 `ZP/ZL` 差异；源码证据指向 C++ `CCGG_seglen()` 在最后一个 CCGG site 后的末端 fragment 上先解引用再检查边界。Rust 保持安全行为，不伪造该越界式标签。
 - reverse cache 会把 RRBS 大样本 RSS 从约 0.87 GiB 提高到约 1.64 GiB，但仍低于 C++ 1M 的约 2.37 GiB；若未来在内存更小机器上运行，可用 `BSMAP_RRBS_MATERIALIZE_REVERSE=0` 强制关闭。
+- full 主要瓶颈在 align core。下一步优先评估非 64-bit 对齐 offset 的 mismatch kernel、RRBS SE normal-only index/view、读写与 align pipeline，以及 C++ AddHit 早停触发频率是否完全等价；SAM 语义必须先保持 QNAME/RNAME/POS/FLAG/NM 对齐。
+- 现有 `count_mismatch_simd` 未接入 `extend.rs` 热路径，且仅优化 `bit_offset == 0`；直接接入可能收益有限，真正值得评估的是非对齐 offset 的 SIMD 或专用 kernel。
