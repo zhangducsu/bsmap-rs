@@ -16,7 +16,7 @@ use crate::align::gap::gap_align;
 use crate::align::mismatch::count_mismatch;
 use crate::align::profile::RrbsProfile;
 use crate::align::seed::SeedSegment;
-use crate::param::{GHit, Hit, FIXELEMENT, MAXSNPS};
+use crate::param::{GHit, FIXELEMENT, MAXSNPS};
 use crate::reads::encode::EncodedRead;
 use crate::reference::binseq::BinSeqCollection;
 use crate::reference::index::{KmerIndex, RRBS_BSC_FLAG, RRBS_CHR_MASK};
@@ -56,37 +56,6 @@ fn circular_wgbs_positions<'a>(
 #[inline]
 fn rrbs_bucket_hit_is_eligible(hit: &crate::param::Hit, cross_chain_enabled: bool) -> bool {
     cross_chain_enabled || hit.chr & RRBS_BSC_FLAG == 0
-}
-
-#[inline]
-fn rrbs_logical_start_raw_index<F>(
-    raw_len: usize,
-    logical_start: usize,
-    cross_chain_enabled: bool,
-    mut get_hit: F,
-) -> Option<usize>
-where
-    F: FnMut(usize) -> Option<Hit>,
-{
-    if raw_len == 0 {
-        return None;
-    }
-    if cross_chain_enabled {
-        return Some(logical_start % raw_len);
-    }
-
-    let mut seen = 0usize;
-    for raw_idx in 0..raw_len {
-        let hit = get_hit(raw_idx)?;
-        if !rrbs_bucket_hit_is_eligible(&hit, false) {
-            continue;
-        }
-        if seen == logical_start {
-            return Some(raw_idx);
-        }
-        seen += 1;
-    }
-    None
 }
 
 /// C++ `AddHit()` 等价状态，由两条 read-chain 和全部 segment 共享。
@@ -338,31 +307,16 @@ pub(crate) fn snp_align_segment(
                 if let Some(profile) = profile {
                     profile.add(&profile.logical_bucket_candidates, logical_bucket_len as u64);
                 }
-                let raw_bucket_len = hits.len();
-                let start = myrand(encoded.index, randseed, 0) as usize % logical_bucket_len;
-                let Some(mut raw_idx) = rrbs_logical_start_raw_index(
-                    raw_bucket_len,
-                    start,
-                    cross_chain_enabled,
-                    |idx| hits.get(idx),
-                ) else {
-                    continue;
-                };
-                let mut visited_logical = 0usize;
+                let start = myrand(encoded.index, randseed, 0) as usize
+                    % logical_bucket_len;
+                let logical_bucket = hits
+                    .iter()
+                    .filter(|hit| rrbs_bucket_hit_is_eligible(hit, cross_chain_enabled))
+                    .cycle()
+                    .skip(start)
+                    .take(logical_bucket_len);
 
-                while visited_logical < logical_bucket_len {
-                    let Some(hit) = hits.get(raw_idx) else {
-                        break;
-                    };
-                    raw_idx += 1;
-                    if raw_idx == raw_bucket_len {
-                        raw_idx = 0;
-                    }
-                    if !rrbs_bucket_hit_is_eligible(&hit, cross_chain_enabled) {
-                        continue;
-                    }
-                    visited_logical += 1;
-
+                for hit in logical_bucket {
                     if ((hit.chr ^ read_chain_mask) >> 16) != cmodeindex {
                         continue;
                     }
@@ -744,73 +698,6 @@ mod tests {
 
         assert_eq!(se, vec![10, 30]);
         assert_eq!(pe, vec![10, 20, 30]);
-    }
-
-    fn rrbs_manual_logical_order(hits: &[Hit], start: usize, cross_chain_enabled: bool) -> Vec<u32> {
-        let logical_len = hits
-            .iter()
-            .filter(|hit| rrbs_bucket_hit_is_eligible(hit, cross_chain_enabled))
-            .count();
-        let mut raw_idx = rrbs_logical_start_raw_index(
-            hits.len(),
-            start,
-            cross_chain_enabled,
-            |idx| hits.get(idx).copied(),
-        )
-        .expect("non-empty logical bucket");
-        let mut locs = Vec::with_capacity(logical_len);
-
-        while locs.len() < logical_len {
-            let hit = hits[raw_idx];
-            raw_idx += 1;
-            if raw_idx == hits.len() {
-                raw_idx = 0;
-            }
-            if rrbs_bucket_hit_is_eligible(&hit, cross_chain_enabled) {
-                locs.push(hit.loc);
-            }
-        }
-
-        locs
-    }
-
-    #[test]
-    fn rrbs_manual_logical_bucket_order_matches_iterator_semantics() {
-        let hits = [
-            Hit { chr: 0, loc: 10 },
-            Hit {
-                chr: RRBS_BSC_FLAG,
-                loc: 20,
-            },
-            Hit { chr: 2, loc: 30 },
-            Hit {
-                chr: RRBS_BSC_FLAG | 4,
-                loc: 40,
-            },
-            Hit { chr: 6, loc: 50 },
-        ];
-
-        for cross_chain_enabled in [false, true] {
-            let logical_len = hits
-                .iter()
-                .filter(|hit| rrbs_bucket_hit_is_eligible(hit, cross_chain_enabled))
-                .count();
-            for start in 0..logical_len {
-                let expected = hits
-                    .iter()
-                    .filter(|hit| rrbs_bucket_hit_is_eligible(hit, cross_chain_enabled))
-                    .cycle()
-                    .skip(start)
-                    .take(logical_len)
-                    .map(|hit| hit.loc)
-                    .collect::<Vec<_>>();
-
-                assert_eq!(
-                    rrbs_manual_logical_order(&hits, start, cross_chain_enabled),
-                    expected
-                );
-            }
-        }
     }
 
     #[test]
