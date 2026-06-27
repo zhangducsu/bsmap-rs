@@ -359,3 +359,10 @@
 - 原因：Rust 没有保留 C++ `xseedreg_array`/`CountSeeds()` 的 seed mask 权重语义，把含 `N` 的 seed 当成普通 seed 排序；同时扩展阶段错误使用 `reg_mask == 0` 跳过扫描。C++ 只在 CountSeeds 中用 `<< 12` 惩罚含 `N` seed 的 candidate count，`SnpAlign()` 仍扫描这些 seed。
 - 规避：RRBS seed 调度必须从 `EncodedRead` mask 提取 C++ 等价 seed mask，并只用于候选计数排序；扩展阶段不得因为该 mask 跳过 seed。任何相关改动必须同时跑目标 read `-r 2`、10K 和 100K 的 streaming/sorted SAM 对比。
 - 验证：提交 `9709b55` 后，两条目标 read 的默认输出和 `-r 2` sorted multiset 均与 C++ 完全一致；SSH2 100K RRBS SE 达到 streaming diff 0、sorted multiset diff 0。
+
+### 41. `git fetch origin <branch>` 不一定更新 Docker 内 remote-tracking ref
+
+- 现象：Docker checkout 中执行 `git fetch origin codex/ssh2-rrbs-production-optimization` 后，输出只显示 `<branch> -> FETCH_HEAD`；随后 `git reset --hard origin/codex/ssh2-rrbs-production-optimization` 把仓库退回旧提交 `da926d8`。
+- 原因：该 fetch 形式只保证更新 `FETCH_HEAD`，不一定更新已有的 `refs/remotes/origin/<branch>`；reset remote-tracking ref 时可能使用陈旧引用。
+- 规避：服务器 Docker 同步分支时使用显式 refspec：`git fetch origin <branch>:refs/remotes/origin/<branch>`，然后 reset 到 `refs/remotes/origin/<branch>`；或者直接 `git reset --hard FETCH_HEAD`，但必须先核对 `git rev-parse FETCH_HEAD`。
+- 验证：改用显式 refspec 后，Docker checkout 从 `da926d8` 正确更新到 `ebd6f50`，`git status --porcelain` 为空。
