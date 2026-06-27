@@ -915,7 +915,8 @@ fn run_single_align(
 ) -> Result<()> {
     info!("开始单端比对...");
 
-    if config.pipeline_depth <= 1 {
+    let pipeline_depth = effective_single_pipeline_depth(config);
+    if pipeline_depth <= 1 {
         run_single_align_serial(args, config, index, coll, output, stats)?;
         info!("单端比对完成");
         return Ok(());
@@ -935,7 +936,6 @@ fn run_single_align(
     // 批量处理
     let mut alignment_core = Duration::ZERO;
 
-    let pipeline_depth = config.pipeline_depth.max(1);
     let (sender, receiver) = sync_channel(pipeline_depth);
 
     std::thread::scope(|scope| -> Result<()> {
@@ -993,6 +993,15 @@ fn run_single_align(
 // ─────────────────────────────────────────────────────────────────────────────
 // 双端比对流程
 // ─────────────────────────────────────────────────────────────────────────────
+
+fn effective_single_pipeline_depth(config: &AlignConfig) -> usize {
+    let requested = config.pipeline_depth.max(1);
+    if config.rrbs_flag && requested == 1 {
+        2
+    } else {
+        requested
+    }
+}
 
 /// 运行双端比对。
 ///
@@ -1535,6 +1544,18 @@ mod tests {
         assert_eq!(stats.n_aligned.load(Ordering::Relaxed), 100);
         assert_eq!(stats.n_unique.load(Ordering::Relaxed), 60);
         assert_eq!(stats.n_multiple.load(Ordering::Relaxed), 40);
+    }
+
+    #[test]
+    fn rrbs_single_align_uses_default_pipeline_depth() {
+        let mut config = AlignConfig::default();
+        assert_eq!(effective_single_pipeline_depth(&config), 1);
+
+        config.rrbs_flag = true;
+        assert_eq!(effective_single_pipeline_depth(&config), 2);
+
+        config.pipeline_depth = 4;
+        assert_eq!(effective_single_pipeline_depth(&config), 4);
     }
 
     #[test]
