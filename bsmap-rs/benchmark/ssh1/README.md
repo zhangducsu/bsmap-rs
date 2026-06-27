@@ -26,3 +26,17 @@ bash bsmap-rs/benchmark/ssh1/run_server_rrbs.sh \
 ```
 
 输出包含 `metadata.tsv`、每个 case 的 `time.json`/`sam_stats.json`、Rust/C++ 字段 diff 和总 `summary.json`。
+
+RRBS 热路径诊断需要显式开启，开启后只用于定位瓶颈，不作为正式性能基线：
+
+```bash
+SSH1_PROFILE_RRBS=1 SSH1_CASES="10k_se" \
+bash bsmap-rs/benchmark/ssh1/run_server_rrbs.sh \
+  /workspace/02_software/bsmap-rs \
+  /workspace/benchmark_results/ssh1
+```
+
+开启后 Rust case 的 `stderr.txt` 会包含 `BSMAP_PROFILE_RRBS key=value`，包括
+read/prepare/align/write 阶段耗时以及 RRBS candidate/mismatch/hit 计数；`summary.json`
+会把这些值汇总到 `cases.<case>.rrbs_profile`。正式 Rust/C++ wall time 对比应使用
+`SSH1_PROFILE_RRBS=0` 的 warm run。

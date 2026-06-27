@@ -16,6 +16,7 @@ Environment:
   READ_1_FULL=/workspace/00_data/rrbs/Ctrl_R1.fq.gz
   READ_2_FULL=/workspace/00_data/rrbs/Ctrl_R2.fq.gz
   RUST_BINARY, CPP_BINARY, THREADS, RANDOM_SEED
+  SSH1_PROFILE_RRBS=1 enables Rust-only RRBS hot-path counters in stderr.
 
 Rust alignment timing requires REFERENCE.bsi to already exist. The index SHA is
 checked before and after the run; standalone index time is intentionally excluded.
@@ -46,6 +47,7 @@ readonly CPP_BINARY="${CPP_BINARY:-$REPO_ROOT/bsmap-original/bsmap-2.90/bsmap}"
 readonly THREADS="${THREADS:-8}"
 readonly RANDOM_SEED="${RANDOM_SEED:-1}"
 readonly CASE_SPEC="${SSH1_CASES:-10k_se 10k_pe}"
+readonly PROFILE_RRBS="${SSH1_PROFILE_RRBS:-0}"
 readonly -a COMMON_ARGS=(-s 12 -v 0.08 -I 4 -D C-CGG -p "$THREADS" -S "$RANDOM_SEED")
 
 for command_name in date git ln mkdir python3 readlink sha256sum stat; do
@@ -113,6 +115,7 @@ write_metadata threads "$THREADS"
 write_metadata random_seed "$RANDOM_SEED"
 write_metadata rrbs_parameters "-s 12 -v 0.08 -I 4 -D C-CGG -p $THREADS -S $RANDOM_SEED"
 write_metadata standalone_index_included false
+write_metadata rrbs_profile_enabled "$PROFILE_RRBS"
 
 if [[ "$CASE_SPEC" == "all" ]]; then
   CASES=(10k_se 10k_pe full_se full_pe)
@@ -143,14 +146,18 @@ run_case() {
   local sam_path="$case_dir/output.sam"
   local status
   local -a command=("$@")
+  local -a env_args=()
+  if [[ "$case_name" == rust_* && "$PROFILE_RRBS" != "0" ]]; then
+    env_args=(env BSMAP_PROFILE_RRBS=1)
+  fi
   mkdir -p "$case_dir"
   : > "$sam_path"
-  printf '%q ' "${command[@]}" > "$case_dir/command.txt"
+  printf '%q ' "${env_args[@]}" "${command[@]}" > "$case_dir/command.txt"
   printf '\n' >> "$case_dir/command.txt"
 
   set +e
   /usr/bin/time -v -o "$case_dir/time.txt" -- \
-    "${command[@]}" > "$case_dir/stdout.txt" 2> "$case_dir/stderr.txt"
+    "${env_args[@]}" "${command[@]}" > "$case_dir/stdout.txt" 2> "$case_dir/stderr.txt"
   status=$?
   set -e
   printf '%s\n' "$status" > "$case_dir/exit_code.txt"

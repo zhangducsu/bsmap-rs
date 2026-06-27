@@ -310,3 +310,10 @@
 - 原因：PowerShell/native pipe、Windows `tar` 和 NTFS 路径规则会影响二进制 archive 流和部分 Linux 风格文件名；该问题发生在基线工作区导出阶段，不代表源码或 Cargo 构建失败。
 - 规避：不要在 Windows 上为本仓库做全量 archive 解包。需要构建 Rust baseline 时，只导出构建必需路径，例如 `bsmap-rs/Cargo.toml`、`bsmap-rs/Cargo.lock`、`bsmap-rs/bsmap`、`bsmap-rs/methratio`、`bsmap-rs/bsp2sam`；或在 WSL ext4 中使用干净 clone/sparse checkout。
 - 验证：S1 baseline `9a4f7ca` 使用构建必需路径导出到 `D:/BSMAP/scratch/s1-baseline-9a4f7ca` 后，`cargo build --release -p bsmap` 成功，baseline binary SHA256 为 `96ac6f102b77245444a40a802132a46148a69a90c4030ecf8ea769341c088186`。
+
+### 34. 托管 PowerShell 可能没有可用 Python 解释器
+
+- 现象：`python -m py_compile ...` 和 `python3 -m py_compile ...` 直接报命令不存在；`py -3` 存在但返回 `No installed Python found!`。
+- 原因：Windows Python launcher 可能已安装，但托管 sandbox 的 PATH 中没有真实 Python 解释器；这与 benchmark 脚本语法是否正确无关。
+- 规避：不要把该错误写成脚本回归。优先在 WSL2 登录 shell 或服务器 Docker 内执行 `python3 -m py_compile benchmark/ssh1/*.py`；本地 sandbox 只能记录为环境限制。
+- 验证：先用 `Get-Command python,python3,py -ErrorAction SilentlyContinue` 区分 launcher 与解释器，再在可用 Linux 环境中补跑 py_compile。

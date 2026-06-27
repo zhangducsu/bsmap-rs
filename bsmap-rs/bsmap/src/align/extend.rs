@@ -14,6 +14,7 @@ use std::collections::HashSet;
 
 use crate::align::gap::gap_align;
 use crate::align::mismatch::count_mismatch;
+use crate::align::profile::RrbsProfile;
 use crate::align::seed::SeedSegment;
 use crate::param::{GHit, FIXELEMENT, MAXSNPS};
 use crate::reads::encode::EncodedRead;
@@ -97,7 +98,12 @@ impl<'a> HitCollector<'a> {
     }
 
     /// 按 C++ `AddHit()` 顺序接收一个已完成边界检查的命中。
-    fn try_add_hit(&mut self, hit: GHit, read_chain: u8) -> bool {
+    fn try_add_hit(
+        &mut self,
+        hit: GHit,
+        read_chain: u8,
+        profile: Option<&RrbsProfile>,
+    ) -> bool {
         let snp_level = hit.snps as usize;
         let read_chain = read_chain as usize;
         if read_chain >= self.level_counts.len() || snp_level >= self.hits.len() {
@@ -126,10 +132,19 @@ impl<'a> HitCollector<'a> {
 
         self.hits[snp_level].push(hit);
         self.level_counts[read_chain][snp_level] += 1;
+        if let Some(profile) = profile {
+            profile.add(&profile.accepted_hits, 1);
+            if hit.gap_size != 0 {
+                profile.add(&profile.gap_accepted_hits, 1);
+            }
+        }
 
         let combined = self.level_counts[0][snp_level] + self.level_counts[1][snp_level];
         if combined >= self.max_hits {
             if snp_level == 0 {
+                if let Some(profile) = profile {
+                    profile.add(&profile.early_stops, 1);
+                }
                 return true;
             }
             *self.snp_thres = snp_level as u32 - 1;
@@ -235,6 +250,17 @@ pub(crate) fn snp_align_segment(
     let read_len = encoded.read_len();
     let fwd_slice = coll.refcat.as_slice();
     let rev_slice = coll.crefcat.as_slice();
+    let is_rrbs = index.has_rrbs_index();
+    let profile = if is_rrbs {
+        crate::align::profile::rrbs_profile()
+    } else {
+        None
+    };
+    if is_rrbs {
+        if let Some(profile) = profile {
+            profile.add(&profile.segment_calls, 1);
+        }
+    }
 
     let seeds = segment.seeds();
     let reg_masks = segment.reg_masks();
@@ -251,9 +277,13 @@ pub(crate) fn snp_align_segment(
         };
 
         // ── RRBS mode: positions from flat hit storage ──
-        if index.has_rrbs_index() {
+        if is_rrbs {
             let hits = index.lookup_rrbs(seed_hash);
             if !hits.is_empty() {
+                if let Some(profile) = profile {
+                    profile.add(&profile.nonempty_seed_buckets, 1);
+                    profile.add(&profile.raw_bucket_candidates, hits.len() as u64);
+                }
                 let modeindex = segment.index as u32;
                 let max_mode = read_len / index.seed_size;
                 if max_mode == 0 || modeindex >= max_mode {
@@ -274,6 +304,9 @@ pub(crate) fn snp_align_segment(
                 if logical_bucket_len == 0 {
                     continue;
                 }
+                if let Some(profile) = profile {
+                    profile.add(&profile.logical_bucket_candidates, logical_bucket_len as u64);
+                }
                 let start = myrand(encoded.index, randseed, 0) as usize
                     % logical_bucket_len;
                 let logical_bucket = hits
@@ -286,6 +319,9 @@ pub(crate) fn snp_align_segment(
                 for hit in logical_bucket {
                     if ((hit.chr ^ read_chain_mask) >> 16) != cmodeindex {
                         continue;
+                    }
+                    if let Some(profile) = profile {
+                        profile.add(&profile.mode_matched_candidates, 1);
                     }
 
                     let block_id = hit.chr & RRBS_CHR_MASK;
@@ -348,6 +384,9 @@ pub(crate) fn snp_align_segment(
                     let snp_thres = collector.snp_thres();
                     let mm_count =
                         count_mismatch(query, ref_offset, ref_seq, mask, snp_thres, n_count, nt3);
+                    if let Some(profile) = profile {
+                        profile.add(&profile.mismatch_calls, 1);
+                    }
 
                     if mm_count <= snp_thres {
                         let hit = GHit {
@@ -358,13 +397,16 @@ pub(crate) fn snp_align_segment(
                             gap_size: 0,
                             gap_pos: 0,
                         };
-                        if collector.try_add_hit(hit, read_chain) {
+                        if collector.try_add_hit(hit, read_chain, profile) {
                             return true;
                         }
                     }
 
                     let snp_thres = collector.snp_thres();
                     if gap_size > 0 && mm_count > snp_thres && mm_count <= snp_thres + 2 {
+                        if let Some(profile) = profile {
+                            profile.add(&profile.gap_attempts, 1);
+                        }
                         if let Some(gap_result) = gap_align(
                             query,
                             ref_seq,
@@ -385,7 +427,7 @@ pub(crate) fn snp_align_segment(
                                 gap_size: gap_result.gap_size as i16,
                                 gap_pos: gap_result.gap_pos as u16,
                             };
-                            if collector.try_add_hit(hit, read_chain) {
+                            if collector.try_add_hit(hit, read_chain, profile) {
                                 return true;
                             }
                         }
@@ -439,7 +481,7 @@ pub(crate) fn snp_align_segment(
                         gap_size: 0,
                         gap_pos: 0,
                     };
-                    if collector.try_add_hit(hit, read_chain) {
+                    if collector.try_add_hit(hit, read_chain, None) {
                         return true;
                     }
                 }
@@ -466,7 +508,7 @@ pub(crate) fn snp_align_segment(
                             gap_size: gap_result.gap_size as i16,
                             gap_pos: gap_result.gap_pos as u16,
                         };
-                        if collector.try_add_hit(hit, read_chain) {
+                        if collector.try_add_hit(hit, read_chain, None) {
                             return true;
                         }
                     }
@@ -707,8 +749,8 @@ mod tests {
             &mut dedup_gap,
         );
 
-        assert!(!collector.try_add_hit(hit(91, 0), 0));
-        assert!(!collector.try_add_hit(hit(90, 0), 0));
+        assert!(!collector.try_add_hit(hit(91, 0), 0, None));
+        assert!(!collector.try_add_hit(hit(90, 0), 0, None));
         drop(collector);
 
         assert_eq!(hits[0].len(), 1);
@@ -741,7 +783,7 @@ mod tests {
         {
             let mut candidate = hit(loc, 0);
             candidate.strand = (ref_chain << 1) | read_chain;
-            assert!(!collector.try_add_hit(candidate, read_chain));
+            assert!(!collector.try_add_hit(candidate, read_chain, None));
         }
         drop(collector);
 
@@ -772,8 +814,8 @@ mod tests {
             &mut dedup_gap,
         );
 
-        assert!(!collector.try_add_hit(hit(100, 1), 0));
-        assert!(!collector.try_add_hit(hit(100, 1), 1));
+        assert!(!collector.try_add_hit(hit(100, 1), 0, None));
+        assert!(!collector.try_add_hit(hit(100, 1), 1, None));
         drop(collector);
 
         assert_eq!(hits[1].len(), 1);
@@ -800,8 +842,8 @@ mod tests {
             &mut dedup_gap,
         );
 
-        assert!(!collector.try_add_hit(hit(100, 1), 0));
-        assert!(!collector.try_add_hit(hit(200, 1), 0));
+        assert!(!collector.try_add_hit(hit(100, 1), 0, None));
+        assert!(!collector.try_add_hit(hit(200, 1), 0, None));
         drop(collector);
 
         assert_eq!(counts[0][1], 2);
@@ -827,11 +869,11 @@ mod tests {
             &mut dedup_gap,
         );
 
-        assert!(!collector.try_add_hit(hit(100, 2), 0));
-        assert!(!collector.try_add_hit(hit(200, 2), 1));
+        assert!(!collector.try_add_hit(hit(100, 2), 0, None));
+        assert!(!collector.try_add_hit(hit(200, 2), 1, None));
         assert_eq!(collector.snp_thres(), 1);
-        assert!(!collector.try_add_hit(hit(300, 0), 0));
-        assert!(collector.try_add_hit(hit(400, 0), 1));
+        assert!(!collector.try_add_hit(hit(300, 0), 0, None));
+        assert!(collector.try_add_hit(hit(400, 0), 1, None));
         drop(collector);
 
         assert_eq!(counts[0][2] + counts[1][2], 2);

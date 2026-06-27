@@ -26,6 +26,7 @@ pub mod extend;
 pub mod gap;
 pub mod mismatch;
 pub mod output;
+pub mod profile;
 pub mod seed;
 
 // 重新导出核心类型，方便外部使用

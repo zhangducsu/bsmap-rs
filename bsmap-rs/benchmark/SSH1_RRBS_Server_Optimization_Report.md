@@ -108,3 +108,17 @@ bash bsmap-rs/benchmark/ssh1/run_server_rrbs.sh \
 
 - full SE 已在 Docker 后台启动，完成后需要补入最终 wall/RSS/字段 diff；旧 full SE 只能作为诊断基线。
 - 若 normal-count 缓存收益不足，下一步继续定位 mismatch/extend 候选数量、SAM 输出和 gzip/read 阶段耗时。
+
+## 2026-06-24 追加：RRBS 热路径 profiling
+
+本轮新增 opt-in 诊断能力，不改变默认生产行为，也不改变 SAM 语义：
+
+- `bsmap/src/align/profile.rs` 新增 `BSMAP_PROFILE_RRBS=1` 环境变量开关。
+- 默认关闭；关闭时仅在 RRBS segment 入口做轻量开关判断，不输出任何 profile 行；WGBS 路径不查询 profile。
+- 开启时统计 read/prepare/align/write 阶段耗时，以及 RRBS segment 调用数、非空 seed bucket、raw/logical candidate 数、mode/read-chain 过滤后进入 mismatch 的候选数、mismatch 调用数、accepted hit、gap attempt 和 early stop。
+- `benchmark/ssh1/run_server_rrbs.sh` 新增 `SSH1_PROFILE_RRBS=1`，只对 Rust case 注入 `BSMAP_PROFILE_RRBS=1`。
+- `benchmark/ssh1/summarize_server_rrbs.py` 会把 stderr 中的 `BSMAP_PROFILE_RRBS key=value` 汇总到 `summary.json` 的 `cases.<case>.rrbs_profile`。
+
+注意：开启 profiling 会引入 atomic 计数开销，不能作为 Rust/C++ 正式 wall time 对比。正式性能表仍必须使用 `SSH1_PROFILE_RRBS=0` 的 warm run；profile run 只用于判断 full SE 慢点到底来自 bucket candidate 数、mode 过滤、mismatch 还是 gap/early-stop 行为。
+
+2026-06-27 本地验证：权限恢复后已在 WSL2 Ubuntu 执行 `cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap`，均通过；Windows Python 3.11 下逐个执行 `python -m py_compile benchmark/ssh1/*.py` 通过；`bash -n benchmark/ssh1/run_server_rrbs.sh` 通过。warning 均为既有 unused 项和 workspace manifest warning，未出现 error 或 test failure。

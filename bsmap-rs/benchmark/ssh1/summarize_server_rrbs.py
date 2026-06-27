@@ -30,16 +30,37 @@ def read_tsv(path):
     return result
 
 
+def parse_rrbs_profile(text):
+    profile = {}
+    for line in text.splitlines():
+        if not line.startswith("BSMAP_PROFILE_RRBS "):
+            continue
+        item = line.removeprefix("BSMAP_PROFILE_RRBS ").strip()
+        key, sep, value = item.partition("=")
+        if not sep:
+            continue
+        try:
+            profile[key] = int(value)
+        except ValueError:
+            try:
+                profile[key] = float(value)
+            except ValueError:
+                profile[key] = value
+    return profile
+
+
 def parse_case(case_dir):
     case_dir = Path(case_dir)
     sha_text = read_text(case_dir / "output.sam.sha256")
+    stderr_text = read_text(case_dir / "stderr.txt")
     return {
         "command": read_text(case_dir / "command.txt"),
         "exit_code": int(read_text(case_dir / "exit_code.txt") or "-1"),
         "time": read_json(case_dir / "time.json"),
         "sam_stats": read_json(case_dir / "sam_stats.json"),
         "sam_sha256": sha_text.split(" ")[0] if sha_text else "",
-        "stderr_tail": "\n".join(read_text(case_dir / "stderr.txt").splitlines()[-12:]),
+        "rrbs_profile": parse_rrbs_profile(stderr_text),
+        "stderr_tail": "\n".join(stderr_text.splitlines()[-12:]),
     }
 
 

@@ -266,6 +266,7 @@ fn run_align_command(args: &AlignArgs) -> Result<()> {
 
     // 打印统计信息
     print_stats(&stats, &config);
+    bsmap::align::profile::print_rrbs_profile_if_enabled();
 
     info!("总耗时: {:.2}s", timer.elapsed());
 
@@ -679,25 +680,38 @@ fn run_single_align_serial(
     let mut read_start = config.read_start;
     let read_end = config.read_end;
     let mut alignment_core = Duration::ZERO;
+    let profile_stages = config.rrbs_flag && bsmap::align::profile::rrbs_profile().is_some();
+    let mut read_time = Duration::ZERO;
+    let mut prepare_time = Duration::ZERO;
+    let mut write_time = Duration::ZERO;
 
     loop {
         batch_raw.clear();
+        let read_timer = Instant::now();
         let n = reader.read_batch(&mut batch_raw, BATCH_SIZE, &mut read_start, read_end)?;
+        if profile_stages {
+            read_time += read_timer.elapsed();
+        }
         if n == 0 {
             break;
         }
 
+        let prepare_timer = Instant::now();
         let batch_start_index = reader.global_index() - n as u32;
         let reads = process_batch_reuse(&mut batch_raw, 0, batch_start_index, config);
         let encoded: Vec<EncodedRead> = reads
             .iter()
             .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
             .collect();
+        if profile_stages {
+            prepare_time += prepare_timer.elapsed();
+        }
 
         let core_start = Instant::now();
         let results = aligner.do_batch(&encoded, index, coll, config);
         alignment_core += core_start.elapsed();
 
+        let write_timer = Instant::now();
         for result in &results {
             if result.has_hits() {
                 output_alignment(
@@ -718,11 +732,26 @@ fn run_single_align_serial(
                 output_unmapped(output, &reads[result.read_idx as usize], config)?;
             }
         }
+        if profile_stages {
+            write_time += write_timer.elapsed();
+        }
 
         progress.inc(n as u64);
     }
 
     progress.finish();
+    if profile_stages {
+        eprintln!("BSMAP_PROFILE_RRBS read_seconds={:.6}", read_time.as_secs_f64());
+        eprintln!(
+            "BSMAP_PROFILE_RRBS prepare_seconds={:.6}",
+            prepare_time.as_secs_f64()
+        );
+        eprintln!(
+            "BSMAP_PROFILE_RRBS align_seconds={:.6}",
+            alignment_core.as_secs_f64()
+        );
+        eprintln!("BSMAP_PROFILE_RRBS write_seconds={:.6}", write_time.as_secs_f64());
+    }
     info!("单端串行批处理比对核心耗时: {:.6}s", alignment_core.as_secs_f64());
     Ok(())
 }
@@ -754,16 +783,25 @@ fn run_paired_align_serial(
     let mut read_start_b = config.read_start;
     let read_end = config.read_end;
     let mut alignment_core = Duration::ZERO;
+    let profile_stages = config.rrbs_flag && bsmap::align::profile::rrbs_profile().is_some();
+    let mut read_time = Duration::ZERO;
+    let mut prepare_time = Duration::ZERO;
+    let mut write_time = Duration::ZERO;
 
     loop {
         batch_a.clear();
         batch_b.clear();
+        let read_timer = Instant::now();
         let n_a = reader_a.read_batch(&mut batch_a, BATCH_SIZE, &mut read_start_a, read_end)?;
         let n_b = reader_b.read_batch(&mut batch_b, BATCH_SIZE, &mut read_start_b, read_end)?;
+        if profile_stages {
+            read_time += read_timer.elapsed();
+        }
         if n_a == 0 || n_b == 0 {
             break;
         }
 
+        let prepare_timer = Instant::now();
         let n = n_a.min(n_b);
         let batch_start_index_a = reader_a.global_index() - n_a as u32;
         let batch_start_index_b = reader_b.global_index() - n_b as u32;
@@ -777,11 +815,15 @@ fn run_paired_align_serial(
             .iter()
             .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
             .collect();
+        if profile_stages {
+            prepare_time += prepare_timer.elapsed();
+        }
 
         let core_start = Instant::now();
         let results = pair_aligner.do_pair_batch(&encoded_a, &encoded_b, index, coll, config);
         alignment_core += core_start.elapsed();
 
+        let write_timer = Instant::now();
         for result in &results {
             let idx = result.read_idx as usize;
             if idx >= reads_a.len() || idx >= reads_b.len() {
@@ -810,11 +852,26 @@ fn run_paired_align_serial(
                 }
             }
         }
+        if profile_stages {
+            write_time += write_timer.elapsed();
+        }
 
         progress.inc(n as u64);
     }
 
     progress.finish();
+    if profile_stages {
+        eprintln!("BSMAP_PROFILE_RRBS read_seconds={:.6}", read_time.as_secs_f64());
+        eprintln!(
+            "BSMAP_PROFILE_RRBS prepare_seconds={:.6}",
+            prepare_time.as_secs_f64()
+        );
+        eprintln!(
+            "BSMAP_PROFILE_RRBS align_seconds={:.6}",
+            alignment_core.as_secs_f64()
+        );
+        eprintln!("BSMAP_PROFILE_RRBS write_seconds={:.6}", write_time.as_secs_f64());
+    }
     info!("双端串行批处理比对核心耗时: {:.6}s", alignment_core.as_secs_f64());
     Ok(())
 }
