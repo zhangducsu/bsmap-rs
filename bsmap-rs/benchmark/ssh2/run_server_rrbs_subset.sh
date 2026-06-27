@@ -9,7 +9,7 @@ usage() {
 Usage: run_server_rrbs_subset.sh REPO_ROOT RUNS_ROOT
 
 Environment:
-  SSH2_LIMITS="10000 100000"         read-end limits to run against full R1
+  SSH2_LIMITS="10000 100000"         read-end limits to run against full R1; use "full" for no -E
   REFERENCE=/workspace/00_data/reference/mm10.fa
   READ_1_FULL=/workspace/00_data/rrbs/Ctrl_R1.fq.gz
   RUST_BINARY, CPP_BINARY, THREADS, RANDOM_SEED
@@ -17,7 +17,7 @@ Environment:
 
 The Rust standalone index must already exist at REFERENCE.bsi. This runner
 compares warm Rust align time against C++ normal invocation using identical
-alignment parameters plus -E <limit>.
+alignment parameters plus -E <limit>; the special limit "full" omits -E.
 EOF
 }
 
@@ -63,7 +63,7 @@ if (( ${#LIMITS[@]} == 0 )); then
   fail "SSH2_LIMITS produced no limits"
 fi
 for limit in "${LIMITS[@]}"; do
-  [[ "$limit" =~ ^[1-9][0-9]*$ ]] || fail "invalid read limit: $limit"
+  [[ "$limit" == "full" || "$limit" =~ ^[1-9][0-9]*$ ]] || fail "invalid read limit: $limit"
 done
 
 mkdir -p "$RUNS_ROOT"
@@ -180,12 +180,16 @@ run_compare() {
 }
 
 for limit in "${LIMITS[@]}"; do
+  limit_args=()
+  if [[ "$limit" != "full" ]]; then
+    limit_args=(-E "$limit")
+  fi
   run_case "rust_se_$limit" "$RUST_BINARY" align \
     -a "$READ_1_FULL" -d "$RUST_REF" -o "$RUN_DIR/case_rust_se_$limit/output.sam" \
-    "${COMMON_ARGS[@]}" -E "$limit"
+    "${COMMON_ARGS[@]}" "${limit_args[@]}"
   run_case "cpp_se_$limit" "$CPP_BINARY" \
     -a "$READ_1_FULL" -d "$CPP_REF" -o "$RUN_DIR/case_cpp_se_$limit/output.sam" \
-    "${COMMON_ARGS[@]}" -E "$limit"
+    "${COMMON_ARGS[@]}" "${limit_args[@]}"
   run_compare "se_$limit" "$RUN_DIR/case_cpp_se_$limit/output.sam" "$RUN_DIR/case_rust_se_$limit/output.sam"
 done
 
