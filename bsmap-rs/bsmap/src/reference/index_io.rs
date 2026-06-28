@@ -39,8 +39,8 @@ use serde::{Deserialize, Serialize};
 
 use super::binseq::BinSeqCollection;
 use super::index::{
-    KmerIndex, MappedKmerIndex, MappedSection, PackedRrbsHit, PackedRrbsHit8,
-    PackedWgbsBucket, RrbsHitFormat, WgbsCountOverflow,
+    KmerIndex, MappedKmerIndex, MappedSection, PackedRrbsHit, PackedWgbsBucket,
+    WgbsCountOverflow,
 };
 use super::storage::{MmapStorage, VecStorage};
 use crate::param::{BINSEQPAD, REF_MARGIN, SEGLEN};
@@ -77,9 +77,6 @@ const INDEX_VERSION_SINGLE_RRBS_REFERENCE: u32 = 9;
 
 /// Version 10: RRBS stores each hit in a compact seven-byte representation.
 const INDEX_VERSION_PACKED_RRBS_HITS: u32 = 10;
-
-/// Version 11: RRBS stores compact hits with an aligned eight-byte stride.
-const INDEX_VERSION_ALIGNED_RRBS_HITS: u32 = 11;
 
 /// WGBS alignment mode.
 const MODE_WGBS: u32 = 0;
@@ -366,7 +363,7 @@ pub fn save_index_v2(
     let mut header = [0u8; HEADER_SIZE];
     header[0..8].copy_from_slice(INDEX_MAGIC);
     let version = if params.is_rrbs {
-        INDEX_VERSION_ALIGNED_RRBS_HITS
+        INDEX_VERSION_PACKED_RRBS_HITS
     } else {
         INDEX_VERSION_SUCCINCT_WGBS
     };
@@ -427,7 +424,7 @@ pub fn save_index_v2(
             (positions.len(), std::mem::size_of::<u32>()),
             (0, std::mem::size_of::<u32>()),
             (index.rrbs_offsets_slice().len(), std::mem::size_of::<u32>()),
-            (index.rrbs_hits_slice().len(), std::mem::size_of::<PackedRrbsHit8>()),
+            (index.rrbs_hits_slice().len(), std::mem::size_of::<PackedRrbsHit>()),
             (index.rrbs_site_offsets_slice().len(), std::mem::size_of::<u32>()),
             (index.rrbs_sites_slice().len(), std::mem::size_of::<[u32; 2]>()),
             (refcat_slice.len(), std::mem::size_of::<u64>()),
@@ -480,7 +477,7 @@ pub fn save_index_v2(
             write_raw_slice(writer, index.rrbs_offsets_slice())
         })?;
         write_section(SECTION_RRBS_HITS, &mut |writer| {
-            write_aligned_rrbs_hits(writer, index.rrbs_hits_slice())
+            write_packed_rrbs_hits(writer, index.rrbs_hits_slice())
         })?;
         write_section(SECTION_RRBS_SITE_OFFSETS, &mut |writer| {
             write_raw_slice(writer, index.rrbs_site_offsets_slice())
@@ -608,18 +605,12 @@ fn write_raw_slice<W: Write, T: Copy>(writer: &mut W, values: &[T]) -> Result<()
     Ok(())
 }
 
-fn write_aligned_rrbs_hits<W: Write>(writer: &mut W, hits: &[crate::param::Hit]) -> Result<()> {
+fn write_packed_rrbs_hits<W: Write>(writer: &mut W, hits: &[crate::param::Hit]) -> Result<()> {
     const BUFFER_SIZE: usize = 8 * 1024 * 1024;
     let mut buffer = Vec::with_capacity(BUFFER_SIZE);
     for &hit in hits {
-        let packed = PackedRrbsHit8::from_hit(hit).context("RRBS hit exceeds v11 packed range")?;
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                (&packed as *const PackedRrbsHit8).cast::<u8>(),
-                std::mem::size_of::<PackedRrbsHit8>(),
-            )
-        };
-        buffer.extend_from_slice(bytes);
+        let packed = PackedRrbsHit::from_hit(hit).context("RRBS hit exceeds v10 packed range")?;
+        buffer.extend_from_slice(&packed.into_bytes());
         if buffer.len() >= BUFFER_SIZE {
             writer.write_all(&buffer)?;
             buffer.clear();
@@ -677,10 +668,9 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
         && version != INDEX_VERSION_SUCCINCT_WGBS
         && version != INDEX_VERSION_SINGLE_RRBS_REFERENCE
         && version != INDEX_VERSION_PACKED_RRBS_HITS
-        && version != INDEX_VERSION_ALIGNED_RRBS_HITS
     {
         bail!(
-            "Unsupported index version {} (expected {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, or {}): {}",
+            "Unsupported index version {} (expected {}, {}, {}, {}, {}, {}, {}, {}, {}, or {}): {}",
             version,
             INDEX_VERSION,
             INDEX_VERSION_V2,
@@ -692,7 +682,6 @@ pub fn read_index_meta(path: &Path) -> Result<IndexMeta> {
             INDEX_VERSION_SUCCINCT_WGBS,
             INDEX_VERSION_SINGLE_RRBS_REFERENCE,
             INDEX_VERSION_PACKED_RRBS_HITS,
-            INDEX_VERSION_ALIGNED_RRBS_HITS,
             path.display()
         );
     }
@@ -860,7 +849,6 @@ pub fn load_index(path: &Path) -> Result<(KmerIndex, IndexMeta)> {
         || meta.version == INDEX_VERSION_SUCCINCT_WGBS
         || meta.version == INDEX_VERSION_SINGLE_RRBS_REFERENCE
         || meta.version == INDEX_VERSION_PACKED_RRBS_HITS
-        || meta.version == INDEX_VERSION_ALIGNED_RRBS_HITS
     {
         let (_coll, index, meta) = load_index_with_mode(path, LoadMode::Memory)?;
         return Ok((index, meta));
@@ -981,7 +969,6 @@ fn load_raw_index(
     let expected_marker = if meta.version == INDEX_VERSION_SUCCINCT_WGBS
         || meta.version == INDEX_VERSION_SINGLE_RRBS_REFERENCE
         || meta.version == INDEX_VERSION_PACKED_RRBS_HITS
-        || meta.version == INDEX_VERSION_ALIGNED_RRBS_HITS
     {
         RAW_SECTION_MARKER_V2
     } else {
@@ -1005,7 +992,6 @@ fn load_raw_index(
     let crefcat = checked_mapped_section::<u64>(sections[SECTION_CREFCAT], file_size)?;
     let succinct_wgbs = meta.version == INDEX_VERSION_SUCCINCT_WGBS && !meta.is_rrbs;
     let packed_rrbs_hits = meta.version == INDEX_VERSION_PACKED_RRBS_HITS && meta.is_rrbs;
-    let aligned_rrbs_hits = meta.version == INDEX_VERSION_ALIGNED_RRBS_HITS && meta.is_rrbs;
 
     let (index2, start_offsets, rrbs_offsets, rrbs_hits, rrbs_site_offsets, rrbs_sites) =
         if succinct_wgbs {
@@ -1025,12 +1011,7 @@ fn load_raw_index(
                 )?,
                 checked_mapped_section::<u32>(sections[SECTION_START_OFFSETS], file_size)?,
                 checked_mapped_section::<u32>(sections[SECTION_RRBS_OFFSETS], file_size)?,
-                if aligned_rrbs_hits {
-                    checked_mapped_section::<PackedRrbsHit8>(
-                        sections[SECTION_RRBS_HITS],
-                        file_size,
-                    )?
-                } else if packed_rrbs_hits {
+                if packed_rrbs_hits {
                     checked_mapped_section::<PackedRrbsHit>(
                         sections[SECTION_RRBS_HITS],
                         file_size,
@@ -1098,15 +1079,7 @@ fn load_raw_index(
                 positions: read_raw_vec(&mut reader, sections[SECTION_POSITIONS])?,
                 start_offsets: read_raw_vec(&mut reader, sections[SECTION_START_OFFSETS])?,
                 rrbs_offsets: read_raw_vec(&mut reader, sections[SECTION_RRBS_OFFSETS])?,
-                rrbs_hits: if aligned_rrbs_hits {
-                    read_raw_vec::<_, PackedRrbsHit8>(
-                        &mut reader,
-                        sections[SECTION_RRBS_HITS],
-                    )?
-                    .into_iter()
-                    .map(PackedRrbsHit8::to_hit)
-                    .collect()
-                } else if packed_rrbs_hits {
+                rrbs_hits: if packed_rrbs_hits {
                     read_raw_vec::<_, PackedRrbsHit>(
                         &mut reader,
                         sections[SECTION_RRBS_HITS],
@@ -1171,13 +1144,7 @@ fn load_raw_index(
                     start_offsets,
                     rrbs_offsets,
                     rrbs_hits,
-                    rrbs_hit_format: if aligned_rrbs_hits {
-                        RrbsHitFormat::Aligned8
-                    } else if packed_rrbs_hits {
-                        RrbsHitFormat::Packed7
-                    } else {
-                        RrbsHitFormat::Unpacked
-                    },
+                    packed_rrbs_hits,
                     rrbs_site_offsets,
                     rrbs_sites,
                     wgbs_occupancy,
@@ -1236,7 +1203,6 @@ pub fn load_index_with_mode(
         || version == INDEX_VERSION_SUCCINCT_WGBS
         || version == INDEX_VERSION_SINGLE_RRBS_REFERENCE
         || version == INDEX_VERSION_PACKED_RRBS_HITS
-        || version == INDEX_VERSION_ALIGNED_RRBS_HITS
     {
         drop(reader);
         return load_raw_index(path, mode, meta, ref_anchor, &header);
@@ -1283,7 +1249,6 @@ pub fn load_index_with_mode(
         && version != INDEX_VERSION_SUCCINCT_WGBS
         && version != INDEX_VERSION_SINGLE_RRBS_REFERENCE
         && version != INDEX_VERSION_PACKED_RRBS_HITS
-        && version != INDEX_VERSION_ALIGNED_RRBS_HITS
     {
         bail!(
             "Unsupported index version {}: {}",
@@ -1553,7 +1518,7 @@ pub fn is_index_compatible(
 
     let meta = read_index_meta(path)?;
     let expected_version = if params.is_rrbs {
-        INDEX_VERSION_ALIGNED_RRBS_HITS
+        INDEX_VERSION_PACKED_RRBS_HITS
     } else {
         INDEX_VERSION_SUCCINCT_WGBS
     };
@@ -1829,7 +1794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_v11_rrbs_roundtrip_preserves_aligned_hits_and_sites() {
+    fn test_v10_rrbs_roundtrip_preserves_packed_hits_and_sites() {
         let refs = vec![Reference {
             name: "chr1".into(),
             seq: b"ACGTCCGGAAAAAAAAAAAAAAAAAAAAAAACCGGTTTTTTTTTTTTTTTTTTTTTTTTCCGG"
@@ -1865,7 +1830,7 @@ mod tests {
         let (loaded_coll, loaded, meta) =
             load_index_with_mode(tmp.path(), LoadMode::Memory).unwrap();
 
-        assert_eq!(meta.version, INDEX_VERSION_ALIGNED_RRBS_HITS);
+        assert_eq!(meta.version, INDEX_VERSION_PACKED_RRBS_HITS);
         assert!(meta.is_rrbs);
         assert!(loaded_coll.crefcat.is_empty());
         assert_eq!(loaded.rrbs_offsets, index.rrbs_offsets);

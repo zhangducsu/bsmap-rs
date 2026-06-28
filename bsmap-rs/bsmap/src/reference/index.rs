@@ -33,7 +33,6 @@ pub const RRBS_BSC_FLAG: u32 = 0x01000000;
 pub(crate) struct PackedRrbsHit([u8; 7]);
 
 impl PackedRrbsHit {
-    #[cfg(test)]
     pub(crate) fn from_hit(hit: Hit) -> Option<Self> {
         const ALLOWED_CHR_BITS: u32 = RRBS_CHR_MASK | (0x7f << RRBS_MODE_SHIFT) | RRBS_BSC_FLAG;
         if hit.chr & !ALLOWED_CHR_BITS != 0 {
@@ -68,49 +67,9 @@ impl PackedRrbsHit {
             loc,
         }
     }
-}
 
-/// RRBS v11 stores one hit in eight bytes. This keeps the v10 compact fields
-/// but restores natural alignment and power-of-two stride for hot-path mmap
-/// decoding.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PackedRrbsHit8 {
-    loc: u32,
-    block_id: u16,
-    mode_and_flag: u8,
-    _pad: u8,
-}
-
-impl PackedRrbsHit8 {
-    pub(crate) fn from_hit(hit: Hit) -> Option<Self> {
-        const ALLOWED_CHR_BITS: u32 = RRBS_CHR_MASK | (0x7f << RRBS_MODE_SHIFT) | RRBS_BSC_FLAG;
-        if hit.chr & !ALLOWED_CHR_BITS != 0 {
-            return None;
-        }
-        let mode = ((hit.chr >> RRBS_MODE_SHIFT) & 0x7f) as u8;
-        Some(Self {
-            loc: hit.loc,
-            block_id: (hit.chr & RRBS_CHR_MASK) as u16,
-            mode_and_flag: mode
-                | if hit.chr & RRBS_BSC_FLAG != 0 {
-                    0x80
-                } else {
-                    0
-                },
-            _pad: 0,
-        })
-    }
-
-    #[inline(always)]
-    pub(crate) fn to_hit(self) -> Hit {
-        let mode_and_flag = self.mode_and_flag as u32;
-        Hit {
-            chr: self.block_id as u32
-                | ((mode_and_flag & 0x7f) << RRBS_MODE_SHIFT)
-                | ((mode_and_flag & 0x80) << 17),
-            loc: self.loc,
-        }
+    pub(crate) fn into_bytes(self) -> [u8; 7] {
+        self.0
     }
 }
 
@@ -123,7 +82,6 @@ pub struct RrbsHitView<'a> {
 enum RrbsHitStorage<'a> {
     Unpacked(&'a [Hit]),
     Packed(&'a [PackedRrbsHit]),
-    Aligned(&'a [PackedRrbsHit8]),
 }
 
 impl<'a> RrbsHitView<'a> {
@@ -139,17 +97,10 @@ impl<'a> RrbsHitView<'a> {
         }
     }
 
-    fn aligned(hits: &'a [PackedRrbsHit8]) -> Self {
-        Self {
-            storage: RrbsHitStorage::Aligned(hits),
-        }
-    }
-
     pub fn len(self) -> usize {
         match self.storage {
             RrbsHitStorage::Unpacked(hits) => hits.len(),
             RrbsHitStorage::Packed(hits) => hits.len(),
-            RrbsHitStorage::Aligned(hits) => hits.len(),
         }
     }
 
@@ -161,7 +112,6 @@ impl<'a> RrbsHitView<'a> {
         match self.storage {
             RrbsHitStorage::Unpacked(hits) => hits.get(index).copied(),
             RrbsHitStorage::Packed(hits) => hits.get(index).copied().map(PackedRrbsHit::to_hit),
-            RrbsHitStorage::Aligned(hits) => hits.get(index).copied().map(PackedRrbsHit8::to_hit),
         }
     }
 
@@ -169,7 +119,6 @@ impl<'a> RrbsHitView<'a> {
         match self.storage {
             RrbsHitStorage::Unpacked(hits) => hits.get(start..end).map(Self::unpacked),
             RrbsHitStorage::Packed(hits) => hits.get(start..end).map(Self::packed),
-            RrbsHitStorage::Aligned(hits) => hits.get(start..end).map(Self::aligned),
         }
     }
 
@@ -177,7 +126,6 @@ impl<'a> RrbsHitView<'a> {
         match self.storage {
             RrbsHitStorage::Unpacked(hits) => RrbsHitIter::Unpacked(hits.iter()),
             RrbsHitStorage::Packed(hits) => RrbsHitIter::Packed(hits.iter()),
-            RrbsHitStorage::Aligned(hits) => RrbsHitIter::Aligned(hits.iter()),
         }
     }
 }
@@ -186,7 +134,6 @@ impl<'a> RrbsHitView<'a> {
 enum RrbsHitIter<'a> {
     Unpacked(std::slice::Iter<'a, Hit>),
     Packed(std::slice::Iter<'a, PackedRrbsHit>),
-    Aligned(std::slice::Iter<'a, PackedRrbsHit8>),
 }
 
 impl Iterator for RrbsHitIter<'_> {
@@ -197,7 +144,6 @@ impl Iterator for RrbsHitIter<'_> {
         match self {
             Self::Unpacked(hits) => hits.next().copied(),
             Self::Packed(hits) => hits.next().copied().map(PackedRrbsHit::to_hit),
-            Self::Aligned(hits) => hits.next().copied().map(PackedRrbsHit8::to_hit),
         }
     }
 
@@ -205,7 +151,6 @@ impl Iterator for RrbsHitIter<'_> {
         match self {
             Self::Unpacked(hits) => hits.size_hint(),
             Self::Packed(hits) => hits.size_hint(),
-            Self::Aligned(hits) => hits.size_hint(),
         }
     }
 }
@@ -251,13 +196,6 @@ pub(crate) struct MappedSection {
     pub len: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RrbsHitFormat {
-    Unpacked,
-    Packed7,
-    Aligned8,
-}
-
 #[derive(Debug)]
 pub(crate) struct MappedKmerIndex {
     pub mmap: memmap2::Mmap,
@@ -266,7 +204,7 @@ pub(crate) struct MappedKmerIndex {
     pub start_offsets: MappedSection,
     pub rrbs_offsets: MappedSection,
     pub rrbs_hits: MappedSection,
-    pub rrbs_hit_format: RrbsHitFormat,
+    pub packed_rrbs_hits: bool,
     pub rrbs_site_offsets: MappedSection,
     pub rrbs_sites: MappedSection,
     pub wgbs_occupancy: MappedSection,
@@ -539,7 +477,7 @@ impl KmerIndex {
     #[inline]
     pub(crate) fn rrbs_hits_slice(&self) -> &[Hit] {
         match &self.mapped {
-            Some(mapped) if mapped.rrbs_hit_format == RrbsHitFormat::Unpacked => unsafe { mapped.slice(mapped.rrbs_hits) },
+            Some(mapped) if !mapped.packed_rrbs_hits => unsafe { mapped.slice(mapped.rrbs_hits) },
             Some(_) => panic!("packed RRBS mmap does not expose an unpacked hit slice"),
             None => &self.rrbs_hits,
         }
@@ -548,11 +486,8 @@ impl KmerIndex {
     #[inline]
     fn rrbs_hit_view(&self) -> RrbsHitView<'_> {
         match &self.mapped {
-            Some(mapped) if mapped.rrbs_hit_format == RrbsHitFormat::Packed7 => {
+            Some(mapped) if mapped.packed_rrbs_hits => {
                 RrbsHitView::packed(unsafe { mapped.slice(mapped.rrbs_hits) })
-            }
-            Some(mapped) if mapped.rrbs_hit_format == RrbsHitFormat::Aligned8 => {
-                RrbsHitView::aligned(unsafe { mapped.slice(mapped.rrbs_hits) })
             }
             Some(mapped) => RrbsHitView::unpacked(unsafe { mapped.slice(mapped.rrbs_hits) }),
             None => RrbsHitView::unpacked(&self.rrbs_hits),
@@ -1544,31 +1479,6 @@ mod tests {
             assert_eq!(packed.to_hit(), hit);
         }
         assert!(PackedRrbsHit::from_hit(Hit {
-            chr: 128 << RRBS_MODE_SHIFT,
-            loc: 0,
-        })
-        .is_none());
-    }
-
-    #[test]
-    fn aligned_rrbs_hit_roundtrips_all_fields_in_eight_bytes() {
-        assert_eq!(std::mem::size_of::<PackedRrbsHit8>(), 8);
-        assert_eq!(std::mem::align_of::<PackedRrbsHit8>(), 4);
-        for hit in [
-            Hit { chr: 0, loc: 0 },
-            Hit {
-                chr: 0xffff | (13 << RRBS_MODE_SHIFT),
-                loc: u32::MAX,
-            },
-            Hit {
-                chr: 0x1234 | (127 << RRBS_MODE_SHIFT) | RRBS_BSC_FLAG,
-                loc: 0x89abcdef,
-            },
-        ] {
-            let packed = PackedRrbsHit8::from_hit(hit).unwrap();
-            assert_eq!(packed.to_hit(), hit);
-        }
-        assert!(PackedRrbsHit8::from_hit(Hit {
             chr: 128 << RRBS_MODE_SHIFT,
             loc: 0,
         })
