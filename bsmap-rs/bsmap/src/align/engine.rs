@@ -24,7 +24,7 @@ use crate::align::extend::{
     clear_hits, is_unique_hit, select_best_hits, snp_align_segment, HitCollector,
 };
 use crate::align::seed::{
-    extract_seeds_and_masks_into, reorder_seeds_for_chain_with_masks_into, SeedSegment,
+    extract_seeds_and_masks_for_chains_into, reorder_seeds_for_chain_with_masks_into, SeedSegment,
 };
 use crate::param::{AlignConfig, GHit, MAXSNPS};
 use crate::reads::encode::EncodedRead;
@@ -161,10 +161,11 @@ impl SingleAlign {
         let xflag_chain0 = config.chains || encoded.read_set < 2;
         let xflag_chain1 = config.chains || encoded.read_set == 2;
 
-        // 提取种子（两条链）
-        extract_seeds_and_masks_into(
+        // 只为实际启用的 read-chain 提取 seed/mask。
+        extract_seeds_and_masks_for_chains_into(
             encoded,
             config.seed_size,
+            [xflag_chain0, xflag_chain1],
             &mut self.seed_chains,
             &mut self.seed_reg_masks,
         );
