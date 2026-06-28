@@ -51,7 +51,7 @@ pub struct MismatchResult {
 /// 3. 应用有效碱基掩码：`diff |= !mask`
 /// 4. 统计 popcount：`count += xm64(diff)`
 /// 5. 如果 `count > snp_thres`，提前返回
-#[inline]
+#[inline(always)]
 pub fn count_mismatch(
     query: &[u64],
     offset: u64,
