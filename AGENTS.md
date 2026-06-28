@@ -464,3 +464,24 @@
 - 原因：当前默认 release 构建未证明 `count_ones()` 会生成更快的硬件 popcount 路径；即便语义等价，替换手写 SWAR 会在 mismatch 热路径造成端到端退化。
 - 规避：不要在默认生产构建里把 `xm64()` 改成 `count_ones()`。若以后重新评估 popcount/SIMD，必须以明确 target feature、microbench 和 10K/100K/1M 端到端共同证明收益，不能只凭“硬件 popcount 理论上更快”保留。
 - 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T014304Z-17440/summary.json` 中，candidate commit `9a33a7b` 的 1M Rust wall 为 36.79 秒、RSS 为 1,857,684 KiB；已由 `cce4f2b` revert。
+
+### 56. `target-cpu=native` 是显式本机构建小收益，不是 portable 默认值
+
+- 现象：同一 SSH2 commit `3a18390` 在 Docker 内使用 `RUSTFLAGS="-C target-cpu=native"` 构建后，1M RRBS SE wall 从 portable 保留基线 35.77 秒降到 34.18 秒，RSS 基本持平；10K/100K SAM diff 仍为 0，1M 仍只剩既有 3 条 C++ terminal ZP/ZL 差异。
+- 原因：CPU-specific codegen 对当前服务器热路径有小幅收益，但它不减少 1M 约 19.2 亿次 mismatch 调用，也不能把 full SE 从 926 秒级压到 `C++ full / 2` 所需的 525 秒以内。
+- 规避：`target-cpu=native` 只能作为明确标记的本机/部署机器构建方式使用，报告必须记录 RUSTFLAGS、CPU 环境和 binary SHA256；不得静默替代 portable release，也不得把 native 小收益写成 full 目标已完成。验证后若继续跑 portable 基准，必须恢复标准 release binary。
+- 验证：native run `/workspace/benchmark_results/ssh2/20260628T015428Z-20368/summary.json` 中，native binary SHA256 为 `c80f886d5703b93eadf50e1229cd66b926d1660a4572f7034e58a9f66545e0e6`，1M Rust wall/RSS 为 34.18 秒/1,856,024 KiB；随后已恢复 portable binary SHA256 `48199b5d47ba278e9fa9885798bd083e70e1235c4e6b9ab6578a2c0f6a331afb`。
+
+### 57. SSH2 当前 RRBS SE 候选规模已经与 C++ 等价
+
+- 现象：100K RRBS SE 诊断中，Rust logical candidates 为 590,799,207，C++ raw candidates 也是 590,799,207；Rust/C++ mismatch calls 均为 191,939,381，accepted hits 均为 1,357,106，SAM streaming/sorted diff 均为 0。
+- 原因：P13 之后的 mode/read-chain/BSC logical bucket 语义已经对齐 C++；Rust profile 中更大的 raw candidates 包含 BSC/cross-chain 物理项，但 SE logical bucket 会按 C++ 语义排除，实际进入 mismatch 的候选数没有额外放大。
+- 规避：不要继续凭直觉通过丢弃 RRBS candidates 来追求速度，除非有新的 C++ 源码证据和 profile 证明 Rust 确实多扫。SSH2 后续大收益方向应集中在每候选 mismatch kernel、批处理、内存访问和并行流水线，而不是再改 mode/BSC 过滤语义。
+- 验证：Docker 临时 C++ 插桩 run `/workspace/benchmark_results/ssh2/20260628T020344Z-21229/summary.json` 使用参数 `-s 12 -v 0.08 -I 4 -D C-CGG -p 8 -S 1 -E 100000`；临时 C++ profile binary SHA256 为 `75910344186240f7a6fc9275f9cf04ac3d9eaf9d6e1741eec310dd16cc653491`。
+
+### 58. RRBS mismatch query-shift 不能直接替代现有 reference-shift
+
+- 现象：尝试把 RRBS `count_mismatch()` 改成 C++ 风格 query/mask shift 后，新旧算法等价单测在 `read_len=33`、`reference_start=2`、`threshold=100` 下失败：query-shift 返回 25，现有 reference-shift oracle 返回 24。
+- 原因：当前 Rust 的 `xc64` 容忍掩码、word 边界和 padding 语义不是简单的逐 word query/mask shift；直接移动 query/mask 会在跨 word 边界时改变 mismatch 计数。此前 Rust reference-shift 路径已经通过大样本 SAM 等价验证，不能为了局部指令形态牺牲 correctness gate。
+- 规避：不要直接把 C++ `CountMismatch()` 指针公式照搬成 Rust query-shift fast path。若未来继续做专用 mismatch kernel，必须先用新旧 Rust oracle 覆盖 read length、offset、mask/N、threshold，再跑 10K/100K/1M SAM diff；未通过单测不得进入 Docker benchmark。
+- 验证：WSL2 定向测试 `cargo test -p bsmap test_count_mismatch_query_shift_matches_reference_shift` 在上述 case 失败；该候选已在本地立即撤回，未提交、未跑服务器性能测试。

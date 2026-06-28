@@ -380,3 +380,43 @@ pipeline 结论：
 | 1,000,000 | 36.79 s | 583% | 1,857,684 | 97.79 s | 297% | 2,487,100 | streaming exact 100,591/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
 
 - 判定：SAM 语义保持，但 1M wall 从保留基线 `35.77 s` 退到 `36.79 s`。当前默认 release 构建下，`count_ones()` 形态比手写 SWAR 更慢，已撤回。
+
+构建候选：`RUSTFLAGS="-C target-cpu=native"`，不改源码，作为显式本机生产构建方式记录。
+
+- Docker checkout：`3a18390ff04e0bd4e36410f7e484b76094d40159`，repo dirty=false。
+- native Rust binary SHA256：`c80f886d5703b93eadf50e1229cd66b926d1660a4572f7034e58a9f66545e0e6`。
+- 验证后已恢复 portable release binary SHA256：`48199b5d47ba278e9fa9885798bd083e70e1235c4e6b9ab6578a2c0f6a331afb`。
+- 验证路径：`/workspace/benchmark_results/ssh2/20260628T015428Z-20368/summary.json`。
+
+| limit | Rust native wall | Rust native CPU | Rust native RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.77 s | 459% | 1,002,740 | 65.61 s | 100% | 2,057,220 | streaming diff 0；sorted diff 0 |
+| 100,000 | 8.80 s | 708% | 1,036,800 | 76.45 s | 115% | 2,117,748 | streaming diff 0；sorted diff 0 |
+| 1,000,000 | 34.18 s | 585% | 1,856,024 | 97.99 s | 296% | 2,486,804 | sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
+
+- 判定：相对 portable 保留基线 1M `35.77 s / 1,856,048 KiB`，native build 降到 `34.18 s / 1,856,024 KiB`，1M wall 提升约 4.4%，RSS 基本持平；100K 也有明显收益。
+- 限制：该方式绑定当前服务器 CPU，不应静默替代 portable release，也不能单独解决 full 目标。按 1M 比例估算，full Rust 仍远高于 `C++ full / 2`，后续仍需从每候选 mismatch kernel、批处理或 pipeline 并行模型继续寻找大收益。
+
+诊断：C++ RRBS 候选规模插桩。
+
+- 目的：确认 Rust full 慢点是否来自比 C++ 多扫候选。
+- 方法：仅在 Docker `/tmp` 中复制 C++ BSMAP 2.90 源码，临时加入 RRBS raw/mode/mismatch/AddHit 计数器；为适配当前 g++ 11，临时把 C++ `main.cpp` 全局变量 `ref` 改名，未改仓库源码和正式 C++ binary。
+- 运行路径：`/workspace/benchmark_results/ssh2/20260628T020344Z-21229/summary.json`。
+- 临时 C++ profile binary SHA256：`75910344186240f7a6fc9275f9cf04ac3d9eaf9d6e1741eec310dd16cc653491`。
+- 参数：`-s 12 -v 0.08 -I 4 -D C-CGG -p 8 -S 1 -E 100000`。
+
+| 指标 | Rust profile 100K | C++ profile 100K | 判定 |
+|---|---:|---:|---|
+| raw/logical candidates | Rust raw `1,033,543,412`；Rust logical `590,799,207` | C++ raw `590,799,207` | Rust raw 包含 BSC/cross-chain 物理项；实际 SE logical bucket 与 C++ 一致 |
+| mode candidates | `193,812,236` | `191,939,381` | Rust profile 计数点略早；进入 mismatch 的数量见下一行 |
+| mismatch calls | `191,939,381` | `191,939,381` | 完全一致 |
+| accepted hits | `1,357,106` | `1,357,106` | 完全一致 |
+| SAM | 24,236 mapped；streaming diff 0；sorted diff 0 | 24,236 mapped | 完全一致 |
+
+- 结论：当前 Rust RRBS SE 与 C++ 在 100K 上进入 mismatch 的候选数和 accepted hit 数已经等价。继续通过“少扫候选”拿收益的空间很小，除非有新的 C++ 源码证据；后续主攻方向应转为每候选成本、mismatch kernel 批处理、内存访问和并行流水线。
+
+撤回候选：query-shift mismatch fast path，测试阶段即撤回，未提交。
+
+- 优化内容：尝试把 RRBS `count_mismatch()` 从当前 Rust reference-shift 形式改成 C++ `CountMismatch()` 风格的 query/mask shift，避免每个候选重组 reference window。
+- 本地定向测试：新增的新旧算法等价测试在 `read_len=33`、`reference_start=2`、`threshold=100` 下失败，新函数返回 25，现有 reference-shift oracle 返回 24。
+- 判定：当前 Rust 的 `xc64` 容忍掩码、word 边界和 padding 语义不能被简单改写为 query-shift。该方向没有通过本地 correctness gate，已立即撤回，未进入 Docker benchmark。
