@@ -457,3 +457,10 @@
 - 原因：full RRBS SE 当前主要成本来自候选规模和 mismatch 调用，禁用链 seed 提取只是每条 read 的小固定开销；减少这部分工作没有转化为端到端收益。
 - 规避：不要继续围绕 SE 禁用链的 seed 提取、固定 scratch 清空或类似 per-read 小固定项做 SSH2 主线优化。除非 profile 证明 prepare/seed extraction 已成为主热点，否则应优先减少 mode-matched candidates、mismatch calls 或改变能显著压缩 align core 的数据流。
 - 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T013109Z-16808/summary.json` 中，candidate commit `44a7e55` 的 1M Rust wall 为 36.21 秒、RSS 为 1,857,664 KiB；已由 `3272fc5` revert。
+
+### 55. `xm64()` 改成 `count_ones()` 在当前构建下更慢
+
+- 现象：将 `xm64()` 从 C++ 风格 SWAR byte-sum 改成 `((tt | tt >> 1) & 0x5555...).count_ones()` 后，本地编译测试通过，10K/100K/1M mapped 和 sorted SAM 语义保持，但 1M Rust wall 从保留基线 35.77 秒退到 36.79 秒。
+- 原因：当前默认 release 构建未证明 `count_ones()` 会生成更快的硬件 popcount 路径；即便语义等价，替换手写 SWAR 会在 mismatch 热路径造成端到端退化。
+- 规避：不要在默认生产构建里把 `xm64()` 改成 `count_ones()`。若以后重新评估 popcount/SIMD，必须以明确 target feature、microbench 和 10K/100K/1M 端到端共同证明收益，不能只凭“硬件 popcount 理论上更快”保留。
+- 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T014304Z-17440/summary.json` 中，candidate commit `9a33a7b` 的 1M Rust wall 为 36.79 秒、RSS 为 1,857,684 KiB；已由 `cce4f2b` revert。

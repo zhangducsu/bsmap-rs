@@ -365,3 +365,18 @@ pipeline 结论：
 | 1,000,000 | 36.21 s | 579% | 1,857,664 | 98.18 s | 296% | 2,487,708 | streaming exact 75,678/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
 
 - 判定：该候选保持 mapped 数和 sorted SAM 语义，但 1M wall 从保留基线 `35.77 s` 退到 `36.21 s`，RSS 略增。说明 full core 的主成本不在禁用链 seed 提取的固定开销上，已撤回。
+
+撤回候选：`9a33a7b perf: use popcount for xm64 mismatch counting`，已由 `cce4f2b Revert "perf: use popcount for xm64 mismatch counting"` 撤回。
+
+- 优化内容：将 `xm64()` 从 C++ 风格 SWAR byte-sum 改为 `((tt | tt >> 1) & 0x5555...).count_ones()`，尝试让编译器/CPU 对 mismatch 计数使用 popcount 路径。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 均通过。
+- Docker 同步：checkout 为 `9a33a7b`，repo dirty=false，Rust binary SHA256 为 `fb091416a59cfe3decec918ed6f8222d627754fa197e81ad3164456c0bb5dc91`。
+- 验证路径：`/workspace/benchmark_results/ssh2/20260628T014304Z-17440/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.97 s | 480% | 1,002,904 | 66.82 s | 100% | 2,057,220 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.68 s | 715% | 1,036,768 | 76.18 s | 115% | 2,117,748 | streaming diff 0；sorted diff 0 |
+| 1,000,000 | 36.79 s | 583% | 1,857,684 | 97.79 s | 297% | 2,487,100 | streaming exact 100,591/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
+
+- 判定：SAM 语义保持，但 1M wall 从保留基线 `35.77 s` 退到 `36.79 s`。当前默认 release 构建下，`count_ones()` 形态比手写 SWAR 更慢，已撤回。
