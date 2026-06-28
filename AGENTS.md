@@ -492,3 +492,17 @@
 - 原因：当前 1M/full RRBS SE 的 CPU 利用率已经接近 8 线程上限，继续加深 producer/align 缓冲无法减少每候选 mismatch 工作量；更深 pipeline 主要增加缓冲驻留，收益只剩噪声级或小幅 I/O 重叠。
 - 规避：不要继续把 SSH2 主线放在调大 `--pipeline-depth` 上。默认 depth=2 仍是当前保留点；除非新的大样本 stage timing 证明读取/写出重新成为瓶颈，否则后续应转向 mismatch kernel、批处理或更深的数据结构优化。
 - 验证：Docker probe `/workspace/benchmark_results/ssh2/pipeline-depth-probe-20260628T021507Z-21614` 使用 portable binary SHA256 `48199b5d47ba278e9fa9885798bd083e70e1235c4e6b9ab6578a2c0f6a331afb`；depth=4/8 均为 253,102 mapped，sorted exact 253,099/253,102。
+
+### 60. RRBS SE pipeline stage profile 显示读写不是 SSH2 主瓶颈
+
+- 现象：为默认 depth=2 pipeline 补充低开销 stage timing 后，1M RRBS SE wall 为 36.07 秒，其中 read 2.55 秒、prepare 1.18 秒、align 25.46 秒、write 1.51 秒；SAM sorted diff 仍只是既有 3 条 C++ terminal ZP/ZL 差异。
+- 原因：pipeline 已经重叠了大部分读写与比对工作，端到端剩余成本主要集中在每候选 mismatch/extend 核心；继续优化 FASTQ 读取、SAM 写出或 pipeline 深度的理论上限太小。
+- 规避：SSH2 后续不要再把主线放在浅层 I/O、写出格式化或 pipeline-depth 调参上，除非新的 full stage profile 证明占比变化。大收益候选应优先来自 mismatch kernel、批量化候选处理、reference/index 访问局部性或更大粒度并行调度。
+- 验证：提交 `b93cfe3` 后 Docker run `/workspace/benchmark_results/ssh2/20260628T022458Z-21945/summary.json` 使用 portable binary SHA256 `2c0afe7204b5ca423935cdcbef03cf5e2830e4fdc517f257a3bd2a204b7f5488`；1M Rust/C++ 均为 253,102 mapped，Rust RSS 1,855,968 KiB，C++ RSS 2,486,468 KiB。
+
+### 61. Windows PowerShell 不能假定支持 `&&`
+
+- 现象：在本地 worktree 执行 `git add ... && git diff --cached --stat && git commit ...` 时，PowerShell 报 `The token '&&' is not a valid statement separator in this version`，Git 命令没有执行。
+- 原因：当前 Windows PowerShell 环境不是支持 `&&` pipeline chain operator 的新版 PowerShell；直接使用 Bash 风格命令串会在解析阶段失败。
+- 规避：本地关键 Git 和验证命令在 PowerShell 中分步执行，或显式使用 WSL/Bash 并开启 `set -euo pipefail`。不要把未执行的 chained command 误判为 Git 失败或代码失败。
+- 验证：改为分步执行 `git add`、`git diff --cached --stat`、`git diff --cached --check` 和 `git commit` 后，`b93cfe3 profile: add RRBS pipeline stage timing` 成功提交并推送。

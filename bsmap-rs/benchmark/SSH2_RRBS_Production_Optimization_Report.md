@@ -434,3 +434,18 @@ pipeline depth probe：不改源码，只测试显式 `--pipeline-depth 4/8`。
 | 8 | 35.30 s | 197.20 s | 6.22 s | 576% | 1,887,492 | 253,102 | sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL |
 
 - 判定：相对默认 depth=2 的 1M `35.77 s / 1,856,048 KiB`，depth=4 退化，depth=8 仅约 1.3% 小幅提升且 RSS 增加约 31 MiB；低于 SSH2 保留门槛。继续加深 pipeline 不是当前主收益方向。
+
+诊断提交：`b93cfe3 profile: add RRBS pipeline stage timing`。
+
+- 目的：补齐 RRBS SE pipeline 路径的低开销 stage profile。此前串行路径已有 `read/prepare/align/write` 阶段耗时，但默认保留的 depth=2 pipeline 只记录 alignment core，无法判断 full 缩放慢点是否来自读写重叠不足。
+- 代码范围：只在 `SinglePreparedBatch` 中携带 producer 侧 `read_time` 和 `prepare_time`，consumer 侧汇总 `write_time`；仅在 `BSMAP_PROFILE_RRBS=stage` 且 RRBS 时输出，不改变默认生产路径和 SAM 语义。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 通过。
+- Docker 同步：checkout 为 `b93cfe3`，repo dirty=false，Rust binary SHA256 为 `2c0afe7204b5ca423935cdcbef03cf5e2830e4fdc517f257a3bd2a204b7f5488`。
+- 运行路径：`/workspace/benchmark_results/ssh2/20260628T022458Z-21945/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | Rust stage seconds | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|---|
+| 1,000,000 | 36.07 s | 580% | 1,855,968 | 97.87 s | 295% | 2,486,468 | read 2.55；prepare 1.18；align 25.46；write 1.51 | sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL |
+
+- 判定：stage profile 本身保持 mapped、FLAG/RNAME/NM 分布和既有 sorted SAM 差异水平；性能与默认 depth=2 基线接近，诊断开销可接受。
+- 关键结论：1M 中可见的 producer/read、prepare 和 SAM write 合计约 5.25 s，远小于 align core 25.46 s；继续优化 pipeline depth、FASTQ 读取或 SAM 写出，即使全部清零也不足以达到 full `<= C++ / 2`。SSH2 下一步应集中在每候选 mismatch kernel、批量化计算、reference/index 访问局部性或更大粒度的并行调度，而不是继续做浅层 pipeline 调参。
