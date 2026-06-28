@@ -150,17 +150,13 @@ pub unsafe fn count_mismatch_prechecked(
     ref_seq: &[u64],
     mask: &[u64],
     snp_thres: u32,
-    _nt3: bool,
+    nt3: bool,
 ) -> u32 {
     debug_assert_eq!(query.len(), mask.len());
 
     let word_offset = (offset / 64) as usize;
     let bit_offset = (offset % 64) as u32;
     debug_assert!(word_offset + query.len() <= ref_seq.len());
-
-    if query.len() == 5 {
-        return count_mismatch_prechecked_5(query, offset, ref_seq, mask, snp_thres);
-    }
 
     let mut total_mismatches: u32 = 0;
     let query_ptr = query.as_ptr();
@@ -205,69 +201,7 @@ pub unsafe fn count_mismatch_prechecked(
         }
     }
 
-    total_mismatches
-}
-
-#[inline(always)]
-unsafe fn count_word_mismatch(q_word: u64, ref_word: u64, mask_word: u64) -> u32 {
-    let mut diff = q_word ^ ref_word;
-    diff &= xc64(ref_word);
-    diff &= mask_word;
-    xm64(diff)
-}
-
-/// Five-word fast path for the common 150 bp RRBS reads.
-#[inline(always)]
-unsafe fn count_mismatch_prechecked_5(
-    query: &[u64],
-    offset: u64,
-    ref_seq: &[u64],
-    mask: &[u64],
-    snp_thres: u32,
-) -> u32 {
-    debug_assert_eq!(query.len(), 5);
-    debug_assert_eq!(mask.len(), 5);
-
-    let word_offset = (offset / 64) as usize;
-    let bit_offset = (offset % 64) as u32;
-    debug_assert!(word_offset + 5 <= ref_seq.len());
-
-    let query_ptr = query.as_ptr();
-    let mask_ptr = mask.as_ptr();
-    let ref_ptr = ref_seq.as_ptr().add(word_offset);
-    let mut total_mismatches = 0u32;
-
-    macro_rules! add_word {
-        ($idx:expr, $ref_word:expr) => {{
-            total_mismatches +=
-                count_word_mismatch(*query_ptr.add($idx), $ref_word, *mask_ptr.add($idx));
-            if total_mismatches > snp_thres {
-                return snp_thres + 1;
-            }
-        }};
-    }
-
-    if bit_offset == 0 {
-        add_word!(0, *ref_ptr.add(0));
-        add_word!(1, *ref_ptr.add(1));
-        add_word!(2, *ref_ptr.add(2));
-        add_word!(3, *ref_ptr.add(3));
-        add_word!(4, *ref_ptr.add(4));
-    } else {
-        let shift_left = bit_offset;
-        let shift_right = 64 - bit_offset;
-        let tail = if word_offset + 5 < ref_seq.len() {
-            *ref_ptr.add(5) >> shift_right
-        } else {
-            0
-        };
-        add_word!(0, (*ref_ptr.add(0) << shift_left) | (*ref_ptr.add(1) >> shift_right));
-        add_word!(1, (*ref_ptr.add(1) << shift_left) | (*ref_ptr.add(2) >> shift_right));
-        add_word!(2, (*ref_ptr.add(2) << shift_left) | (*ref_ptr.add(3) >> shift_right));
-        add_word!(3, (*ref_ptr.add(3) << shift_left) | (*ref_ptr.add(4) >> shift_right));
-        add_word!(4, (*ref_ptr.add(4) << shift_left) | tail);
-    }
-
+    let _ = nt3;
     total_mismatches
 }
 
@@ -922,14 +856,11 @@ mod tests {
 
     #[test]
     fn test_prechecked_consistency_nonzero_offsets_and_thresholds() {
-        let query_seq: Vec<u8> = (0..150).map(|i| b"ACGT"[i % 4]).collect();
-        let mut ref_seq_bytes = query_seq.clone();
-        for idx in (5..ref_seq_bytes.len()).step_by(17) {
-            ref_seq_bytes[idx] = if ref_seq_bytes[idx] == b'A' { b'C' } else { b'A' };
-        }
+        let query_seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let ref_seq_bytes = b"ATGTACGTACGTTCGTACGTACGTACGTACGAACGTACGTTCGTACGTACGA";
         let query_words = (query_seq.len() + SEGLEN - 1) / SEGLEN;
-        let query = pack_forward(&query_seq, query_words);
-        let ref_seq = make_ref_seq(&ref_seq_bytes);
+        let query = pack_forward(query_seq, query_words);
+        let ref_seq = make_ref_seq(ref_seq_bytes);
         let mut mask = make_mask(query_seq.len());
         // Mask one full base so both implementations must ignore it.
         mask[1] &= !(0b11u64 << 46);
