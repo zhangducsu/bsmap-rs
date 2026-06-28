@@ -506,3 +506,10 @@
 - 原因：当前 Windows PowerShell 环境不是支持 `&&` pipeline chain operator 的新版 PowerShell；直接使用 Bash 风格命令串会在解析阶段失败。
 - 规避：本地关键 Git 和验证命令在 PowerShell 中分步执行，或显式使用 WSL/Bash 并开启 `set -euo pipefail`。不要把未执行的 chained command 误判为 Git 失败或代码失败。
 - 验证：改为分步执行 `git add`、`git diff --cached --stat`、`git diff --cached --check` 和 `git commit` 后，`b93cfe3 profile: add RRBS pipeline stage timing` 成功提交并推送。
+
+### 62. `count_mismatch()` 强制 inline 收益不足
+
+- 现象：将 `count_mismatch()` 从普通 `#[inline]` 改为 `#[inline(always)]` 后，本地 `cargo check/test/build` 通过，10K/100K SAM diff 为 0，1M sorted diff 仍只是既有 3 条 C++ terminal ZP/ZL；但 1M Rust wall 只从保留基线 35.77 秒降到 35.18 秒。
+- 原因：函数边界不是当前 SSH2 full RRBS SE 的主瓶颈；该变化约 1.6% 的短基准收益低于保留门槛，也可能属于 run-to-run 波动。强制 inline 还会降低编译器自主权，未来可能增加代码体积或造成不同 CPU/编译器下的回归。
+- 规避：不要把 `#[inline(always)]` 作为 SSH2 mismatch 主线优化手段。后续 mismatch 优化必须证明能显著减少每候选 word 工作、引入正确的批量/SIMD kernel，或改善 reference/index 访问局部性，并用 10K/100K/1M SAM diff 与性能表共同验证。
+- 验证：候选 `87f0c49` 的 Docker run `/workspace/benchmark_results/ssh2/20260628T023417Z-22324/summary.json` 中，1M Rust wall/RSS 为 35.18 秒/1,856,020 KiB；已由 `2cc6c37 Revert "perf: force inline mismatch counter"` 撤回。

@@ -449,3 +449,18 @@ pipeline depth probe：不改源码，只测试显式 `--pipeline-depth 4/8`。
 
 - 判定：stage profile 本身保持 mapped、FLAG/RNAME/NM 分布和既有 sorted SAM 差异水平；性能与默认 depth=2 基线接近，诊断开销可接受。
 - 关键结论：1M 中可见的 producer/read、prepare 和 SAM write 合计约 5.25 s，远小于 align core 25.46 s；继续优化 pipeline depth、FASTQ 读取或 SAM 写出，即使全部清零也不足以达到 full `<= C++ / 2`。SSH2 下一步应集中在每候选 mismatch kernel、批量化计算、reference/index 访问局部性或更大粒度的并行调度，而不是继续做浅层 pipeline 调参。
+
+撤回候选：`87f0c49 perf: force inline mismatch counter`，已由 `2cc6c37 Revert "perf: force inline mismatch counter"` 撤回。
+
+- 优化内容：把 `count_mismatch()` 从普通 `#[inline]` 改为 `#[inline(always)]`，尝试降低约 19.7 亿次 1M mismatch 调用的函数边界成本；不改算法和输出逻辑。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 通过。第一次补丁误叠加 `#[inline]` 与 `#[inline(always)]` 产生新增 warning，已在测试前修正为单一属性。
+- Docker 同步：checkout 为 `87f0c49`，repo dirty=false，Rust binary SHA256 为 `9cf3079eb16e8b1ff0c7c3da8dc729293506065c3baac2613944dfab7c76f950`。
+- 验证路径：`/workspace/benchmark_results/ssh2/20260628T023417Z-22324/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.93 s | 481% | 1,002,884 | 66.62 s | 100% | 2,057,240 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.42 s | 717% | 1,036,788 | 75.84 s | 115% | 2,117,760 | streaming diff 0；sorted diff 0 |
+| 1,000,000 | 35.18 s | 576% | 1,856,020 | 96.65 s | 295% | 2,486,916 | sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL |
+
+- 判定：SAM 语义保持，RSS 基本持平；但相对保留基线 1M `35.77 s / 1,856,048 KiB` 只提升约 1.6%，低于 SSH2 单项保留门槛且可能属于 run-to-run 波动。该候选不保留。
