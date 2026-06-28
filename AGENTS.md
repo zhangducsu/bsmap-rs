@@ -436,3 +436,10 @@
 - 原因：虽然 1M 有约 971 万次 segment 调用，但 N 计数相对 19.7 亿次 mismatch 调用不是端到端主导成本；该优化只能带来约 0.5% 的短基准收益。
 - 规避：不要继续围绕 per-read 固定小字段预计算做零散微调，除非 profile 证明相关函数进入 top hotspot。SSH2 后续应优先优化候选规模、mismatch kernel、或能显著降低 full align core 的数据流结构。
 - 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T010232Z-15433/summary.json` 中，candidate commit `5b1e4aa` 的 1M Rust wall 为 35.59 秒、RSS 为 1,857,736 KiB；已由 `95798d8` revert。
+
+### 52. Docker 内 `perf` 存在不等于可采样
+
+- 现象：Docker 内 `/usr/bin/perf` 和 `/usr/bin/timeout` 存在，`/proc/sys/kernel/perf_event_paranoid` 为 `2`，但执行 `perf stat` 时输出 `WARNING: perf not found for kernel 3.10.0`，并提示需要安装对应内核的 `linux-tools-3.10.0`。
+- 原因：容器里的 `perf` 用户态工具与宿主机内核版本不匹配，且容器不能自行提供正确的内核 perf 事件支持；工具文件存在不能证明采样链路可用。
+- 规避：SSH2 阶段不要继续依赖 Docker 内 `perf stat/perf record` 判断 RRBS 热点。若要采样，改用低开销 stage 日志、短样本诊断计数、源码审计，或在宿主机上另建经验证的 perf/eBPF 环境；正式 Rust/C++ 性能表不得混入 perf 失败 run。
+- 验证：SSH2 probe 结果目录 `/workspace/benchmark_results/ssh2/perf-probe-20260628T011156Z-15865` 记录了该 stderr；后续优化判断改回生产 binary 的 10K/100K/1M/full benchmark。
