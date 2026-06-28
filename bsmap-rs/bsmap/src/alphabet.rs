@@ -223,22 +223,7 @@ pub fn xc64(tt: u64) -> u64 {
 /// Equivalent to C++ `Param::XM64(bit64_t tt)`.
 #[inline]
 pub fn xm64(tt: u64) -> u32 {
-    let mut t = tt;
-
-    // OR adjacent bits: non-zero 2-bit field → non-zero in both bits
-    t |= t >> 1;
-    t &= 0x5555_5555_5555_5555;
-
-    // Pairwise sum into 4-bit lanes
-    t = (t + (t >> 2)) & 0x3333_3333_3333_3333;
-
-    // Sum 4-bit lanes into 8-bit lanes
-    t = (t + (t >> 4)) & 0x0F0F_0F0F_0F0F_0F0F;
-
-    // Horizontal sum via multiplication
-    t = t.wrapping_mul(0x0101_0101_0101_0101);
-
-    (t >> 56) as u32
+    ((tt | (tt >> 1)) & 0x5555_5555_5555_5555).count_ones()
 }
 
 // ── Seed Extraction ─────────────────────────────────────────────────────────
