@@ -450,3 +450,10 @@
 - 原因：当前瓶颈虽在 mismatch 调用规模，但这个局部分支不是端到端主导项；额外分支拆分和 slice 形态没有压过编译器原有优化，短样本小幅波动不能外推为 full 收益。
 - 规避：不要继续围绕 `count_mismatch()` 内部边界分支做无证据微调。后续 mismatch 优化必须先证明能减少大量 candidate、减少 word 计算，或引入经端到端验证的专用 kernel；仅重排安全分支/iterator 形态不足以保留。
 - 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T011859Z-16179/summary.json` 中，candidate commit `01a5564` 的 1M Rust wall 为 35.90 秒、RSS 为 1,857,704 KiB；已由 `622c7d9` revert。
+
+### 54. 只提取启用 read-chain 的 seed 不是 SSH2 当前主瓶颈
+
+- 现象：SE 默认 `-n 0` 下只扩展 read_chain 0，因此尝试跳过 read_chain 1 的 seed/mask 提取；本地编译测试通过，10K/100K/1M mapped 和 sorted SAM 语义保持，但 1M Rust wall 从保留基线 35.77 秒退到 36.21 秒，RSS 从 1,856,048 KiB 略增到 1,857,664 KiB。
+- 原因：full RRBS SE 当前主要成本来自候选规模和 mismatch 调用，禁用链 seed 提取只是每条 read 的小固定开销；减少这部分工作没有转化为端到端收益。
+- 规避：不要继续围绕 SE 禁用链的 seed 提取、固定 scratch 清空或类似 per-read 小固定项做 SSH2 主线优化。除非 profile 证明 prepare/seed extraction 已成为主热点，否则应优先减少 mode-matched candidates、mismatch calls 或改变能显著压缩 align core 的数据流。
+- 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T013109Z-16808/summary.json` 中，candidate commit `44a7e55` 的 1M Rust wall 为 36.21 秒、RSS 为 1,857,664 KiB；已由 `3272fc5` revert。

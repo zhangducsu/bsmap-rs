@@ -350,3 +350,18 @@ pipeline 结论：
 | 1,000,000 | 35.90 s | 570% | 1,857,704 | 97.54 s | 295% | 2,487,604 | streaming exact 99,907/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
 
 - 判定：该候选未改变 mapped、FLAG/RNAME/NM 分布，1M sorted diff 仍只有既有 3 条 C++ terminal ZP/ZL 差异；但 1M wall 从保留基线 `35.77 s` 退到 `35.90 s`，RSS 也略增。说明当前编译器/CPU 对该分支拆分无端到端收益，已撤回。
+
+撤回候选：`44a7e55 perf: extract seeds only for enabled read chains`，已由 `3272fc5 Revert "perf: extract seeds only for enabled read chains"` 撤回。
+
+- 优化内容：SE 默认 `-n 0` 只会扩展 read_chain 0，因此尝试在 `SingleAlign::run_align()` 中只为启用的 read-chain 提取 seed/mask；保留旧 API 的双链行为，并新增 scratch 清空单测。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 均通过。
+- Docker 同步：checkout 为 `44a7e55`，repo dirty=false，Rust binary SHA256 为 `bb0beb55b907943744c793c4b7842781366b1533e5c09a8420aa79ae2c8850c3`。
+- 验证路径：`/workspace/benchmark_results/ssh2/20260628T013109Z-16808/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.86 s | 488% | 1,002,916 | 66.30 s | 100% | 2,057,240 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.62 s | 711% | 1,036,732 | 75.93 s | 115% | 2,117,764 | streaming exact 0/24,236；sorted diff 0 |
+| 1,000,000 | 36.21 s | 579% | 1,857,664 | 98.18 s | 296% | 2,487,708 | streaming exact 75,678/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
+
+- 判定：该候选保持 mapped 数和 sorted SAM 语义，但 1M wall 从保留基线 `35.77 s` 退到 `36.21 s`，RSS 略增。说明 full core 的主成本不在禁用链 seed 提取的固定开销上，已撤回。
