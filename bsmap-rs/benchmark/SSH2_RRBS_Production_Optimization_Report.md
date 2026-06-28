@@ -305,3 +305,18 @@ pipeline 结论：
 | 1,000,000 | 36.44 s | 583% | 1,856,036 | 98.51 s | 295% | 2,487,740 | sorted multiset 253,099/253,102；仍为 3 条 C++ terminal ZP/ZL 边界差异 |
 
 - 判定：packed `u64` key + identity hasher 保持 SAM 语义，但 1M wall 从保留基线 35.77 s 退到 36.44 s，RSS 基本不变；说明当前 full SE 不是被默认 tuple `HashSet` hash 成本主导。该候选负收益，已撤回。
+
+撤回候选：`f143c44 perf: add opt-in RRBS normal hit cache`，已由 `a82f138 Revert "perf: add opt-in RRBS normal hit cache"` 撤回。
+
+- 优化内容：在运行时按 `(seed_hash, mode)` 解码并缓存 RRBS normal hits，通过环境变量 `BSMAP_RRBS_NORMAL_HIT_CACHE=1` 启用；不修改 `.bsi` 格式，默认生产路径原本不受影响。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 均通过；新增单测确认 cached normal mode 保持 normal hit 顺序。
+- Docker 同步：checkout 为 `f143c44`，repo dirty=false，Rust binary SHA256 为 `5794128601e6125a29dd1285bfbd816cb10fdb6ff5102ff500c21e9012e877f4`。
+- 验证路径：`/workspace/benchmark_results/ssh2/20260628T004435Z-14681/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 2.22 s | 444% | 1,169,964 | 65.87 s | 100% | 2,057,224 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.63 s | 703% | 1,203,824 | 76.06 s | 116% | 2,119,712 | streaming exact 0/24,236；sorted diff 0 |
+| 1,000,000 | 34.99 s | 568% | 2,076,696 | 98.30 s | 299% | 2,487,720 | streaming exact 99,825/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
+
+- 判定：相对保留基线 1M `35.77 s / 1,856,048 KiB`，该候选仅提升约 2.2%，低于 SSH2 单项保留门槛；RSS 增加约 220,648 KiB，且 100K/1M streaming SAM 顺序仍不满足严格对齐。该方向不保留。

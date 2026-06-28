@@ -422,3 +422,10 @@
 - 原因：SSH2 当前主要成本仍来自 RRBS 候选规模和 mismatch kernel；`AddHit` 去重 hash 成本不是端到端主导项。替换 hasher 还会增加实现复杂度，收益不成立。
 - 规避：不要继续围绕 `AddHit` 去重 hash 做小改，除非新的 profile 证明 accepted-hit 去重占比已经成为主瓶颈。去重结构变化必须同时跑 10K/100K/1M SAM diff 和性能表，不能只凭理论上 identity hash 更快就保留。
 - 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T002013Z-13830/summary.json` 中，candidate commit `dcb61c2` 的 1M Rust wall 为 36.44 秒；已由 `e64aaca` revert。
+
+### 50. RRBS normal hit 解码缓存收益不足且吃 RSS
+
+- 现象：运行时按 `(seed_hash, mode)` 解码并缓存 RRBS normal hits 后，1M Rust wall 从保留基线 35.77 秒降到 34.99 秒，但 RSS 从 1,856,048 KiB 增到 2,076,696 KiB；100K/1M streaming compare 仍出现大面积顺序差异，只有 sorted multiset 保持既有语义水平。
+- 原因：SSH2 当前热路径主要仍是候选规模和 mismatch 调用，避免 packed hit 解码/BSC skip 只能带来约 2.2% 小收益；缓存本身需要额外保存 normal hits 和 mode ranges，会显著增加驻留内存。
+- 规避：不要默认引入 RRBS decoded normal-hit 全量缓存。除非后续 profile 证明 packed decode 已成为主瓶颈，并且端到端收益超过门槛、RSS 仍低于目标，否则优先优化候选规模、mismatch kernel 或 pipeline。
+- 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T004435Z-14681/summary.json` 中，candidate commit `f143c44` 的 1M Rust wall 为 34.99 秒、RSS 为 2,076,696 KiB；已由 `a82f138` revert。
