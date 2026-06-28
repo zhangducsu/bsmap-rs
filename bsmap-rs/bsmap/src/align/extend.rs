@@ -11,6 +11,7 @@
 //! - 最后合并两条链的 hits
 
 use std::collections::HashSet;
+use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::align::gap::gap_align;
 use crate::align::mismatch::count_mismatch;
@@ -23,6 +24,42 @@ use crate::reference::index::{KmerIndex, RRBS_BSC_FLAG, RRBS_CHR_MASK};
 use crate::utils::myrand;
 
 const HIT_LEVELS: usize = MAXSNPS as usize + 1;
+
+#[derive(Default)]
+pub(crate) struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut value = 0u64;
+        for (shift, byte) in bytes.iter().take(8).enumerate() {
+            value |= (*byte as u64) << (shift * 8);
+        }
+        self.0 = value;
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+}
+
+pub(crate) type DedupSet = HashSet<u64, BuildHasherDefault<IdentityHasher>>;
+
+#[inline]
+pub(crate) fn new_dedup_set() -> DedupSet {
+    DedupSet::default()
+}
+
+#[inline]
+fn dedup_key(chr: u32, loc: u32) -> u64 {
+    ((chr as u64) << 32) | loc as u64
+}
 
 fn circular_bucket_indices(
     bucket_len: usize,
@@ -66,8 +103,8 @@ pub(crate) struct HitCollector<'a> {
     max_hits: usize,
     chr_lengths: &'a [u32],
     read_len: u32,
-    dedup_no_gap: &'a mut HashSet<(u32, u32)>,
-    dedup_gap: &'a mut HashSet<(u32, u32)>,
+    dedup_no_gap: &'a mut DedupSet,
+    dedup_gap: &'a mut DedupSet,
 }
 
 impl<'a> HitCollector<'a> {
@@ -78,8 +115,8 @@ impl<'a> HitCollector<'a> {
         max_hits: usize,
         chr_lengths: &'a [u32],
         read_len: u32,
-        dedup_no_gap: &'a mut HashSet<(u32, u32)>,
-        dedup_gap: &'a mut HashSet<(u32, u32)>,
+        dedup_no_gap: &'a mut DedupSet,
+        dedup_gap: &'a mut DedupSet,
     ) -> Self {
         Self {
             hits,
@@ -120,7 +157,7 @@ impl<'a> HitCollector<'a> {
             return false;
         }
 
-        let key = (hit.chr, hit.loc);
+        let key = dedup_key(hit.chr, hit.loc);
         let is_new = if hit.gap_size != 0 {
             self.dedup_gap.insert(key)
         } else {
@@ -173,8 +210,8 @@ pub fn snp_align_for_chain(
     let mut counts_by_chain = [[0usize; HIT_LEVELS]; 2];
     let copy_len = level_counts.len().min(HIT_LEVELS);
     counts_by_chain[read_chain as usize][..copy_len].copy_from_slice(&level_counts[..copy_len]);
-    let mut dedup_no_gap = HashSet::new();
-    let mut dedup_gap = HashSet::new();
+    let mut dedup_no_gap = new_dedup_set();
+    let mut dedup_gap = new_dedup_set();
     let read_len = encoded.read_len();
     let query = if read_chain == 0 {
         encoded.fwd_words()
@@ -824,8 +861,8 @@ mod tests {
         let mut counts = [[0usize; HIT_LEVELS]; 2];
         let mut snp_thres = 0;
         let chr_lengths = [100];
-        let mut dedup_no_gap = HashSet::new();
-        let mut dedup_gap = HashSet::new();
+        let mut dedup_no_gap = new_dedup_set();
+        let mut dedup_gap = new_dedup_set();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,
@@ -853,8 +890,8 @@ mod tests {
         let mut counts = [[0usize; HIT_LEVELS]; 2];
         let mut snp_thres = 0;
         let chr_lengths = [1_000];
-        let mut dedup_no_gap = HashSet::new();
-        let mut dedup_gap = HashSet::new();
+        let mut dedup_no_gap = new_dedup_set();
+        let mut dedup_gap = new_dedup_set();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,
@@ -889,8 +926,8 @@ mod tests {
         let mut counts = [[0usize; HIT_LEVELS]; 2];
         let mut snp_thres = 2;
         let chr_lengths = [1_000];
-        let mut dedup_no_gap = HashSet::new();
-        let mut dedup_gap = HashSet::new();
+        let mut dedup_no_gap = new_dedup_set();
+        let mut dedup_gap = new_dedup_set();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,
@@ -917,8 +954,8 @@ mod tests {
         let mut counts = [[0usize; HIT_LEVELS]; 2];
         let mut snp_thres = 2;
         let chr_lengths = [1_000];
-        let mut dedup_no_gap = HashSet::new();
-        let mut dedup_gap = HashSet::new();
+        let mut dedup_no_gap = new_dedup_set();
+        let mut dedup_gap = new_dedup_set();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,
@@ -944,8 +981,8 @@ mod tests {
         let mut counts = [[0usize; HIT_LEVELS]; 2];
         let mut snp_thres = 2;
         let chr_lengths = [1_000];
-        let mut dedup_no_gap = HashSet::new();
-        let mut dedup_gap = HashSet::new();
+        let mut dedup_no_gap = new_dedup_set();
+        let mut dedup_gap = new_dedup_set();
         let mut collector = HitCollector::new(
             &mut hits,
             &mut counts,

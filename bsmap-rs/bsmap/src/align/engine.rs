@@ -17,11 +17,11 @@
 //! - 命中在全局去重后进入对应 read-chain 的计数层
 //! - `AddHit()` 的早停结果立即结束当前 segment 扩展
 
-use std::collections::HashSet;
 use rayon::prelude::*;
 
 use crate::align::extend::{
-    clear_hits, is_unique_hit, select_best_hits, snp_align_segment, HitCollector,
+    clear_hits, is_unique_hit, new_dedup_set, select_best_hits, snp_align_segment, DedupSet,
+    HitCollector,
 };
 use crate::align::seed::{
     extract_seeds_and_masks_into, reorder_seeds_for_chain_with_masks_into, SeedSegment,
@@ -75,9 +75,9 @@ pub struct SingleAlign {
     /// 多重比对读段数。
     pub n_multiple: u32,
     /// C++ hitset: 非 gap 命中去重集。Rust `chr` 已等价于 C++ `chr >> 1`。
-    dedup_no_gap: HashSet<(u32, u32)>,
+    dedup_no_gap: DedupSet,
     /// C++ ghitset: gap 命中去重集。Rust `chr` 已等价于 C++ `chr >> 1`。
-    dedup_gap: HashSet<(u32, u32)>,
+    dedup_gap: DedupSet,
     /// C++ `x_cur_n_hit[read_chain][snp_level]`，跨 segment 累计。
     level_counts: [[usize; MAXSNPS as usize + 1]; 2],
     /// Worker-local seed hash scratch，跨 read 复用容量。
@@ -100,8 +100,8 @@ impl SingleAlign {
             n_aligned: 0,
             n_unique: 0,
             n_multiple: 0,
-            dedup_no_gap: HashSet::new(),
-            dedup_gap: HashSet::new(),
+            dedup_no_gap: new_dedup_set(),
+            dedup_gap: new_dedup_set(),
             level_counts: [[0; MAXSNPS as usize + 1]; 2],
             seed_chains: std::array::from_fn(|_| Vec::with_capacity(crate::param::FIXSIZE)),
             seed_reg_masks: std::array::from_fn(|_| Vec::with_capacity(crate::param::FIXSIZE)),
