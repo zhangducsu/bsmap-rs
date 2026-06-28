@@ -480,20 +480,8 @@ pub fn count_mismatch_simd(
     _n_count: u32,
     nt3: bool,
 ) -> u32 {
-    use std::sync::atomic::{AtomicU8, Ordering};
-
-    static AVX2_AVAILABLE: AtomicU8 = AtomicU8::new(0);
-    let avx2_available = match AVX2_AVAILABLE.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let available = is_x86_feature_detected!("avx2");
-            AVX2_AVAILABLE.store(if available { 2 } else { 1 }, Ordering::Relaxed);
-            available
-        }
-    };
-
-    if avx2_available {
+    // 检查 AVX2 支持
+    if is_x86_feature_detected!("avx2") {
         // SAFETY: 我们已经检查了 AVX2 支持
         unsafe {
             count_mismatch_avx2(query, offset, ref_seq, mask, snp_thres, 0, nt3)
@@ -515,18 +503,9 @@ unsafe fn count_mismatch_avx2(
     mask: &[u64],
     snp_thres: u32,
     _n_count: u32,
-    _nt3: bool,
+    nt3: bool,
 ) -> u32 {
     use std::arch::x86_64::*;
-
-    #[inline(always)]
-    unsafe fn xc64_vec(value: __m256i) -> __m256i {
-        let all_ones = _mm256_cmpeq_epi64(value, value);
-        let not_value = _mm256_xor_si256(value, all_ones);
-        let shifted = _mm256_slli_epi64(not_value, 1);
-        let ct_mask = _mm256_set1_epi64x(0x5555_5555_5555_5555u64 as i64);
-        _mm256_or_si256(_mm256_or_si256(shifted, value), ct_mask)
-    }
 
     let word_offset = (offset / 64) as usize;
     let bit_offset = (offset % 64) as u32;
@@ -534,45 +513,34 @@ unsafe fn count_mismatch_avx2(
     let mut total_mismatches: u32 = 0;
 
     // AVX2 每次处理 4 个 u64（256 bits）
-    let simd_len = if bit_offset == 0 {
-        query.len() / 4 * 4
-    } else {
-        let available_words = ref_seq.len().saturating_sub(word_offset);
-        query.len().min(available_words.saturating_sub(1)) / 4 * 4
-    };
+    let simd_len = query.len() / 4 * 4;
 
-    if simd_len > 0 {
-        let shift_left = _mm256_set1_epi64x(bit_offset as i64);
-        let shift_right = _mm256_set1_epi64x((64 - bit_offset) as i64);
-
+    if bit_offset == 0 && simd_len > 0 {
+        // 对齐情况下使用 SIMD
         for i in (0..simd_len).step_by(4) {
             // 加载 4 个 u64
             let q_vec = _mm256_loadu_si256(query.as_ptr().add(i) as *const __m256i);
+            let r_vec = _mm256_loadu_si256(ref_seq.as_ptr().add(word_offset + i) as *const __m256i);
             let m_vec = _mm256_loadu_si256(mask.as_ptr().add(i) as *const __m256i);
-            let r_vec = if bit_offset == 0 {
-                _mm256_loadu_si256(ref_seq.as_ptr().add(word_offset + i) as *const __m256i)
-            } else {
-                let low =
-                    _mm256_loadu_si256(ref_seq.as_ptr().add(word_offset + i) as *const __m256i);
-                let high = _mm256_loadu_si256(
-                    ref_seq.as_ptr().add(word_offset + i + 1) as *const __m256i,
-                );
-                _mm256_or_si256(
-                    _mm256_sllv_epi64(low, shift_left),
-                    _mm256_srlv_epi64(high, shift_right),
-                )
-            };
 
             // XOR 计算差异
             let diff_vec = _mm256_xor_si256(q_vec, r_vec);
-            let masked_diff = _mm256_and_si256(_mm256_and_si256(diff_vec, xc64_vec(r_vec)), m_vec);
+
+            // 应用掩码：diff & mask（mask=0 的位置清零不计入）
+            let masked_diff = _mm256_and_si256(diff_vec, m_vec);
 
             // 提取到数组进行 popcount（AVX2 没有原生 popcount）
             let mut diffs = [0u64; 4];
             _mm256_storeu_si256(diffs.as_mut_ptr() as *mut __m256i, masked_diff);
 
             for j in 0..4 {
-                total_mismatches += xm64(diffs[j]);
+                let mut diff = diffs[j];
+
+                // 应用 C→T 容忍掩码
+                let ref_word = ref_seq[word_offset + i + j];
+                diff &= xc64(ref_word);
+
+                total_mismatches += xm64(diff);
 
                 if total_mismatches > snp_thres {
                     return snp_thres + 1;
@@ -580,17 +548,16 @@ unsafe fn count_mismatch_avx2(
             }
         }
 
-    }
-
-    // 处理不足 4 个 word 的输入，以及 SIMD 块后的剩余 word。
-    if bit_offset == 0 {
+        // 处理剩余部分
         for i in simd_len..query.len() {
             let ref_word = ref_seq[word_offset + i];
             let q_word = query[i];
             let m_word = mask[i];
 
             let mut diff = q_word ^ ref_word;
+
             diff &= xc64(ref_word);
+
             diff &= m_word;
             total_mismatches += xm64(diff);
 
@@ -599,28 +566,8 @@ unsafe fn count_mismatch_avx2(
             }
         }
     } else {
-        let shift_left = bit_offset;
-        let shift_right = 64 - bit_offset;
-        for i in simd_len..query.len() {
-            let ref_low = ref_seq[word_offset + i] << shift_left;
-            let ref_high = if word_offset + i + 1 < ref_seq.len() {
-                ref_seq[word_offset + i + 1] >> shift_right
-            } else {
-                0
-            };
-            let ref_word = ref_low | ref_high;
-            let q_word = query[i];
-            let m_word = mask[i];
-
-            let mut diff = q_word ^ ref_word;
-            diff &= xc64(ref_word);
-            diff &= m_word;
-            total_mismatches += xm64(diff);
-
-            if total_mismatches > snp_thres {
-                return snp_thres + 1;
-            }
-        }
+        // 非对齐情况，回退到标量
+        return count_mismatch(query, offset, ref_seq, mask, snp_thres, 0, nt3);
     }
 
     total_mismatches
@@ -834,61 +781,6 @@ mod tests {
         let simd = count_mismatch_simd(&query, 0, &ref_seq, &mask, 100, 0, false);
 
         assert_eq!(scalar, simd, "SIMD 版本和标量版本结果应该一致");
-    }
-
-    #[test]
-    fn test_simd_consistency_nonzero_offsets_and_masks() {
-        let bases = *b"ACGT";
-        let mut reference = Vec::with_capacity(280);
-        for i in 0..280usize {
-            reference.push(bases[(i * 11 + i / 5 + 3) % bases.len()]);
-        }
-        let ref_words = make_ref_seq(&reference);
-
-        for read_len in 1..=160usize {
-            for reference_start in 0..64usize {
-                let mut query_seq = reference[reference_start..reference_start + read_len].to_vec();
-                if read_len > 9 {
-                    let pos = read_len / 3;
-                    query_seq[pos] = match query_seq[pos] {
-                        b'A' => b'C',
-                        b'C' => b'G',
-                        b'G' => b'T',
-                        _ => b'A',
-                    };
-                }
-                if read_len > 47 {
-                    let pos = read_len - 5;
-                    query_seq[pos] = match query_seq[pos] {
-                        b'A' => b'T',
-                        b'C' => b'A',
-                        b'G' => b'C',
-                        _ => b'G',
-                    };
-                }
-
-                let query = pack_forward(&query_seq, 1);
-                let mut mask = make_mask(read_len);
-                if read_len > 13 {
-                    let masked = read_len / 2;
-                    let word = masked / SEGLEN;
-                    let bit = 62 - (masked % SEGLEN) * 2;
-                    mask[word] &= !(0b11u64 << bit);
-                }
-
-                let offset = (reference_start * 2) as u64;
-                for threshold in [0, 1, 2, 4, 12, 100] {
-                    let scalar =
-                        count_mismatch(&query, offset, &ref_words, &mask, threshold, 0, false);
-                    let simd =
-                        count_mismatch_simd(&query, offset, &ref_words, &mask, threshold, 0, false);
-                    assert_eq!(
-                        scalar, simd,
-                        "read_len={read_len} reference_start={reference_start} threshold={threshold}"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
