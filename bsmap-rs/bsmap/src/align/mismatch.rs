@@ -134,6 +134,77 @@ pub fn count_mismatch(
     total_mismatches
 }
 
+/// Mismatch counter for hot paths that already checked the reference window.
+///
+/// # Safety
+///
+/// The caller must guarantee that `query.len() == mask.len()` and that
+/// `ref_seq` contains every word read by `offset` and `query.len()`. For a
+/// non-zero bit offset this means `word_offset + query.len() <= ref_seq.len()`;
+/// the high word beyond the last query word is only read when it exists, matching
+/// [`count_mismatch`].
+#[inline]
+pub unsafe fn count_mismatch_prechecked(
+    query: &[u64],
+    offset: u64,
+    ref_seq: &[u64],
+    mask: &[u64],
+    snp_thres: u32,
+    nt3: bool,
+) -> u32 {
+    debug_assert_eq!(query.len(), mask.len());
+
+    let word_offset = (offset / 64) as usize;
+    let bit_offset = (offset % 64) as u32;
+    debug_assert!(word_offset + query.len() <= ref_seq.len());
+
+    let mut total_mismatches: u32 = 0;
+    let query_ptr = query.as_ptr();
+    let mask_ptr = mask.as_ptr();
+    let ref_ptr = ref_seq.as_ptr().add(word_offset);
+
+    if bit_offset == 0 {
+        for i in 0..query.len() {
+            let ref_word = *ref_ptr.add(i);
+            let q_word = *query_ptr.add(i);
+            let m_word = *mask_ptr.add(i);
+            let mut diff = q_word ^ ref_word;
+            diff &= xc64(ref_word);
+            diff &= m_word;
+            total_mismatches += xm64(diff);
+            if total_mismatches > snp_thres {
+                return snp_thres + 1;
+            }
+        }
+    } else {
+        let shift_left = bit_offset;
+        let shift_right = 64 - bit_offset;
+        let has_tail_word = word_offset + query.len() < ref_seq.len();
+
+        for i in 0..query.len() {
+            let ref_low = *ref_ptr.add(i) << shift_left;
+            let ref_high = if i + 1 < query.len() || has_tail_word {
+                *ref_ptr.add(i + 1) >> shift_right
+            } else {
+                0
+            };
+            let ref_word = ref_low | ref_high;
+            let q_word = *query_ptr.add(i);
+            let m_word = *mask_ptr.add(i);
+            let mut diff = q_word ^ ref_word;
+            diff &= xc64(ref_word);
+            diff &= m_word;
+            total_mismatches += xm64(diff);
+            if total_mismatches > snp_thres {
+                return snp_thres + 1;
+            }
+        }
+    }
+
+    let _ = nt3;
+    total_mismatches
+}
+
 /// 记录所有 mismatch 位置（无 gap）。
 ///
 /// 对应 C++ `MismatchPattern0()` 函数。遍历所有 word，
@@ -781,6 +852,32 @@ mod tests {
         let simd = count_mismatch_simd(&query, 0, &ref_seq, &mask, 100, 0, false);
 
         assert_eq!(scalar, simd, "SIMD 版本和标量版本结果应该一致");
+    }
+
+    #[test]
+    fn test_prechecked_consistency_nonzero_offsets_and_thresholds() {
+        let query_seq = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT";
+        let ref_seq_bytes = b"ATGTACGTACGTTCGTACGTACGTACGTACGAACGTACGTTCGTACGTACGA";
+        let query_words = (query_seq.len() + SEGLEN - 1) / SEGLEN;
+        let query = pack_forward(query_seq, query_words);
+        let ref_seq = make_ref_seq(ref_seq_bytes);
+        let mut mask = make_mask(query_seq.len());
+        // Mask one full base so both implementations must ignore it.
+        mask[1] &= !(0b11u64 << 46);
+
+        for offset_bases in 0..64u64 {
+            let offset = offset_bases * 2;
+            for &threshold in &[0, 1, 2, 4, 12, 100] {
+                let scalar = count_mismatch(&query, offset, &ref_seq, &mask, threshold, 0, false);
+                let prechecked = unsafe {
+                    count_mismatch_prechecked(&query, offset, &ref_seq, &mask, threshold, false)
+                };
+                assert_eq!(
+                    scalar, prechecked,
+                    "offset_bases={offset_bases}, threshold={threshold}"
+                );
+            }
+        }
     }
 
     #[test]

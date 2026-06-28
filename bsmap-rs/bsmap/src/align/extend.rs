@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 
 use crate::align::gap::gap_align;
-use crate::align::mismatch::count_mismatch;
+use crate::align::mismatch::{count_mismatch, count_mismatch_prechecked};
 use crate::align::profile::RrbsProfile;
 use crate::align::seed::SeedSegment;
 use crate::param::{GHit, Hit, FIXELEMENT, MAXSNPS};
@@ -237,7 +237,7 @@ fn try_process_rrbs_hit(
     nt3: bool,
     query: &[u64],
     mask: &[u64],
-    n_count: u32,
+    _n_count: u32,
     collector: &mut HitCollector<'_>,
     profile: Option<&RrbsProfile>,
 ) -> bool {
@@ -294,7 +294,8 @@ fn try_process_rrbs_hit(
     let chr = chr_idx as u32;
 
     let snp_thres = collector.snp_thres();
-    let mm_count = count_mismatch(query, ref_offset, ref_seq, mask, snp_thres, n_count, nt3);
+    let mm_count =
+        unsafe { count_mismatch_prechecked(query, ref_offset, ref_seq, mask, snp_thres, nt3) };
     if let Some(profile) = profile {
         profile.add(&profile.mismatch_calls, 1);
     }
