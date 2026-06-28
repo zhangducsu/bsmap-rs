@@ -170,8 +170,29 @@ pub(crate) struct RrbsModeRanges {
     ranges: Vec<RrbsModeRange>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RrbsCachedModeRange {
+    pub start: u32,
+    pub count: u32,
+    pub normal_prefix: u32,
+}
+
+pub(crate) struct RrbsNormalModeCache {
+    max_modes: usize,
+    ranges: Vec<RrbsCachedModeRange>,
+    logical_counts: Vec<u32>,
+    hits: Vec<Hit>,
+}
+
 pub(crate) struct RrbsModeBucket<'a> {
     pub hits: RrbsHitView<'a>,
+    pub normal_prefix: u32,
+    pub normal_count: u32,
+    pub logical_len: u32,
+}
+
+pub(crate) struct RrbsCachedModeBucket<'a> {
+    pub hits: &'a [Hit],
     pub normal_prefix: u32,
     pub normal_count: u32,
     pub logical_len: u32,
@@ -187,6 +208,35 @@ impl RrbsModeRanges {
         self.ranges
             .get(seed_hash as usize * self.max_modes + mode)
             .copied()
+    }
+}
+
+impl RrbsNormalModeCache {
+    #[inline]
+    fn get(
+        &self,
+        seed_hash: u32,
+        mode: u32,
+        total_kmers: u32,
+    ) -> Option<RrbsCachedModeBucket<'_>> {
+        let mode = mode as usize;
+        if mode >= self.max_modes || seed_hash >= total_kmers {
+            return None;
+        }
+        let hash = seed_hash as usize;
+        let range = *self.ranges.get(hash * self.max_modes + mode)?;
+        if range.count == 0 {
+            return None;
+        }
+        let start = range.start as usize;
+        let end = start + range.count as usize;
+        let hits = self.hits.get(start..end)?;
+        Some(RrbsCachedModeBucket {
+            hits,
+            normal_prefix: range.normal_prefix,
+            normal_count: range.count,
+            logical_len: self.logical_counts.get(hash).copied().unwrap_or(0),
+        })
     }
 }
 
@@ -347,6 +397,11 @@ pub struct KmerIndex {
     /// the hot path jump to the target mode while preserving C++ circular
     /// randomization over the non-BSC logical bucket.
     pub(crate) rrbs_mode_ranges: OnceLock<RrbsModeRanges>,
+    /// Runtime-only decoded normal-hit cache for large RRBS SE runs.
+    ///
+    /// This is opt-in and not serialized. It preserves C++ hit order but avoids
+    /// repeatedly decoding packed hits and skipping BSC entries in hot buckets.
+    pub(crate) rrbs_normal_mode_cache: OnceLock<RrbsNormalModeCache>,
 }
 
 /// Incremental RRBS digestion-site collector for streaming FASTA input.
@@ -766,6 +821,7 @@ impl KmerIndex {
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
             rrbs_mode_ranges: OnceLock::new(),
+            rrbs_normal_mode_cache: OnceLock::new(),
         }
     }
 
@@ -978,6 +1034,98 @@ impl KmerIndex {
         })
     }
 
+    pub(crate) fn lookup_rrbs_cached_normal_mode(
+        &self,
+        seed_hash: u32,
+        mode: u32,
+    ) -> Option<RrbsCachedModeBucket<'_>> {
+        let cache = self
+            .rrbs_normal_mode_cache
+            .get_or_init(|| self.build_rrbs_normal_mode_cache());
+        cache.get(seed_hash, mode, self.total_kmers)
+    }
+
+    fn build_rrbs_normal_mode_cache(&self) -> RrbsNormalModeCache {
+        let rrbs_offsets = self.rrbs_offsets_slice();
+        let bucket_count = rrbs_offsets.len().saturating_sub(1);
+        let seed_size = self.seed_size.max(1);
+        let max_modes = (((crate::param::FIXELEMENT - 1) * SEGLEN) as u32 / seed_size)
+            .max(1) as usize;
+        if bucket_count == 0 {
+            return RrbsNormalModeCache {
+                max_modes,
+                ranges: Vec::new(),
+                logical_counts: Vec::new(),
+                hits: Vec::new(),
+            };
+        }
+
+        let rrbs_hits = self.rrbs_hit_view();
+        let mut counts = vec![0u32; bucket_count * max_modes];
+        let mut logical_counts = vec![0u32; bucket_count];
+        for (hash, window) in rrbs_offsets.windows(2).enumerate() {
+            for index in window[0] as usize..window[1] as usize {
+                let Some(hit) = rrbs_hits.get(index) else {
+                    continue;
+                };
+                if hit.chr & RRBS_BSC_FLAG != 0 {
+                    continue;
+                }
+                let mode = ((hit.chr >> RRBS_MODE_SHIFT) & 0x7f) as usize;
+                if mode >= max_modes {
+                    continue;
+                }
+                counts[hash * max_modes + mode] += 1;
+                logical_counts[hash] += 1;
+            }
+        }
+
+        let mut ranges = vec![RrbsCachedModeRange::default(); bucket_count * max_modes];
+        let mut total_hits = 0u32;
+        for hash in 0..bucket_count {
+            let mut normal_prefix = 0u32;
+            for mode in 0..max_modes {
+                let idx = hash * max_modes + mode;
+                let count = counts[idx];
+                ranges[idx] = RrbsCachedModeRange {
+                    start: total_hits,
+                    count,
+                    normal_prefix,
+                };
+                total_hits = total_hits.saturating_add(count);
+                normal_prefix = normal_prefix.saturating_add(count);
+            }
+        }
+
+        let mut hits = vec![Hit::default(); total_hits as usize];
+        let mut write_offsets = ranges.iter().map(|range| range.start).collect::<Vec<_>>();
+        for (hash, window) in rrbs_offsets.windows(2).enumerate() {
+            for index in window[0] as usize..window[1] as usize {
+                let Some(hit) = rrbs_hits.get(index) else {
+                    continue;
+                };
+                if hit.chr & RRBS_BSC_FLAG != 0 {
+                    continue;
+                }
+                let mode = ((hit.chr >> RRBS_MODE_SHIFT) & 0x7f) as usize;
+                if mode >= max_modes {
+                    continue;
+                }
+                let idx = hash * max_modes + mode;
+                let output = write_offsets[idx] as usize;
+                hits[output] = hit;
+                write_offsets[idx] += 1;
+            }
+        }
+
+        RrbsNormalModeCache {
+            max_modes,
+            ranges,
+            logical_counts,
+            hits,
+        }
+    }
+
     fn build_rrbs_normal_counts(&self) -> Vec<u32> {
         let rrbs_offsets = self.rrbs_offsets_slice();
         if rrbs_offsets.len() < 2 {
@@ -1168,6 +1316,7 @@ fn build_flat_rrbs_index(
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
             rrbs_mode_ranges: OnceLock::new(),
+            rrbs_normal_mode_cache: OnceLock::new(),
         };
     }
 
@@ -1221,6 +1370,7 @@ fn build_flat_rrbs_index(
         mapped: None,
         rrbs_normal_counts: OnceLock::new(),
         rrbs_mode_ranges: OnceLock::new(),
+        rrbs_normal_mode_cache: OnceLock::new(),
     }
 }
 
@@ -1454,6 +1604,7 @@ mod tests {
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
             rrbs_mode_ranges: OnceLock::new(),
+            rrbs_normal_mode_cache: OnceLock::new(),
         };
 
         assert_eq!(index.rrbs_fragment(0, 10, 20), Some((6, 37)));
@@ -1516,6 +1667,7 @@ mod tests {
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
             rrbs_mode_ranges: OnceLock::new(),
+            rrbs_normal_mode_cache: OnceLock::new(),
         };
 
         assert_eq!(index.rrbs_candidate_count(1, true), 3);
@@ -1565,6 +1717,7 @@ mod tests {
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
             rrbs_mode_ranges: OnceLock::new(),
+            rrbs_normal_mode_cache: OnceLock::new(),
         };
 
         let mode1 = index.lookup_rrbs_normal_mode(0, 1).unwrap();
@@ -1580,6 +1733,85 @@ mod tests {
 
         assert!(index.lookup_rrbs_normal_mode(0, 3).is_none());
         assert!(index.lookup_rrbs_normal_mode(1, 0).is_none());
+    }
+
+    #[test]
+    fn rrbs_cached_normal_mode_preserves_mode_order() {
+        let index = KmerIndex {
+            total_kmers: 2,
+            max_kmer_num: u32::MAX,
+            index2: Vec::new(),
+            positions: Vec::new(),
+            start_offsets: Vec::new(),
+            rrbs_offsets: vec![0, 8, 8],
+            rrbs_hits: vec![
+                Hit { chr: 0, loc: 10 },
+                Hit {
+                    chr: RRBS_BSC_FLAG,
+                    loc: 11,
+                },
+                Hit {
+                    chr: 1 | (1 << RRBS_MODE_SHIFT),
+                    loc: 20,
+                },
+                Hit {
+                    chr: RRBS_BSC_FLAG | 1 | (1 << RRBS_MODE_SHIFT),
+                    loc: 21,
+                },
+                Hit {
+                    chr: 2 | (1 << RRBS_MODE_SHIFT),
+                    loc: 22,
+                },
+                Hit {
+                    chr: 3 | (2 << RRBS_MODE_SHIFT),
+                    loc: 30,
+                },
+                Hit {
+                    chr: RRBS_BSC_FLAG | 3 | (2 << RRBS_MODE_SHIFT),
+                    loc: 31,
+                },
+                Hit {
+                    chr: RRBS_BSC_FLAG | 2 | (1 << RRBS_MODE_SHIFT),
+                    loc: 23,
+                },
+            ],
+            rrbs_site_offsets: Vec::new(),
+            rrbs_sites: Vec::new(),
+            wgbs_occupancy: Vec::new(),
+            wgbs_rank: Vec::new(),
+            wgbs_buckets: Vec::new(),
+            wgbs_overflow: Vec::new(),
+            seed_size: 12,
+            mapped: None,
+            rrbs_normal_counts: OnceLock::new(),
+            rrbs_mode_ranges: OnceLock::new(),
+            rrbs_normal_mode_cache: OnceLock::new(),
+        };
+
+        let mode1 = index.lookup_rrbs_cached_normal_mode(0, 1).unwrap();
+        assert_eq!(mode1.normal_prefix, 1);
+        assert_eq!(mode1.normal_count, 2);
+        assert_eq!(mode1.logical_len, 4);
+        assert_eq!(
+            mode1.hits.iter().map(|hit| hit.loc).collect::<Vec<_>>(),
+            vec![20, 22]
+        );
+
+        let mode0 = index.lookup_rrbs_cached_normal_mode(0, 0).unwrap();
+        assert_eq!(
+            mode0.hits.iter().map(|hit| hit.loc).collect::<Vec<_>>(),
+            vec![10]
+        );
+
+        let mode2 = index.lookup_rrbs_cached_normal_mode(0, 2).unwrap();
+        assert_eq!(mode2.normal_prefix, 3);
+        assert_eq!(
+            mode2.hits.iter().map(|hit| hit.loc).collect::<Vec<_>>(),
+            vec![30]
+        );
+
+        assert!(index.lookup_rrbs_cached_normal_mode(0, 3).is_none());
+        assert!(index.lookup_rrbs_cached_normal_mode(1, 0).is_none());
     }
 
     #[test]
