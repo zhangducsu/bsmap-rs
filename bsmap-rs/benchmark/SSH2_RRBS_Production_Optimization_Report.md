@@ -511,3 +511,20 @@ full stage profile 补充运行：
 | 1,000,000 | 37.06 s | 588% | 1,857,712 | 95.48 s | 290% | 2,487,336 | sorted exact 253,099/253,102，仍为既有 3 条 C++ terminal ZP/ZL 边界差异 |
 
 - 判定：该候选没有引入新的 mapped 数或核心字段差异；1M 的 3 条 sorted multiset 差异仍是既有 C++ terminal ZP/ZL 边界标签问题。但相对保留基线 1M `35.77 s / 1,856,048 KiB`，wall 退化到 `37.06 s`，RSS 基本持平。说明在当前 portable 构建和服务器 CPU 上，非零 offset AVX2 kernel 的开销、feature dispatch 或数据搬移没有压过原有 SWAR scalar 路径；该方向不保留。
+
+撤回候选：prechecked RRBS mismatch 与 5-word unroll，已由 `96a3b43 Revert "perf: unroll common five-word RRBS mismatch"` 和 `9fe6ed6 Revert "perf: use prechecked mismatch for RRBS hits"` 撤回。
+
+- 优化内容：
+  - `5e6d28c perf: use prechecked mismatch for RRBS hits`：在 RRBS no-gap hot path 中调用已由上层完成 reference window 检查的 unsafe mismatch counter，避免每个 word 的重复 slice 边界检查。
+  - `d1551bf perf: unroll common five-word RRBS mismatch`：针对 150 bp RRBS read 的 5-word hot path 做手工 unroll，并用 scalar oracle 覆盖 150 bp、非零 offset、mask/N 和 threshold。
+- 本地验证：两个候选均通过 `cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap`。
+- Docker 验证路径：
+  - 泛型 prechecked：`/workspace/benchmark_results/ssh2/20260628T041213Z-27733/summary.json`，binary SHA256 `cb65b7960e875e67730febe33eef528b4298b73b37c747015a4e659b93990517`。
+  - 5-word unroll：`/workspace/benchmark_results/ssh2/20260628T042122Z-28259/summary.json`，binary SHA256 `6b19db89e01a3d81625f89a787a18660638d42d82e67889b39c7a20d543ef073`。
+
+| candidate | 10K Rust wall/RSS | 100K Rust wall/RSS | 1M Rust wall/RSS | SAM diff | 判定 |
+|---|---:|---:|---:|---|---|
+| prechecked generic | 1.95 s / 1,002,944 KiB | 10.33 s / 1,036,760 KiB | 35.61 s / 1,857,676 KiB | 10K/100K streaming diff 0；1M sorted exact 253,099/253,102，仅既有 3 条 ZP/ZL | 相对 35.77 s 仅约 0.45%，不保留 |
+| prechecked + five-word unroll | 1.83 s / 1,003,260 KiB | 10.52 s / 1,036,936 KiB | 35.23 s / 1,857,752 KiB | 10K/100K streaming diff 0；1M sorted exact 253,099/253,102，仅既有 3 条 ZP/ZL | 相对 35.77 s 约 1.5%，低于保留门槛，不保留 |
+
+- 判定：两个候选都没有破坏 SAM 语义，但收益仍停留在噪声级/小微调区间，和此前 `#[inline(always)]` 的 1.6% 级结果一致。为避免 unsafe/unroll 热路径增加维护风险，SSH2 不保留该方向。后续不应继续围绕 scalar `count_mismatch()` 的边界检查、手工 unroll 或函数形态做小改，除非 microbench 与端到端短基准同时证明超过保留门槛。

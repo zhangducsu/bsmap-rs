@@ -534,3 +534,10 @@
 - 原因：当前服务器 portable release 下，非零 offset AVX2 kernel 需要额外处理完整 word/tail、运行时 feature dispatch 和跨 lane 数据组合；这些开销没有压过原有 C++ 风格 SWAR scalar 路径。RRBS full 主瓶颈虽在 mismatch 调用规模，但不代表任何 SIMD 化都会有端到端收益。
 - 规避：不要默认接入非零 offset AVX2 mismatch 路径，除非后续 microbench 与 10K/100K/1M 端到端 benchmark 同时证明收益。SIMD 候选必须保留 scalar oracle 单测，覆盖 read length、reference offset、mask/N 和 threshold；只看局部指令形态或理论 SIMD 宽度不得保留。
 - 验证：候选 `534b063` 的 Docker run `/workspace/benchmark_results/ssh2/20260628T035723Z-27210/summary.json` 中，1M Rust wall/RSS 为 37.06 秒/1,857,712 KiB；已由 `ab24a97 Revert "perf: use AVX2 mismatch for RRBS offsets"` 撤回。
+
+### 66. RRBS scalar mismatch 的 prechecked/unroll 只有小微调收益
+
+- 现象：把 RRBS no-gap hot path 改成 unsafe prechecked mismatch counter 后，10K/100K SAM diff 为 0，1M 仍只剩既有 3 条 C++ terminal ZP/ZL；但 1M Rust wall 只从保留基线 35.77 秒降到 35.61 秒。继续对常见 150 bp 的 5-word 路径手工 unroll 后，1M wall 为 35.23 秒，仍只有约 1.5% 收益。
+- 原因：当前 full RRBS SE 主瓶颈虽然在 mismatch/extend core，但 scalar `count_mismatch()` 的 slice 边界检查、循环形态和 5-word unroll 不是足够大的端到端主导项；这类修改和此前 `#[inline(always)]` 一样，只能带来噪声级到小微调级收益。
+- 规避：不要继续围绕 scalar mismatch 的边界检查、函数内联、手工 unroll 做 SSH2 主线优化。此类改动若引入 unsafe 或明显增加热路径复杂度，必须达到 10K/100K/1M SAM diff 无回归且 1M wall 至少 3% 以上收益才可保留；否则撤回。
+- 验证：prechecked generic run `/workspace/benchmark_results/ssh2/20260628T041213Z-27733/summary.json` 的 1M Rust wall/RSS 为 35.61 秒/1,857,676 KiB；5-word unroll run `/workspace/benchmark_results/ssh2/20260628T042122Z-28259/summary.json` 的 1M Rust wall/RSS 为 35.23 秒/1,857,752 KiB。候选 `5e6d28c` 与 `d1551bf` 已分别由 `9fe6ed6` 和 `96a3b43` 撤回。
