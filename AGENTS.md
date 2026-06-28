@@ -443,3 +443,10 @@
 - 原因：容器里的 `perf` 用户态工具与宿主机内核版本不匹配，且容器不能自行提供正确的内核 perf 事件支持；工具文件存在不能证明采样链路可用。
 - 规避：SSH2 阶段不要继续依赖 Docker 内 `perf stat/perf record` 判断 RRBS 热点。若要采样，改用低开销 stage 日志、短样本诊断计数、源码审计，或在宿主机上另建经验证的 perf/eBPF 环境；正式 Rust/C++ 性能表不得混入 perf 失败 run。
 - 验证：SSH2 probe 结果目录 `/workspace/benchmark_results/ssh2/perf-probe-20260628T011156Z-15865` 记录了该 stderr；后续优化判断改回生产 binary 的 10K/100K/1M/full benchmark。
+
+### 53. mismatch reference-window 分支拆分没有端到端收益
+
+- 现象：把 `count_mismatch()` 的常规 `bit_offset != 0` 路径拆成无末端越界分支的 slice 访问后，本地编译测试通过，10K/100K/1M mapped 和分布不变，但 1M Rust wall 从保留基线 35.77 秒退到 35.90 秒，RSS 从 1,856,048 KiB 略增到 1,857,704 KiB。
+- 原因：当前瓶颈虽在 mismatch 调用规模，但这个局部分支不是端到端主导项；额外分支拆分和 slice 形态没有压过编译器原有优化，短样本小幅波动不能外推为 full 收益。
+- 规避：不要继续围绕 `count_mismatch()` 内部边界分支做无证据微调。后续 mismatch 优化必须先证明能减少大量 candidate、减少 word 计算，或引入经端到端验证的专用 kernel；仅重排安全分支/iterator 形态不足以保留。
+- 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T011859Z-16179/summary.json` 中，candidate commit `01a5564` 的 1M Rust wall 为 35.90 秒、RSS 为 1,857,704 KiB；已由 `622c7d9` revert。

@@ -335,3 +335,18 @@ pipeline 结论：
 | 1,000,000 | 35.59 s | 576% | 1,857,736 | 99.51 s | 300% | 2,487,892 | streaming exact 51,032/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
 
 - 判定：相对保留基线 1M `35.77 s / 1,856,048 KiB`，该候选仅提升约 0.5%，低于 SSH2 单项保留门槛；RSS 基本持平。该方向不能解决 full core 859 s 的主瓶颈，已撤回。
+
+撤回候选：`01a5564 perf: split fast mismatch reference window path`，已由 `622c7d9 Revert "perf: split fast mismatch reference window path"` 撤回。
+
+- 优化内容：保持现有 reference-shift 语义不变，只把 `count_mismatch()` 的常规 `bit_offset != 0` 路径拆成无末端越界分支的 slice 访问；极端末端候选仍走旧 fallback。新增非零 offset 单测。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 均通过。
+- Docker 同步：checkout 为 `01a5564`，repo dirty=false，Rust binary SHA256 为 `acb2d8759f8381693305766efd3880baf431b8c21a7f38178e275c22052640b1`。
+- 验证路径：`/workspace/benchmark_results/ssh2/20260628T011859Z-16179/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.86 s | 489% | 1,002,936 | 66.36 s | 100% | 2,057,236 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.28 s | 719% | 1,036,772 | 76.31 s | 115% | 2,117,744 | streaming exact 0/24,236；sorted diff 0 |
+| 1,000,000 | 35.90 s | 570% | 1,857,704 | 97.54 s | 295% | 2,487,604 | streaming exact 99,907/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
+
+- 判定：该候选未改变 mapped、FLAG/RNAME/NM 分布，1M sorted diff 仍只有既有 3 条 C++ terminal ZP/ZL 差异；但 1M wall 从保留基线 `35.77 s` 退到 `35.90 s`，RSS 也略增。说明当前编译器/CPU 对该分支拆分无端到端收益，已撤回。
