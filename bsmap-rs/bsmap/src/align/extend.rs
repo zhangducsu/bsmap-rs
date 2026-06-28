@@ -11,7 +11,6 @@
 //! - 最后合并两条链的 hits
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
 
 use crate::align::gap::gap_align;
 use crate::align::mismatch::count_mismatch;
@@ -57,20 +56,6 @@ fn circular_wgbs_positions<'a>(
 #[inline]
 fn rrbs_bucket_hit_is_eligible(hit: &crate::param::Hit, cross_chain_enabled: bool) -> bool {
     cross_chain_enabled || hit.chr & RRBS_BSC_FLAG == 0
-}
-
-fn rrbs_normal_hit_cache_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("BSMAP_RRBS_NORMAL_HIT_CACHE")
-            .map(|value| {
-                !matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "" | "0" | "false" | "off" | "no"
-                )
-            })
-            .unwrap_or(false)
-    })
 }
 
 /// C++ `AddHit()` 等价状态，由两条 read-chain 和全部 segment 共享。
@@ -444,68 +429,6 @@ pub(crate) fn snp_align_segment(
                     % logical_bucket_len;
 
                 if !cross_chain_enabled {
-                    if rrbs_normal_hit_cache_enabled() {
-                        if let Some(mode_bucket) =
-                            index.lookup_rrbs_cached_normal_mode(seed_hash, cmodeindex)
-                        {
-                            debug_assert_eq!(mode_bucket.logical_len as usize, logical_bucket_len);
-                            if let Some(profile) = profile {
-                                profile.add(
-                                    &profile.mode_matched_candidates,
-                                    mode_bucket.normal_count as u64,
-                                );
-                            }
-                            let mode_start = mode_bucket.normal_prefix as usize;
-                            let mode_end = mode_start + mode_bucket.normal_count as usize;
-                            let rotation = if start >= mode_start && start < mode_end {
-                                start - mode_start
-                            } else {
-                                0
-                            };
-
-                            for hit in mode_bucket.hits[rotation..].iter() {
-                                if try_process_rrbs_hit(
-                                    *hit,
-                                    coll,
-                                    fwd_slice,
-                                    rev_slice,
-                                    read_len,
-                                    seed_pos_in_read,
-                                    read_chain,
-                                    gap_size,
-                                    nt3,
-                                    query,
-                                    mask,
-                                    n_count,
-                                    collector,
-                                    profile,
-                                ) {
-                                    return true;
-                                }
-                            }
-                            for hit in mode_bucket.hits[..rotation].iter() {
-                                if try_process_rrbs_hit(
-                                    *hit,
-                                    coll,
-                                    fwd_slice,
-                                    rev_slice,
-                                    read_len,
-                                    seed_pos_in_read,
-                                    read_chain,
-                                    gap_size,
-                                    nt3,
-                                    query,
-                                    mask,
-                                    n_count,
-                                    collector,
-                                    profile,
-                                ) {
-                                    return true;
-                                }
-                            }
-                        }
-                        continue;
-                    }
                     if let Some(mode_bucket) = index.lookup_rrbs_normal_mode(seed_hash, cmodeindex) {
                         debug_assert_eq!(mode_bucket.logical_len as usize, logical_bucket_len);
                         if let Some(profile) = profile {

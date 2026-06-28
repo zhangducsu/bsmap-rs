@@ -1070,7 +1070,6 @@ fn load_raw_index(
                     mapped: None,
                     rrbs_normal_counts: OnceLock::new(),
                     rrbs_mode_ranges: OnceLock::new(),
-                    rrbs_normal_mode_cache: OnceLock::new(),
                 }
             } else {
                 KmerIndex {
@@ -1104,7 +1103,6 @@ fn load_raw_index(
                 mapped: None,
                 rrbs_normal_counts: OnceLock::new(),
                 rrbs_mode_ranges: OnceLock::new(),
-                rrbs_normal_mode_cache: OnceLock::new(),
                 }
             };
             let refcat_data = read_raw_vec(&mut reader, sections[SECTION_REFCAT])?;
@@ -1156,7 +1154,6 @@ fn load_raw_index(
                 }),
                 rrbs_normal_counts: OnceLock::new(),
                 rrbs_mode_ranges: OnceLock::new(),
-                rrbs_normal_mode_cache: OnceLock::new(),
             };
             let ref_file = File::open(path)?;
             let ref_mmap = unsafe { memmap2::Mmap::map(&ref_file)? };
@@ -1435,7 +1432,6 @@ fn reconstruct_kmer_index_v6(data: IndexDataV6, seed_size: u32) -> KmerIndex {
         mapped: None,
         rrbs_normal_counts: OnceLock::new(),
         rrbs_mode_ranges: OnceLock::new(),
-        rrbs_normal_mode_cache: OnceLock::new(),
     }
 }
 
@@ -1464,7 +1460,6 @@ fn reconstruct_kmer_index_v5(data: IndexDataV5, seed_size: u32) -> KmerIndex {
         mapped: None,
         rrbs_normal_counts: OnceLock::new(),
         rrbs_mode_ranges: OnceLock::new(),
-        rrbs_normal_mode_cache: OnceLock::new(),
     }
 }
 
@@ -1508,7 +1503,6 @@ fn reconstruct_kmer_index_v4(data: IndexDataV4, seed_size: u32) -> KmerIndex {
         mapped: None,
         rrbs_normal_counts: OnceLock::new(),
         rrbs_mode_ranges: OnceLock::new(),
-        rrbs_normal_mode_cache: OnceLock::new(),
     }
 }
 

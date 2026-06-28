@@ -874,7 +874,6 @@ mod tests {
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
             rrbs_mode_ranges: OnceLock::new(),
-            rrbs_normal_mode_cache: OnceLock::new(),
         }
     }
 
@@ -1051,7 +1050,6 @@ mod tests {
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
             rrbs_mode_ranges: OnceLock::new(),
-            rrbs_normal_mode_cache: OnceLock::new(),
         };
 
         let disabled =
@@ -1084,7 +1082,6 @@ mod tests {
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
             rrbs_mode_ranges: OnceLock::new(),
-            rrbs_normal_mode_cache: OnceLock::new(),
         };
 
         let mut profile = [[0u32; 16]; MAXSNPS as usize + 1];
@@ -1117,7 +1114,6 @@ mod tests {
             mapped: None,
             rrbs_normal_counts: OnceLock::new(),
             rrbs_mode_ranges: OnceLock::new(),
-            rrbs_normal_mode_cache: OnceLock::new(),
         };
 
         assert_eq!(index.wgbs_candidate_count(0), 4);
