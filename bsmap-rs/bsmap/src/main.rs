@@ -574,6 +574,8 @@ struct SinglePreparedBatch {
     raw_count: usize,
     reads: Vec<ReadInf>,
     encoded: Vec<EncodedRead>,
+    read_time: Duration,
+    prepare_time: Duration,
 }
 
 struct PairedPreparedBatch {
@@ -595,25 +597,40 @@ fn produce_single_batches(
         let mut batch_raw = Vec::with_capacity(BATCH_SIZE);
         let mut read_start = config.read_start;
         let read_end = config.read_end;
+        let profile_stages = config.rrbs_flag && bsmap::align::profile::rrbs_stage_profile_enabled();
 
         loop {
             batch_raw.clear();
+            let read_timer = Instant::now();
             let n = reader.read_batch(&mut batch_raw, BATCH_SIZE, &mut read_start, read_end)?;
+            let read_time = if profile_stages {
+                read_timer.elapsed()
+            } else {
+                Duration::ZERO
+            };
             if n == 0 {
                 break;
             }
 
+            let prepare_timer = Instant::now();
             let batch_start_index = reader.global_index() - n as u32;
             let reads = process_batch_reuse(&mut batch_raw, 0, batch_start_index, config);
             let encoded: Vec<EncodedRead> = reads
                 .iter()
                 .map(|read| encode_read_with_quality(read, config.qual_threshold, config.zero_qual))
                 .collect();
+            let prepare_time = if profile_stages {
+                prepare_timer.elapsed()
+            } else {
+                Duration::ZERO
+            };
 
             let batch = SinglePreparedBatch {
                 raw_count: n,
                 reads,
                 encoded,
+                read_time,
+                prepare_time,
             };
             if sender.send(Ok(batch)).is_err() {
                 break;
@@ -935,6 +952,10 @@ fn run_single_align(
 
     // 批量处理
     let mut alignment_core = Duration::ZERO;
+    let profile_stages = config.rrbs_flag && bsmap::align::profile::rrbs_stage_profile_enabled();
+    let mut read_time = Duration::ZERO;
+    let mut prepare_time = Duration::ZERO;
+    let mut write_time = Duration::ZERO;
 
     let (sender, receiver) = sync_channel(pipeline_depth);
 
@@ -943,6 +964,10 @@ fn run_single_align(
 
         for batch in receiver {
             let batch = batch?;
+            if profile_stages {
+                read_time += batch.read_time;
+                prepare_time += batch.prepare_time;
+            }
 
         // 读取一批读段
         // 编码读段
@@ -952,6 +977,7 @@ fn run_single_align(
             alignment_core += core_start.elapsed();
 
         // 输出结果
+            let write_timer = Instant::now();
             for result in &results {
             if result.has_hits() {
                 output_alignment(
@@ -975,6 +1001,9 @@ fn run_single_align(
                 output_unmapped(output, &batch.reads[result.read_idx as usize], config)?;
             }
             }
+            if profile_stages {
+                write_time += write_timer.elapsed();
+            }
 
         // 更新进度条
             progress.inc(batch.raw_count as u64);
@@ -984,6 +1013,18 @@ fn run_single_align(
     })?;
 
     progress.finish();
+    if profile_stages {
+        eprintln!("BSMAP_PROFILE_RRBS read_seconds={:.6}", read_time.as_secs_f64());
+        eprintln!(
+            "BSMAP_PROFILE_RRBS prepare_seconds={:.6}",
+            prepare_time.as_secs_f64()
+        );
+        eprintln!(
+            "BSMAP_PROFILE_RRBS align_seconds={:.6}",
+            alignment_core.as_secs_f64()
+        );
+        eprintln!("BSMAP_PROFILE_RRBS write_seconds={:.6}", write_time.as_secs_f64());
+    }
     info!("单端比对核心耗时: {:.6}s", alignment_core.as_secs_f64());
     info!("单端比对完成");
 
