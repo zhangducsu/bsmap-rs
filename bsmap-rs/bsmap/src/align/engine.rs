@@ -216,18 +216,6 @@ impl SingleAlign {
         let num_segments = self.seed_segments[0]
             .len()
             .max(self.seed_segments[1].len());
-        let n_counts = [
-            if xflag_chain0 {
-                crate::align::extend::count_n_in_mask(encoded.fwd_mask(), read_len)
-            } else {
-                0
-            },
-            if xflag_chain1 {
-                crate::align::extend::count_n_in_mask(encoded.rev_mask(), read_len)
-            } else {
-                0
-            },
-        ];
 
         // C++ 两条 read-chain 共享一个动态 mismatch 阈值。
         let mut snp_thres = max_snp;
@@ -264,7 +252,7 @@ impl SingleAlign {
                 } else {
                     encoded.rev_mask()
                 };
-                let n_count = n_counts[read_chain as usize];
+                let n_count = crate::align::extend::count_n_in_mask(mask, read_len);
 
                 let mut collector = HitCollector::new(
                     &mut self.hits,
