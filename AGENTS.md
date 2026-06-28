@@ -485,3 +485,10 @@
 - 原因：当前 Rust 的 `xc64` 容忍掩码、word 边界和 padding 语义不是简单的逐 word query/mask shift；直接移动 query/mask 会在跨 word 边界时改变 mismatch 计数。此前 Rust reference-shift 路径已经通过大样本 SAM 等价验证，不能为了局部指令形态牺牲 correctness gate。
 - 规避：不要直接把 C++ `CountMismatch()` 指针公式照搬成 Rust query-shift fast path。若未来继续做专用 mismatch kernel，必须先用新旧 Rust oracle 覆盖 read length、offset、mask/N、threshold，再跑 10K/100K/1M SAM diff；未通过单测不得进入 Docker benchmark。
 - 验证：WSL2 定向测试 `cargo test -p bsmap test_count_mismatch_query_shift_matches_reference_shift` 在上述 case 失败；该候选已在本地立即撤回，未提交、未跑服务器性能测试。
+
+### 59. RRBS SE pipeline depth 继续加深收益不足
+
+- 现象：在默认保留的 RRBS SE depth=2 pipeline 之后，显式测试 `--pipeline-depth 4` 和 `--pipeline-depth 8`；1M depth=4 wall 为 35.92 秒，depth=8 wall 为 35.30 秒，均保持 sorted SAM 既有差异水平，但 depth=8 RSS 增至 1,887,492 KiB。
+- 原因：当前 1M/full RRBS SE 的 CPU 利用率已经接近 8 线程上限，继续加深 producer/align 缓冲无法减少每候选 mismatch 工作量；更深 pipeline 主要增加缓冲驻留，收益只剩噪声级或小幅 I/O 重叠。
+- 规避：不要继续把 SSH2 主线放在调大 `--pipeline-depth` 上。默认 depth=2 仍是当前保留点；除非新的大样本 stage timing 证明读取/写出重新成为瓶颈，否则后续应转向 mismatch kernel、批处理或更深的数据结构优化。
+- 验证：Docker probe `/workspace/benchmark_results/ssh2/pipeline-depth-probe-20260628T021507Z-21614` 使用 portable binary SHA256 `48199b5d47ba278e9fa9885798bd083e70e1235c4e6b9ab6578a2c0f6a331afb`；depth=4/8 均为 253,102 mapped，sorted exact 253,099/253,102。

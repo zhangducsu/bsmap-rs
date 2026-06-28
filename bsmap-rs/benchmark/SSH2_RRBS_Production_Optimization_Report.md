@@ -420,3 +420,17 @@ pipeline 结论：
 - 优化内容：尝试把 RRBS `count_mismatch()` 从当前 Rust reference-shift 形式改成 C++ `CountMismatch()` 风格的 query/mask shift，避免每个候选重组 reference window。
 - 本地定向测试：新增的新旧算法等价测试在 `read_len=33`、`reference_start=2`、`threshold=100` 下失败，新函数返回 25，现有 reference-shift oracle 返回 24。
 - 判定：当前 Rust 的 `xc64` 容忍掩码、word 边界和 padding 语义不能被简单改写为 query-shift。该方向没有通过本地 correctness gate，已立即撤回，未进入 Docker benchmark。
+
+pipeline depth probe：不改源码，只测试显式 `--pipeline-depth 4/8`。
+
+- 目的：判断 RRBS SE 默认 depth=2 之后继续加深 pipeline 是否还有低风险收益。
+- Rust binary SHA256：`48199b5d47ba278e9fa9885798bd083e70e1235c4e6b9ab6578a2c0f6a331afb`。
+- 运行路径：`/workspace/benchmark_results/ssh2/pipeline-depth-probe-20260628T021507Z-21614`。
+- 对照：复用同参数 C++ 1M SAM `/workspace/benchmark_results/ssh2/20260628T015428Z-20368/case_cpp_se_1000000/output.sam` 做 streaming/sorted diff。
+
+| depth | Rust wall | Rust user | Rust sys | Rust CPU | Rust RSS KiB | mapped | sorted diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 4 | 35.92 s | 201.31 s | 5.99 s | 577% | 1,866,508 | 253,102 | sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL |
+| 8 | 35.30 s | 197.20 s | 6.22 s | 576% | 1,887,492 | 253,102 | sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL |
+
+- 判定：相对默认 depth=2 的 1M `35.77 s / 1,856,048 KiB`，depth=4 退化，depth=8 仅约 1.3% 小幅提升且 RSS 增加约 31 MiB；低于 SSH2 保留门槛。继续加深 pipeline 不是当前主收益方向。
