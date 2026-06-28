@@ -450,6 +450,22 @@ pipeline depth probe：不改源码，只测试显式 `--pipeline-depth 4/8`。
 - 判定：stage profile 本身保持 mapped、FLAG/RNAME/NM 分布和既有 sorted SAM 差异水平；性能与默认 depth=2 基线接近，诊断开销可接受。
 - 关键结论：1M 中可见的 producer/read、prepare 和 SAM write 合计约 5.25 s，远小于 align core 25.46 s；继续优化 pipeline depth、FASTQ 读取或 SAM 写出，即使全部清零也不足以达到 full `<= C++ / 2`。SSH2 下一步应集中在每候选 mismatch kernel、批量化计算、reference/index 访问局部性或更大粒度的并行调度，而不是继续做浅层 pipeline 调参。
 
+full stage profile 补充运行：
+
+- 运行路径：`/workspace/benchmark_results/ssh2/rust-full-stage-20260628T024823Z-22811/summary.json`。
+- Docker checkout：`64c9c668b9940fcc0d0eff8efeb082ca6af138f6`，repo dirty=false。
+- Rust binary SHA256：`2c0afe7204b5ca423935cdcbef03cf5e2830e4fdc517f257a3bd2a204b7f5488`。
+- Reference SHA256：`db16cb4633191754f1d9cc70e73d2a1f60d03fdf62bcf4902a31a4717a3d2de7`。
+- Reads SHA256：`a00aacbc7841f3243c2cf273d627944c2ee607b5310d90906169bc8392573172`。
+- Rust warm align 不包含 standalone index；run 前后 index SHA256 均为 `1329966ddda5aedd9fc7e13cb84a4e755cd632df3d14a0de32a239a29561e634`。
+
+| case | wall | user | sys | CPU | RSS KiB | mapped | stage seconds | 判定 |
+|---|---:|---:|---:|---:|---:|---:|---|---|
+| Rust full SE stage | 933.61 s | 6803.96 s | 161.59 s | 746% | 1,858,428 | 8,873,078 | read 86.18；prepare 41.19；align 863.54；write 51.50 | 与保留 pipeline full 926.23 s 接近；诊断开销可接受 |
+
+- full stage 结论：full 数据上 align core 仍占绝对主导，`read + prepare + write` 合计约 178.87 s，align core 为 863.54 s。即使理想化清零读、prepare 和 SAM write，Rust 仍会高于 SSH2 目标 `<= 525.42 s`。
+- 因此，SSH2 后续不再把浅层 pipeline、FASTQ 解压或 SAM writer 作为主线；除非有新 profile 反证，主攻方向应转为降低每候选 mismatch 成本、批量化候选处理、改善 reference/index 随机访问局部性，或改变并行调度粒度。
+
 撤回候选：`87f0c49 perf: force inline mismatch counter`，已由 `2cc6c37 Revert "perf: force inline mismatch counter"` 撤回。
 
 - 优化内容：把 `count_mismatch()` 从普通 `#[inline]` 改为 `#[inline(always)]`，尝试降低约 19.7 亿次 1M mismatch 调用的函数边界成本；不改算法和输出逻辑。

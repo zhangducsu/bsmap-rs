@@ -513,3 +513,10 @@
 - 原因：函数边界不是当前 SSH2 full RRBS SE 的主瓶颈；该变化约 1.6% 的短基准收益低于保留门槛，也可能属于 run-to-run 波动。强制 inline 还会降低编译器自主权，未来可能增加代码体积或造成不同 CPU/编译器下的回归。
 - 规避：不要把 `#[inline(always)]` 作为 SSH2 mismatch 主线优化手段。后续 mismatch 优化必须证明能显著减少每候选 word 工作、引入正确的批量/SIMD kernel，或改善 reference/index 访问局部性，并用 10K/100K/1M SAM diff 与性能表共同验证。
 - 验证：候选 `87f0c49` 的 Docker run `/workspace/benchmark_results/ssh2/20260628T023417Z-22324/summary.json` 中，1M Rust wall/RSS 为 35.18 秒/1,856,020 KiB；已由 `2cc6c37 Revert "perf: force inline mismatch counter"` 撤回。
+
+### 63. full RRBS SE stage profile 证明主瓶颈仍是 align core
+
+- 现象：full RRBS SE 使用 `BSMAP_PROFILE_RRBS=stage` 后，Rust warm align wall 为 933.61 秒，其中 read 86.18 秒、prepare 41.19 秒、align 863.54 秒、write 51.50 秒；RSS 1,858,428 KiB，mapped 8,873,078。
+- 原因：full 数据上 pipeline 已经把读、prepare 和写出的大部分开销与比对重叠，剩余绝对主耗时来自 RRBS align/mismatch/extend 核心。即使理想化清零读、prepare 和 SAM write，也无法达到 SSH2 的 `C++ full / 2` 目标。
+- 规避：除非新的 full profile 反证，不要继续把 SSH2 主线放在 FASTQ 解压、SAM writer、pipeline depth 或浅层调参上。后续高收益方向应集中在每候选 mismatch 成本、批量化候选处理、reference/index 随机访问局部性和更大粒度并行调度。
+- 验证：Docker run `/workspace/benchmark_results/ssh2/rust-full-stage-20260628T024823Z-22811/summary.json` 使用 commit `64c9c66`、portable binary SHA256 `2c0afe7204b5ca423935cdcbef03cf5e2830e4fdc517f257a3bd2a204b7f5488`；run 前后 v10 index SHA256 均为 `1329966ddda5aedd9fc7e13cb84a4e755cd632df3d14a0de32a239a29561e634`。
