@@ -527,3 +527,10 @@
 - 原因：当前 SSH2 主瓶颈不是 v10 hit 的非 2 的幂 stride 或七字节解码成本；增加对齐 padding 只放大 mmap/RSS 和索引大小，没有换来足够 CPU/cache 收益。
 - 规避：不要再次尝试把 RRBS hit 默认存储从七字节改成八字节对齐，除非新的 profile 明确证明 packed hit 解码成为主瓶颈。索引格式变更必须同时记录 standalone index 时间、索引大小、RSS、10K/100K/1M SAM diff 和 warm align 性能。
 - 验证：候选 `292aaac` 的 v11 index `/workspace/benchmark_results/ssh2/v11-aligned-index-20260628T031610Z-23495/mm10.fa.bsi` 大小为 1,091,007,832 bytes；Docker run `/workspace/benchmark_results/ssh2/20260628T031711Z-23535/summary.json` 中 1M Rust wall/RSS 为 36.06 秒/1,903,960 KiB；已由 `2eb736b Revert "perf: align packed RRBS hit storage"` 撤回。
+
+### 65. RRBS 非零 offset AVX2 mismatch 没有端到端收益
+
+- 现象：把 `count_mismatch_simd()` 扩展到支持非零 `bit_offset`，并接入 RRBS no-gap mismatch 热路径后，本地 `cargo check/test/build` 通过，10K SAM diff 为 0，1M sorted diff 仍只剩既有 3 条 C++ terminal ZP/ZL；但 1M Rust wall 从保留基线 35.77 秒退到 37.06 秒。
+- 原因：当前服务器 portable release 下，非零 offset AVX2 kernel 需要额外处理完整 word/tail、运行时 feature dispatch 和跨 lane 数据组合；这些开销没有压过原有 C++ 风格 SWAR scalar 路径。RRBS full 主瓶颈虽在 mismatch 调用规模，但不代表任何 SIMD 化都会有端到端收益。
+- 规避：不要默认接入非零 offset AVX2 mismatch 路径，除非后续 microbench 与 10K/100K/1M 端到端 benchmark 同时证明收益。SIMD 候选必须保留 scalar oracle 单测，覆盖 read length、reference offset、mask/N 和 threshold；只看局部指令形态或理论 SIMD 宽度不得保留。
+- 验证：候选 `534b063` 的 Docker run `/workspace/benchmark_results/ssh2/20260628T035723Z-27210/summary.json` 中，1M Rust wall/RSS 为 37.06 秒/1,857,712 KiB；已由 `ab24a97 Revert "perf: use AVX2 mismatch for RRBS offsets"` 撤回。

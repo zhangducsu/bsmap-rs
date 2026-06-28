@@ -495,3 +495,19 @@ full stage profile 补充运行：
 | 1,000,000 | 36.06 s | 578% | 1,903,960 | 97.72 s | 295% | 2,487,008 | sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
 
 - 判定：该候选保持 10K/100K 完全一致，1M sorted SAM 仍只剩既有 3 条 C++ terminal ZP/ZL 差异；但相对保留基线 1M `35.77 s / 1,856,048 KiB`，wall 退化到 `36.06 s`，RSS 增加约 47,912 KiB。说明当前瓶颈不在 v10 七字节 hit 解码或非 2 的幂 stride；该方向不保留。
+
+撤回候选：`534b063 perf: use AVX2 mismatch for RRBS offsets`，已由 `ab24a97 Revert "perf: use AVX2 mismatch for RRBS offsets"` 撤回。
+
+- 优化内容：把现有 `count_mismatch_simd()` 扩展到支持非零 `bit_offset`，在 RRBS no-gap mismatch 热路径中用 AVX2 处理完整 word，再用 scalar tail 处理剩余 word；新增非零 offset、mask/N 和不同 threshold 的 scalar/SIMD oracle 单测。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 均通过。
+- Docker 同步方式：由于旧 partial clone 在 `git reset` 时触发 lazy blob fetch 并卡住，本轮改用本地完整 Git bundle 传入 Docker，在 `/tmp/ssh2_full_534b063/repo` 新建非 partial checkout；checkout 为 `534b063`，repo dirty=false。
+- Docker build：portable release binary SHA256 为 `006480338fa45a67912971c289c3e98301a205f320c7c30ad8c3b62df970f40b`。
+- Docker 验证路径：`/workspace/benchmark_results/ssh2/20260628T035723Z-27210/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.98 s | 485% | 1,002,984 | 66.57 s | 100% | 2,057,224 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.44 s | 712% | 1,036,824 | 77.36 s | 115% | 2,117,748 | streaming exact 0/24,236；sorted diff 0 |
+| 1,000,000 | 37.06 s | 588% | 1,857,712 | 95.48 s | 290% | 2,487,336 | sorted exact 253,099/253,102，仍为既有 3 条 C++ terminal ZP/ZL 边界差异 |
+
+- 判定：该候选没有引入新的 mapped 数或核心字段差异；1M 的 3 条 sorted multiset 差异仍是既有 C++ terminal ZP/ZL 边界标签问题。但相对保留基线 1M `35.77 s / 1,856,048 KiB`，wall 退化到 `37.06 s`，RSS 基本持平。说明在当前 portable 构建和服务器 CPU 上，非零 offset AVX2 kernel 的开销、feature dispatch 或数据搬移没有压过原有 SWAR scalar 路径；该方向不保留。
