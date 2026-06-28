@@ -283,3 +283,10 @@ pipeline 结论：
 - v11 10K/100K/1M 验证路径：`/workspace/benchmark_results/ssh2/20260627T234727Z-12600/summary.json`。
 - 1M Rust wall 35.21 s，相对默认 pipeline 35.77 s 仅提升约 1.6%；100K sorted multiset diff 0，但 streaming diff 从 record 1 起发生大面积顺序差异。
 - 判定：收益不足且改变 streaming SAM 顺序，不符合 SSH2 对 C++ SAM 对齐的优先级，已撤回。
+
+撤回候选：`aec3d51 perf: reduce best-hit selection allocation`，已由 `7f98490 Revert "perf: reduce best-hit selection allocation"` 撤回。
+
+- 验证路径：`/workspace/benchmark_results/ssh2/20260628T000122Z-13125/summary.json`。
+- 10K/100K streaming diff 0、sorted diff 0；1M 仍仅有 3 条已知 C++ terminal ZP/ZL 边界差异。
+- 性能：1M Rust wall 35.97 s、RSS 1,855,404 KiB；保留基线为 35.77 s、RSS 1,856,048 KiB。
+- 判定：线性去重替换 `HashSet` 没有带来端到端收益，甚至略慢；该路径不是当前 full SE 主要瓶颈，已撤回。
