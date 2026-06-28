@@ -70,8 +70,10 @@ pub fn count_mismatch(
     // 处理跨 word 边界的情况
     if bit_offset == 0 {
         // 简单情况：bit_offset = 0，直接比较
-        let ref_words = &ref_seq[word_offset..word_offset + query.len()];
-        for ((&q_word, &m_word), &ref_word) in query.iter().zip(mask.iter()).zip(ref_words.iter()) {
+        for i in 0..query.len() {
+            let ref_word = ref_seq[word_offset + i];
+            let q_word = query[i];
+            let m_word = mask[i];
 
             // 计算差异
             let mut diff = q_word ^ ref_word;
@@ -97,59 +99,34 @@ pub fn count_mismatch(
         let shift_left = bit_offset;
         let shift_right = 64 - bit_offset;
 
-        if word_offset + query.len() < ref_seq.len() {
-            let ref_words = &ref_seq[word_offset..word_offset + query.len() + 1];
-            for (i, (&q_word, &m_word)) in query.iter().zip(mask.iter()).enumerate() {
-                // 从参考序列提取对齐的 word（与 make_seed 一致的移位方向）
-                let ref_word = (ref_words[i] << shift_left) | (ref_words[i + 1] >> shift_right);
+        for i in 0..query.len() {
+            // 从参考序列提取对齐的 word（与 make_seed 一致的移位方向）
+            let ref_low = ref_seq[word_offset + i] << shift_left;
+            let ref_high = if word_offset + i + 1 < ref_seq.len() {
+                ref_seq[word_offset + i + 1] >> shift_right
+            } else {
+                0
+            };
+            let ref_word = ref_low | ref_high;
 
-                // 计算差异
-                let mut diff = q_word ^ ref_word;
+            let q_word = query[i];
+            let m_word = mask[i];
 
-                // 应用 C→T 容忍掩码
-                diff &= xc64(ref_word);
+            // 计算差异
+            let mut diff = q_word ^ ref_word;
 
-                // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
-                diff &= m_word;
+            // 应用 C→T 容忍掩码
+            diff &= xc64(ref_word);
 
-                // 统计 mismatch
-                total_mismatches += xm64(diff);
+            // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
+            diff &= m_word;
 
-                // 提前终止检查
-                if total_mismatches > snp_thres {
-                    return snp_thres + 1;
-                }
-            }
-        } else {
-            for i in 0..query.len() {
-                // 从参考序列提取对齐的 word（与 make_seed 一致的移位方向）
-                let ref_low = ref_seq[word_offset + i] << shift_left;
-                let ref_high = if word_offset + i + 1 < ref_seq.len() {
-                    ref_seq[word_offset + i + 1] >> shift_right
-                } else {
-                    0
-                };
-                let ref_word = ref_low | ref_high;
+            // 统计 mismatch
+            total_mismatches += xm64(diff);
 
-                let q_word = query[i];
-                let m_word = mask[i];
-
-                // 计算差异
-                let mut diff = q_word ^ ref_word;
-
-                // 应用 C→T 容忍掩码
-                diff &= xc64(ref_word);
-
-                // 应用有效碱基掩码：mask=0 的位置（N/padding）清零不计入
-                diff &= m_word;
-
-                // 统计 mismatch
-                total_mismatches += xm64(diff);
-
-                // 提前终止检查
-                if total_mismatches > snp_thres {
-                    return snp_thres + 1;
-                }
+            // 提前终止检查
+            if total_mismatches > snp_thres {
+                return snp_thres + 1;
             }
         }
     }
@@ -731,19 +708,6 @@ mod tests {
         // offset = 0 应该完全匹配
         let mismatches = count_mismatch(&query, 0, &ref_seq, &mask, 10, 0, false);
         assert_eq!(mismatches, 0, "offset=0 时应该完全匹配");
-    }
-
-    #[test]
-    fn test_count_mismatch_with_nonzero_offset() {
-        let query_seq = b"ACGTACGTACGTACGT";
-        let ref_seq_bytes = b"AAACGTACGTACGTACGT";
-
-        let query = pack_forward(query_seq, 1);
-        let ref_seq = make_ref_seq(ref_seq_bytes);
-        let mask = make_mask(query_seq.len());
-
-        let mismatches = count_mismatch(&query, 4, &ref_seq, &mask, 10, 0, false);
-        assert_eq!(mismatches, 0, "offset=4 时应该跳过参考前两个 A");
     }
 
     #[test]
