@@ -415,3 +415,10 @@
 - 原因：RRBS hit 存储顺序参与 C++ 风格随机 bucket 起点、环形遍历和输出顺序；即使最终记录集合相同，改变 hit 顺序也可能破坏与 C++ 的 streaming SAM 对齐。
 - 规避：任何 RRBS index hit 重排、normal-only slice、compact bucket 或随机遍历优化，必须同时检查 streaming diff 和 sorted multiset diff。若收益小且 streaming 顺序变动，应撤回；不得只用 sorted diff 0 判定可保留。
 - 验证：SSH2 v11 run `/workspace/benchmark_results/ssh2/20260627T234727Z-12600/summary.json` 显示 100K sorted exact 24,236/24,236 但 streaming exact 0/24,236；候选提交 `ee524cf` 已由 `4804347` revert。
+
+### 49. AddHit 去重 hash 不是 SSH2 当前主瓶颈
+
+- 现象：把 `HashSet<(u32,u32)>` 改成 packed `u64` key 加 identity hasher 后，10K/100K SAM diff 仍为 0，1M 仍只剩已知 3 条 C++ terminal ZP/ZL 差异，但 1M Rust wall 从保留基线 35.77 秒退到 36.44 秒，RSS 基本不变。
+- 原因：SSH2 当前主要成本仍来自 RRBS 候选规模和 mismatch kernel；`AddHit` 去重 hash 成本不是端到端主导项。替换 hasher 还会增加实现复杂度，收益不成立。
+- 规避：不要继续围绕 `AddHit` 去重 hash 做小改，除非新的 profile 证明 accepted-hit 去重占比已经成为主瓶颈。去重结构变化必须同时跑 10K/100K/1M SAM diff 和性能表，不能只凭理论上 identity hash 更快就保留。
+- 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T002013Z-13830/summary.json` 中，candidate commit `dcb61c2` 的 1M Rust wall 为 36.44 秒；已由 `e64aaca` revert。

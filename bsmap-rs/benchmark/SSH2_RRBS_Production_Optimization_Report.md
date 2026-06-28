@@ -290,3 +290,18 @@ pipeline 结论：
 - 10K/100K streaming diff 0、sorted diff 0；1M 仍仅有 3 条已知 C++ terminal ZP/ZL 边界差异。
 - 性能：1M Rust wall 35.97 s、RSS 1,855,404 KiB；保留基线为 35.77 s、RSS 1,856,048 KiB。
 - 判定：线性去重替换 `HashSet` 没有带来端到端收益，甚至略慢；该路径不是当前 full SE 主要瓶颈，已撤回。
+
+撤回候选：`dcb61c2 perf: use packed hit dedup keys`，已由 `e64aaca Revert "perf: use packed hit dedup keys"` 撤回。
+
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 均通过。
+- Docker 同步：GitHub fetch 一次出现 GnuTLS 断开，改用本地 Git bundle 通过 SSH stdin 写入 Docker `/tmp` 后同步；Docker checkout 为 `dcb61c2`，repo dirty=false。
+- Docker binary SHA256：`eff80c041c76dee2303474321c16551f12b06052fbbdddb35013c518fcd28784`。
+- 验证路径：`/workspace/benchmark_results/ssh2/20260628T002013Z-13830/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.88 s | 482% | 1,002,636 | 66.26 s | 100% | 2,057,220 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.70 s | 709% | 1,036,772 | 77.53 s | 115% | 2,117,760 | streaming diff 0；sorted diff 0 |
+| 1,000,000 | 36.44 s | 583% | 1,856,036 | 98.51 s | 295% | 2,487,740 | sorted multiset 253,099/253,102；仍为 3 条 C++ terminal ZP/ZL 边界差异 |
+
+- 判定：packed `u64` key + identity hasher 保持 SAM 语义，但 1M wall 从保留基线 35.77 s 退到 36.44 s，RSS 基本不变；说明当前 full SE 不是被默认 tuple `HashSet` hash 成本主导。该候选负收益，已撤回。
