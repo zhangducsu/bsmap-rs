@@ -520,3 +520,10 @@
 - 原因：full 数据上 pipeline 已经把读、prepare 和写出的大部分开销与比对重叠，剩余绝对主耗时来自 RRBS align/mismatch/extend 核心。即使理想化清零读、prepare 和 SAM write，也无法达到 SSH2 的 `C++ full / 2` 目标。
 - 规避：除非新的 full profile 反证，不要继续把 SSH2 主线放在 FASTQ 解压、SAM writer、pipeline depth 或浅层调参上。后续高收益方向应集中在每候选 mismatch 成本、批量化候选处理、reference/index 随机访问局部性和更大粒度并行调度。
 - 验证：Docker run `/workspace/benchmark_results/ssh2/rust-full-stage-20260628T024823Z-22811/summary.json` 使用 commit `64c9c66`、portable binary SHA256 `2c0afe7204b5ca423935cdcbef03cf5e2830e4fdc517f257a3bd2a204b7f5488`；run 前后 v10 index SHA256 均为 `1329966ddda5aedd9fc7e13cb84a4e755cd632df3d14a0de32a239a29561e634`。
+
+### 64. RRBS hit 从七字节改八字节对齐没有端到端收益
+
+- 现象：把新建 RRBS index 从 v10 七字节 packed hit 改为 v11 八字节对齐 packed hit 后，本地 `cargo check/test/build` 通过，10K/100K SAM diff 为 0，1M sorted diff 仍只剩既有 3 条 C++ terminal ZP/ZL；但 1M Rust wall 从保留基线 35.77 秒退到 36.06 秒，RSS 从 1,856,048 KiB 增到 1,903,960 KiB。
+- 原因：当前 SSH2 主瓶颈不是 v10 hit 的非 2 的幂 stride 或七字节解码成本；增加对齐 padding 只放大 mmap/RSS 和索引大小，没有换来足够 CPU/cache 收益。
+- 规避：不要再次尝试把 RRBS hit 默认存储从七字节改成八字节对齐，除非新的 profile 明确证明 packed hit 解码成为主瓶颈。索引格式变更必须同时记录 standalone index 时间、索引大小、RSS、10K/100K/1M SAM diff 和 warm align 性能。
+- 验证：候选 `292aaac` 的 v11 index `/workspace/benchmark_results/ssh2/v11-aligned-index-20260628T031610Z-23495/mm10.fa.bsi` 大小为 1,091,007,832 bytes；Docker run `/workspace/benchmark_results/ssh2/20260628T031711Z-23535/summary.json` 中 1M Rust wall/RSS 为 36.06 秒/1,903,960 KiB；已由 `2eb736b Revert "perf: align packed RRBS hit storage"` 撤回。

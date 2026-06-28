@@ -480,3 +480,18 @@ full stage profile 补充运行：
 | 1,000,000 | 35.18 s | 576% | 1,856,020 | 96.65 s | 295% | 2,486,916 | sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL |
 
 - 判定：SAM 语义保持，RSS 基本持平；但相对保留基线 1M `35.77 s / 1,856,048 KiB` 只提升约 1.6%，低于 SSH2 单项保留门槛且可能属于 run-to-run 波动。该候选不保留。
+
+撤回候选：`292aaac perf: align packed RRBS hit storage`，已由 `2eb736b Revert "perf: align packed RRBS hit storage"` 撤回。
+
+- 优化内容：将新建 RRBS index 从 v10 七字节 packed hit 改为 v11 八字节对齐 packed hit，尝试用约 49 MB 的 `.bsi` 增量换取更低的 mmap 解码和 stride 成本；不改变 hit 顺序、mode 编码或 SAM 语义。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 通过；新增单测覆盖 v11 aligned hit roundtrip 和 index mmap/memory roundtrip。
+- v11 standalone index：`/workspace/benchmark_results/ssh2/v11-aligned-index-20260628T031610Z-23495`，构建 wall 37.96 s，RSS 1,276,372 KiB，索引 SHA256 `99d2861c480730e5a3970c4f4efc5fce429266581405f7b78fafd5225c34c4b7`，大小 1,091,007,832 bytes。
+- Docker 验证路径：`/workspace/benchmark_results/ssh2/20260628T031711Z-23535/summary.json`；checkout 为 `292aaac`，repo dirty=false，Rust binary SHA256 `fce20e69087acadc269e7c3e6a96f609646d18bd8814c58babe8769f5c0f0795`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.93 s | 480% | 1,050,820 | 66.16 s | 100% | 2,057,224 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.62 s | 709% | 1,084,452 | 75.33 s | 115% | 2,117,748 | streaming diff 0；sorted diff 0 |
+| 1,000,000 | 36.06 s | 578% | 1,903,960 | 97.72 s | 295% | 2,487,008 | sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
+
+- 判定：该候选保持 10K/100K 完全一致，1M sorted SAM 仍只剩既有 3 条 C++ terminal ZP/ZL 差异；但相对保留基线 1M `35.77 s / 1,856,048 KiB`，wall 退化到 `36.06 s`，RSS 增加约 47,912 KiB。说明当前瓶颈不在 v10 七字节 hit 解码或非 2 的幂 stride；该方向不保留。
