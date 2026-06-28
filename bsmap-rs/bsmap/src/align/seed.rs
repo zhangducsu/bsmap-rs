@@ -144,22 +144,6 @@ pub(crate) fn extract_seeds_and_masks_into(
     all_seeds: &mut [Vec<u32>; 2],
     all_reg_masks: &mut [Vec<u32>; 2],
 ) {
-    extract_seeds_and_masks_for_chains_into(
-        encoded,
-        seed_size,
-        [true, true],
-        all_seeds,
-        all_reg_masks,
-    );
-}
-
-pub(crate) fn extract_seeds_and_masks_for_chains_into(
-    encoded: &EncodedRead,
-    seed_size: u32,
-    enabled_chains: [bool; 2],
-    all_seeds: &mut [Vec<u32>; 2],
-    all_reg_masks: &mut [Vec<u32>; 2],
-) {
     let read_len = encoded.read_len();
     let num_words = encoded.num_words();
     let seed_count = if read_len >= seed_size {
@@ -169,14 +153,6 @@ pub(crate) fn extract_seeds_and_masks_for_chains_into(
     };
 
     for chain in 0..2u32 {
-        let seeds = &mut all_seeds[chain as usize];
-        let reg_masks = &mut all_reg_masks[chain as usize];
-        seeds.clear();
-        reg_masks.clear();
-        if !enabled_chains[chain as usize] {
-            continue;
-        }
-
         let words = if chain == 0 {
             encoded.fwd_words()
         } else {
@@ -188,6 +164,10 @@ pub(crate) fn extract_seeds_and_masks_for_chains_into(
             encoded.rev_mask()
         };
 
+        let seeds = &mut all_seeds[chain as usize];
+        let reg_masks = &mut all_reg_masks[chain as usize];
+        seeds.clear();
+        reg_masks.clear();
         if seeds.capacity() < seed_count {
             seeds.reserve(seed_count);
         }
@@ -866,29 +846,6 @@ mod tests {
         assert_eq!(scratch, expected);
         assert_eq!([scratch[0].as_ptr(), scratch[1].as_ptr()], pointers);
         assert_eq!([scratch[0].capacity(), scratch[1].capacity()], capacities);
-    }
-
-    #[test]
-    fn selective_seed_extraction_clears_disabled_chain() {
-        let encoded = make_test_read(b"ACGTACGTACGTACGTACGTACGTACGTACGT");
-        let mut seeds = [Vec::new(), Vec::new()];
-        let mut masks = [Vec::new(), Vec::new()];
-        extract_seeds_and_masks_into(&encoded, 8, &mut seeds, &mut masks);
-        let expected_chain0 = seeds[0].clone();
-        assert!(!seeds[1].is_empty());
-        assert!(!masks[1].is_empty());
-
-        extract_seeds_and_masks_for_chains_into(
-            &encoded,
-            8,
-            [true, false],
-            &mut seeds,
-            &mut masks,
-        );
-
-        assert_eq!(seeds[0], expected_chain0);
-        assert!(seeds[1].is_empty());
-        assert!(masks[1].is_empty());
     }
 
     fn make_rrbs_count_index(buckets: Vec<Vec<Hit>>) -> KmerIndex {
