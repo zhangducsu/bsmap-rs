@@ -320,3 +320,18 @@ pipeline 结论：
 | 1,000,000 | 34.99 s | 568% | 2,076,696 | 98.30 s | 299% | 2,487,720 | streaming exact 99,825/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
 
 - 判定：相对保留基线 1M `35.77 s / 1,856,048 KiB`，该候选仅提升约 2.2%，低于 SSH2 单项保留门槛；RSS 增加约 220,648 KiB，且 100K/1M streaming SAM 顺序仍不满足严格对齐。该方向不保留。
+
+撤回候选：`5b1e4aa perf: cache per-read N counts`，已由 `95798d8 Revert "perf: cache per-read N counts"` 撤回。
+
+- 优化内容：将 `count_n_in_mask(mask, read_len)` 从每个 segment 重复计算改为每条 read/read-chain 预计算一次。
+- 本地验证：`cargo check -p bsmap`、`cargo test -p bsmap`、`cargo build --release -p bsmap` 均通过。
+- Docker 同步：checkout 为 `5b1e4aa`，repo dirty=false，Rust binary SHA256 为 `09b9b024cb20945a139c13eb326146eb525c7c650f2833f551dfa92fc2bb47ea`。
+- 验证路径：`/workspace/benchmark_results/ssh2/20260628T010232Z-15433/summary.json`。
+
+| limit | Rust wall | Rust CPU | Rust RSS KiB | C++ wall | C++ CPU | C++ RSS KiB | SAM diff |
+|---:|---:|---:|---:|---:|---:|---:|---|
+| 10,000 | 1.96 s | 470% | 1,002,816 | 67.20 s | 100% | 2,057,236 | streaming diff 0；sorted diff 0 |
+| 100,000 | 10.43 s | 716% | 1,036,744 | 77.62 s | 116% | 2,117,760 | streaming exact 0/24,236；sorted diff 0 |
+| 1,000,000 | 35.59 s | 576% | 1,857,736 | 99.51 s | 300% | 2,487,892 | streaming exact 51,032/253,102；sorted exact 253,099/253,102，仍为 3 条 C++ terminal ZP/ZL 边界差异 |
+
+- 判定：相对保留基线 1M `35.77 s / 1,856,048 KiB`，该候选仅提升约 0.5%，低于 SSH2 单项保留门槛；RSS 基本持平。该方向不能解决 full core 859 s 的主瓶颈，已撤回。

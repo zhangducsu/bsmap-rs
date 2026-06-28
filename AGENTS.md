@@ -429,3 +429,10 @@
 - 原因：SSH2 当前热路径主要仍是候选规模和 mismatch 调用，避免 packed hit 解码/BSC skip 只能带来约 2.2% 小收益；缓存本身需要额外保存 normal hits 和 mode ranges，会显著增加驻留内存。
 - 规避：不要默认引入 RRBS decoded normal-hit 全量缓存。除非后续 profile 证明 packed decode 已成为主瓶颈，并且端到端收益超过门槛、RSS 仍低于目标，否则优先优化候选规模、mismatch kernel 或 pipeline。
 - 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T004435Z-14681/summary.json` 中，candidate commit `f143c44` 的 1M Rust wall 为 34.99 秒、RSS 为 2,076,696 KiB；已由 `a82f138` revert。
+
+### 51. per-read N count 缓存不是 SSH2 当前主瓶颈
+
+- 现象：把 `count_n_in_mask(mask, read_len)` 从每个 segment 重复计算改成每条 read/read-chain 预计算一次后，1M Rust wall 只从保留基线 35.77 秒降到 35.59 秒，RSS 基本持平。
+- 原因：虽然 1M 有约 971 万次 segment 调用，但 N 计数相对 19.7 亿次 mismatch 调用不是端到端主导成本；该优化只能带来约 0.5% 的短基准收益。
+- 规避：不要继续围绕 per-read 固定小字段预计算做零散微调，除非 profile 证明相关函数进入 top hotspot。SSH2 后续应优先优化候选规模、mismatch kernel、或能显著降低 full align core 的数据流结构。
+- 验证：SSH2 run `/workspace/benchmark_results/ssh2/20260628T010232Z-15433/summary.json` 中，candidate commit `5b1e4aa` 的 1M Rust wall 为 35.59 秒、RSS 为 1,857,736 KiB；已由 `95798d8` revert。
